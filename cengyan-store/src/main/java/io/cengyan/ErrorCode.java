@@ -1,0 +1,31 @@
+package io.cengyan;
+
+/**
+ * 对外错误码。响应里的 {@code code} 使用枚举名。
+ * {@link #INTERNAL} 只表示进程内部失败，不在查询协议的业务码表里。
+ */
+public enum ErrorCode {
+    OK,
+    NAME_CONFLICT,
+    UNIQUE_VIOLATION,
+    GRAPH_NOT_FOUND,
+    DROP_ALIAS_AS_GRAPH,
+    TYPE_NOT_FOUND,
+    VERTEX_DEGREE_EXCEEDED,
+    TRUNCATED,
+    FRONTIER_EXCEEDED,
+    PATH_LIMIT_EXCEEDED,
+    SCHEMA_MISMATCH,
+    CROSS_PART_UNSUPPORTED,
+    DIVIDE_BY_ZERO,
+    QUERY_CANCELED,
+    QUERY_MEMORY_EXCEEDED,
+    BUSY,
+    SYNTAX,
+    TYPE_MISMATCH,
+    FORBIDDEN,
+    SPACE_READONLY,
+    PART_READONLY,
+    NODE_NOT_DRAINED,
+    INTERNAL
+}
