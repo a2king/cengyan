@@ -21,6 +21,8 @@ statement
     | ALTER NODE TYPE typeName=IDENT ADD prop=IDENT valueType NULL #alterNode
     | ALTER REL TYPE typeName=IDENT ADD prop=IDENT valueType NULL #alterRel
     | INSERT node (edge node)?                                #insertStmt
+    | MATCH node (edge node)? whereClause? SET assignment (',' assignment)* #setStmt
+    | MATCH node (edge node)? whereClause? DELETE IDENT (',' IDENT)* #deleteStmt
     | MATCH node edge node whereClause? returnClause orderClause? skipClause? limitClause? #matchStmt
     ;
 
@@ -40,7 +42,8 @@ props: '{' (prop (',' prop)*)? '}';
 prop: name=IDENT ':' expr;
 
 whereClause: WHERE expr;
-returnClause: RETURN item (',' item)*;
+returnClause: RETURN DISTINCT? item (',' item)*;
+assignment: variable=IDENT '.' field=IDENT '=' expr;
 item: expr (AS alias=IDENT)?;
 orderClause: ORDER BY sortItem (',' sortItem)*;
 sortItem: expr (ASC | DESC)?;
@@ -69,7 +72,7 @@ primary
     | name=IDENT                 #varPrimary
     | '(' expr ')'               #parenPrimary
     ;
-call: name=IDENT '(' (expr (',' expr)*)? ')';
+call: name=IDENT '(' ('*' | expr (',' expr)*)? ')';
 parameter: '$' name=IDENT;
 literal: INTEGER_LIT | REAL_LIT | STRING_LIT | TRUE | FALSE | NULL | DATETIME STRING_LIT;
 

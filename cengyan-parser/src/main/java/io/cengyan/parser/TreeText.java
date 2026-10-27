@@ -29,6 +29,9 @@ final class TreeText {
                     text.append(" (where ").append(expr(match.where())).append(')');
                 }
                 text.append(" (return");
+                if (match.distinct()) {
+                    text.append(" distinct");
+                }
                 for (Stmt.Item item : match.items()) {
                     text.append(' ').append(item.alias() == null ? expr(item.expr()) : expr(item.expr()) + ":" + item.alias());
                 }
@@ -49,7 +52,42 @@ final class TreeText {
                 text.append(')');
                 yield text.toString();
             }
+            case Stmt.Set set -> assignment(set.source(), set.edge(), set.target(), set.where(), set.assignments(), null);
+            case Stmt.Delete delete -> assignment(delete.source(), delete.edge(), delete.target(), delete.where(), null, delete.variables());
         };
+    }
+
+    private static String assignment(
+            Stmt.NodePat source,
+            Stmt.EdgePat edge,
+            Stmt.NodePat target,
+            Expr where,
+            java.util.List<Stmt.Assign> assignments,
+            java.util.List<String> variables) {
+        StringBuilder text = new StringBuilder(assignments == null ? "(delete " : "(set ");
+        text.append(node(source));
+        if (edge != null) {
+            text.append(' ').append(edge(edge)).append(' ').append(node(target));
+        }
+        if (where != null) {
+            text.append(" (where ").append(expr(where)).append(')');
+        }
+        if (assignments != null) {
+            text.append(" (assign");
+            for (Stmt.Assign assign : assignments) {
+                text.append(' ').append(assign.variable()).append('.').append(assign.field())
+                        .append('=').append(expr(assign.value()));
+            }
+            text.append(')');
+        } else {
+            text.append(" (vars");
+            for (String variable : variables) {
+                text.append(' ').append(variable);
+            }
+            text.append(')');
+        }
+        text.append(')');
+        return text.toString();
     }
 
     private static String fields(java.util.List<Stmt.Field> fields) {

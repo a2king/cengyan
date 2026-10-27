@@ -16,6 +16,7 @@ import io.cengyan.parser.ParseException;
 import io.cengyan.parser.Stmt;
 import io.cengyan.store.GraphStore;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,13 +27,20 @@ import java.util.Map;
 public final class QueryEngine {
     private final Catalog catalog;
     private final MatchExecutor match;
+    private final MutateExecutor mutate;
 
     public QueryEngine(Catalog catalog, GraphStore store) {
+        this(catalog, store, "1GB", Path.of(System.getProperty("java.io.tmpdir"), "cengyan-duck"));
+    }
+
+    public QueryEngine(Catalog catalog, GraphStore store, String duckdbMemory, Path duckdbTempDirectory) {
         if (catalog == null || store == null) {
             throw new IllegalArgumentException("目录和存储不能为空");
         }
         this.catalog = catalog;
-        this.match = new MatchExecutor(catalog, store);
+        DuckSettings duck = new DuckSettings(duckdbMemory, duckdbTempDirectory);
+        this.match = new MatchExecutor(catalog, store, duck);
+        this.mutate = new MutateExecutor(catalog, store);
     }
 
     public QueryResult execute(
@@ -93,6 +101,9 @@ public final class QueryEngine {
                     insert(graphId(session), insert, values);
                     yield QueryResult.changed(1);
                 }
+                case Stmt.Set set -> QueryResult.changed(mutate.set(set, graphId(session), values, limits, cancel));
+                case Stmt.Delete delete -> QueryResult.changed(
+                        mutate.delete(delete, graphId(session), values, limits, cancel));
                 case Stmt.Match query -> match.run(query, graphId(session), values, limits, cancel);
             };
         }

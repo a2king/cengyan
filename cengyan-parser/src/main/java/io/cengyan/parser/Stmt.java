@@ -45,7 +45,17 @@ public sealed interface Stmt {
             List<Item> items,
             List<Sort> orderBy,
             Long skip,
-            Long limit) implements Stmt {
+            Long limit,
+            boolean distinct) implements Stmt {
+    }
+
+    record Assign(String variable, String field, Expr value) {
+    }
+
+    record Set(NodePat source, EdgePat edge, NodePat target, Expr where, List<Assign> assignments) implements Stmt {
+    }
+
+    record Delete(NodePat source, EdgePat edge, NodePat target, Expr where, List<String> variables) implements Stmt {
     }
 
     record Field(String name, String valueType, boolean nullable) {

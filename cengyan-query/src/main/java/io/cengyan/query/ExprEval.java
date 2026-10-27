@@ -155,6 +155,7 @@ final class ExprEval {
                 }
                 yield (long) list.size();
             }
+            case "count", "sum" -> throw new CengyanException(ErrorCode.SYNTAX, "聚合只能写在 RETURN");
             default -> throw new CengyanException(ErrorCode.SYNTAX, "未知函数 " + call.name());
         };
     }

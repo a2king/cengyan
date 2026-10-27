@@ -49,6 +49,13 @@ class GqlSyntaxTest {
                 Gql.tree("CREATE NODE TYPE Company (name STRING, capital INT64 NULL)"));
         assertEquals("(alter rel holder note STRING)",
                 Gql.tree("ALTER REL TYPE holder ADD note STRING NULL"));
+        assertEquals("(set (node a:Company id=1) (edge OUT e:holder) (node b id=2) (assign e.ratio=0.2))",
+                Gql.tree("MATCH (a:Company {id:1})-[e:holder]->(b {id:2}) SET e.ratio = 0.2"));
+        assertEquals("(delete (node a id=1) (vars a))",
+                Gql.tree("MATCH (a {id:1}) DELETE a"));
+        assertTrue(Gql.tree("MATCH (a:Company {id:1})-[:holder]->(b) RETURN DISTINCT b.id").contains("distinct"));
+        assertInstanceOf(Expr.Call.class, ((Stmt.Match) Gql.parse(
+                "MATCH (a:Company {id:1})-[:holder]->(b) RETURN count(*)")).items().get(0).expr());
     }
 
     @Test

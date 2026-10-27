@@ -217,6 +217,100 @@ class QueryEngineTest {
         }
     }
 
+    @Test
+    void 修改和删除一次提交() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH Company",
+                    "USE Company",
+                    "CREATE NODE TYPE Company (name STRING NULL)",
+                    "CREATE REL TYPE holder (ratio DOUBLE NULL)",
+                    "INSERT (a:Company {id:1, name:'root'})-[:holder {ratio:0.5}]->(b:Company {id:2})",
+                    "INSERT (a:Company {id:1})-[:holder {ratio:0.2}]->(b:Company {id:3})");
+            int graphId = db.session.current().graphId();
+            QueryResult updated = run(db,
+                    "MATCH (a:Company {id:1})-[e:holder]->(b {id:2}) SET e.ratio = 0.25, a.name = 'renamed'");
+            assertEquals(2, updated.rowsAffected());
+            assertEquals(0.25d, db.catalog.readRel(graphId, "holder", 0L, 1L, 2L).get("ratio"));
+            assertEquals("renamed", db.catalog.readVertex(graphId, "Company", 1L).get("name"));
+            assertEquals(0.2d, db.catalog.readRel(graphId, "holder", 0L, 1L, 3L).get("ratio"));
+            QueryResult missed = run(db,
+                    "MATCH (a:Company {id:1})-[e:holder]->(b) WHERE b.id = 9 SET e.ratio = 0.9");
+            assertEquals(0, missed.rowsAffected());
+            assertEquals(0.25d, db.catalog.readRel(graphId, "holder", 0L, 1L, 2L).get("ratio"));
+            db.store.injectBeforeWrite(() -> {
+                throw new CengyanException(ErrorCode.INTERNAL, "提交前失败");
+            });
+            CengyanException crashed = assertThrows(CengyanException.class, () -> run(db,
+                    "MATCH (a:Company {id:1})-[e:holder]->(b {id:2}) SET e.ratio = 0.8"));
+            assertTrue(crashed.getMessage().contains("提交前失败"));
+            assertEquals(0.25d, db.catalog.readRel(graphId, "holder", 0L, 1L, 2L).get("ratio"));
+            QueryResult deleted = run(db, "MATCH (a:Company {id:1})-[e:holder]->(b {id:2}) DELETE e");
+            assertEquals(1, deleted.rowsAffected());
+            assertEquals(null, db.catalog.readRel(graphId, "holder", 0L, 1L, 2L));
+            assertEquals(0.2d, db.catalog.readRel(graphId, "holder", 0L, 1L, 3L).get("ratio"));
+            QueryResult removed = run(db, "MATCH (a:Company {id:1}) DELETE a");
+            assertEquals(1, removed.rowsAffected());
+            assertEquals(null, db.catalog.readVertex(graphId, "Company", 1L));
+            assertEquals(null, db.catalog.readRel(graphId, "holder", 0L, 1L, 3L));
+            CengyanException multi = assertThrows(CengyanException.class, () -> run(db,
+                    "MATCH (a:Company {id:1})-[:holder]->{1,2}(b) DELETE b"));
+            assertEquals(ErrorCode.SYNTAX, multi.code());
+            assertTrue(multi.getMessage().contains("一跳"));
+        }
+    }
+
+    @Test
+    void 点的边数超过上限时不删除() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH Company",
+                    "USE Company",
+                    "CREATE NODE TYPE Company ()",
+                    "CREATE REL TYPE holder ()");
+            int graphId = db.session.current().graphId();
+            for (int i = 2; i <= 66; i++) {
+                db.catalog.insertRel(graphId, "holder", 0L,
+                        VertexWrite.of("Company", 1L, Map.of()), VertexWrite.onlyId(i), Map.of(), false);
+            }
+            CengyanException exceeded = assertThrows(CengyanException.class,
+                    () -> run(db, "MATCH (a:Company {id:1}) DELETE a"));
+            assertEquals(ErrorCode.VERTEX_DEGREE_EXCEEDED, exceeded.code());
+            assertEquals(Map.of(), db.catalog.readRel(graphId, "holder", 0L, 1L, 2L));
+            assertEquals(Map.of(), db.catalog.readVertex(graphId, "Company", 1L));
+        }
+    }
+
+    @Test
+    void 聚合和去重在已经收住的行上计算() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH Company",
+                    "USE Company",
+                    "CREATE NODE TYPE Company ()",
+                    "CREATE REL TYPE holder (ratio DOUBLE NULL)",
+                    "INSERT (a:Company {id:1})-[:holder {ratio:0.5}]->(b:Company {id:2})",
+                    "INSERT (a:Company {id:1})-[:holder@1 {ratio:0.5}]->(b:Company {id:2})",
+                    "INSERT (a:Company {id:1})-[:holder {ratio:0.25}]->(b:Company {id:3})");
+            QueryResult distinct = run(db,
+                    "MATCH (a:Company {id:1})-[:holder]->(b) RETURN DISTINCT b.id AS id ORDER BY id");
+            assertEquals(List.of(2L, 3L), column(distinct, 0));
+            QueryResult totals = run(db,
+                    "MATCH (a:Company {id:1})-[e:holder]->(b) RETURN count(*) AS n, sum(e.ratio) AS total");
+            assertEquals(List.of("n", "total"), totals.columns());
+            assertEquals(3L, totals.rows().get(0).get(0));
+            assertEquals(1.25d, ((Number) totals.rows().get(0).get(1)).doubleValue(), 1e-9);
+            QueryResult empty = run(db,
+                    "MATCH (a:Company {id:1})-[e:holder]->(b) WHERE b.id = 9 RETURN count(*) AS n, sum(e.ratio) AS total");
+            assertEquals(0L, empty.rows().get(0).get(0));
+            assertEquals(null, empty.rows().get(0).get(1));
+            CengyanException mixed = assertThrows(CengyanException.class, () -> run(db,
+                    "MATCH (a:Company {id:1})-[e:holder]->(b) RETURN count(*), b.id"));
+            assertEquals(ErrorCode.SYNTAX, mixed.code());
+            assertTrue(mixed.getMessage().contains("聚合"));
+        }
+    }
+
     private static QueryResult run(Db db, String gql) {
         return run(db, gql, limits());
     }

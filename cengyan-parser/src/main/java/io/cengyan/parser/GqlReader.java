@@ -52,6 +52,9 @@ final class GqlReader {
             Map.entry("as", Kind.AS),
             Map.entry("asc", Kind.ASC),
             Map.entry("desc", Kind.DESC),
+            Map.entry("set", Kind.SET),
+            Map.entry("delete", Kind.DELETE),
+            Map.entry("distinct", Kind.DISTINCT),
             Map.entry("true", Kind.TRUE),
             Map.entry("false", Kind.FALSE));
 
@@ -172,10 +175,24 @@ final class GqlReader {
     private Stmt match() {
         expect(Kind.MATCH, "缺少 MATCH");
         Stmt.NodePat source = node();
-        Stmt.EdgePat edge = edge();
-        Stmt.NodePat target = node();
+        Stmt.EdgePat edge = null;
+        Stmt.NodePat target = null;
+        if (peek() == Kind.MINUS || peek() == Kind.LARROW) {
+            edge = edge();
+            target = node();
+        }
         Expr where = take(Kind.WHERE) ? expr() : null;
+        if (take(Kind.SET)) {
+            return new Stmt.Set(source, edge, target, where, assignments());
+        }
+        if (take(Kind.DELETE)) {
+            return new Stmt.Delete(source, edge, target, where, variables());
+        }
+        if (edge == null) {
+            return fail("这里要写边、SET 或 DELETE");
+        }
         expect(Kind.RETURN, "缺少 RETURN");
+        boolean distinct = take(Kind.DISTINCT);
         List<Stmt.Item> items = items();
         List<Stmt.Sort> order = List.of();
         if (take(Kind.ORDER)) {
@@ -184,7 +201,33 @@ final class GqlReader {
         }
         Long skip = take(Kind.SKIP) ? integer() : null;
         Long limit = take(Kind.LIMIT) ? integer() : null;
-        return new Stmt.Match(source, edge, target, where, items, order, skip, limit);
+        return new Stmt.Match(source, edge, target, where, items, order, skip, limit, distinct);
+    }
+
+    private List<Stmt.Assign> assignments() {
+        List<Stmt.Assign> assignments = new ArrayList<>();
+        assignments.add(assignment());
+        while (take(Kind.COMMA)) {
+            assignments.add(assignment());
+        }
+        return List.copyOf(assignments);
+    }
+
+    private Stmt.Assign assignment() {
+        String variable = ident();
+        expect(Kind.DOT, "SET 要写成 变量.属性 = 值");
+        String field = ident();
+        expect(Kind.EQ, "SET 缺少等号");
+        return new Stmt.Assign(variable, field, expr());
+    }
+
+    private List<String> variables() {
+        List<String> names = new ArrayList<>();
+        names.add(ident());
+        while (take(Kind.COMMA)) {
+            names.add(ident());
+        }
+        return List.copyOf(names);
     }
 
     private boolean nodeOrRel() {
@@ -489,6 +532,11 @@ final class GqlReader {
             String name = next().text;
             if (take(Kind.LP)) {
                 List<Expr> args = new ArrayList<>();
+                if (take(Kind.STAR)) {
+                    args.add(new Expr.Literal("*"));
+                    expect(Kind.RP, "函数调用缺少右括号");
+                    return new Expr.Call(name, List.copyOf(args));
+                }
                 if (!take(Kind.RP)) {
                     args.add(expr());
                     while (take(Kind.COMMA)) {
@@ -769,6 +817,7 @@ final class GqlReader {
         BOOL, BOOLEAN, INT, INT64, INTEGER_WORD, DOUBLE, DATETIME,
         CREATE, GRAPH, GRAPHS, USE, ALIAS, ALIASES, FOR, DROP, SHOW, NODE, REL, TYPES, TYPE,
         DESCRIBE, ALTER, ADD, NULL, INSERT, MATCH, WHERE, RETURN, ORDER, BY, LIMIT, SKIP,
+        SET, DELETE, DISTINCT,
         AND, OR, NOT, IS, IN, AS, ASC, DESC, TRUE, FALSE,
         ARROW, LARROW, LE, GE, NEQ, EQ, LT, GT, PLUS, MINUS, STAR, SLASH,
         LP, RP, LB, RB, LC, RC, COMMA, COLON, SEMI, DOT, AT, DOLLAR, EOF

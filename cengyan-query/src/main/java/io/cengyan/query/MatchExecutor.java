@@ -30,18 +30,21 @@ import java.util.function.LongPredicate;
 
 /**
  * 一跳 MATCH。只涉及 rank 和终点 id 的条件在扫描时判断。
- * 属性在收满 LIMIT 之后一次取出。排序作用在这些已经收住的行上。
+ * 属性在收满 LIMIT 之后一次取出。排序、去重和聚合交给 DuckDB，作用在这些已经收住的行上。
  */
 final class MatchExecutor {
     private final Catalog catalog;
     private final GraphStore store;
+    private final DuckSettings duck;
 
-    MatchExecutor(Catalog catalog, GraphStore store) {
+    MatchExecutor(Catalog catalog, GraphStore store, DuckSettings duck) {
         this.catalog = catalog;
         this.store = store;
+        this.duck = duck;
     }
 
     QueryResult run(Stmt.Match match, int graphId, Map<String, Object> params, QueryLimits limits, CancelToken cancel) {
+        String[] aggregates = aggregateKinds(match);
         int maxEdges = limits.maxEdgesPerVertex();
         Names names = names(match);
         RelType relType = catalog.relType(graphId, match.edge().typeName());
@@ -61,7 +64,7 @@ final class MatchExecutor {
         LongPredicate neighborOnly = push.neighbor;
         if (match.edge().minHop() != null) {
             return multi(match, graphId, limits, cancel, names, relType, sourceType, targetType, needs, eval,
-                    rankOnly, neighborOnly);
+                    rankOnly, neighborOnly, aggregates);
         }
         List<Hop> hops = new ArrayList<>();
         try (ReadSession session = store.read()) {
@@ -116,41 +119,8 @@ final class MatchExecutor {
                     matchedEdgeProps.add(edgeProps.get(i));
                 }
             }
-            List<String> columns = new ArrayList<>();
-            for (Stmt.Item item : match.items()) {
-                columns.add(item.alias() == null ? item.text() : item.alias());
-            }
-            List<List<Object>> rows = new ArrayList<>();
-            List<List<Object>> sortKeys = new ArrayList<>();
-            for (int i = 0; i < matched.size(); i++) {
-                Hop hop = matched.get(i);
-                eval.slots(slots(names, match, hop, sourceType, targetType,
-                        matchedEdgeProps == null ? null : matchedEdgeProps.get(i),
-                        sourceProps.get(hop.start()), targetProps.get(hop.neighbor())));
-                List<Object> row = new ArrayList<>();
-                for (Stmt.Item item : match.items()) {
-                    row.add(DateTimes.plain(eval.eval(item.expr())));
-                }
-                rows.add(row);
-                if (!match.orderBy().isEmpty()) {
-                    List<Stmt.Sort> sorts = sorts(match, names);
-                    List<Object> keys = new ArrayList<>();
-                    for (Stmt.Sort sort : sorts) {
-                        keys.add(DateTimes.plain(eval.eval(sort.expr())));
-                    }
-                    sortKeys.add(keys);
-                }
-            }
-            order(rows, sortKeys, sorts(match, names));
-            int skip = match.skip() == null ? 0 : Math.toIntExact(match.skip());
-            if (skip > 0) {
-                if (skip >= rows.size()) {
-                    rows = List.of();
-                } else {
-                    rows = rows.subList(skip, rows.size());
-                }
-            }
-            return new QueryResult(columns, rows, 0);
+            return project(match, names, sourceType, targetType, eval, matched, matchedEdgeProps,
+                    sourceProps, targetProps, aggregates, false);
         }
     }
 
@@ -166,7 +136,8 @@ final class MatchExecutor {
             Needs needs,
             ExprEval eval,
             LongPredicate rank,
-            LongPredicate neighbor) {
+            LongPredicate neighbor,
+            String[] aggregates) {
         int minHop = match.edge().minHop();
         int maxHop = match.edge().maxHop() == null ? minHop : match.edge().maxHop();
         Long startId = constantId(match.source().properties(), eval);
@@ -199,38 +170,11 @@ final class MatchExecutor {
                     ? vertexProps(session, graphId, sourceType, reachHops(reached, true), true) : Map.of();
             Map<Long, Map<String, Object>> targetProps = needs.target
                     ? vertexProps(session, graphId, targetType, reachHops(reached, false), false) : Map.of();
-            List<String> columns = new ArrayList<>();
-            for (Stmt.Item item : match.items()) {
-                columns.add(item.alias() == null ? item.text() : item.alias());
-            }
-            List<List<Object>> rows = new ArrayList<>();
-            List<List<Object>> sortKeys = new ArrayList<>();
-            List<Stmt.Sort> sorts = sorts(match, names);
+            List<Hop> hops = new ArrayList<>();
             for (Reach hop : reached) {
-                eval.slots(slots(names, match, new Hop(hop.start(), hop.vid(), null), sourceType, targetType,
-                        null, sourceProps.get(hop.start()), targetProps.get(hop.vid())));
-                List<Object> row = new ArrayList<>();
-                for (Stmt.Item item : match.items()) {
-                    row.add(DateTimes.plain(eval.eval(item.expr())));
-                }
-                rows.add(row);
-                if (!sorts.isEmpty()) {
-                    List<Object> keys = new ArrayList<>();
-                    for (Stmt.Sort sort : sorts) {
-                        keys.add(DateTimes.plain(eval.eval(sort.expr())));
-                    }
-                    sortKeys.add(keys);
-                }
+                hops.add(new Hop(hop.start(), hop.vid(), null));
             }
-            order(rows, sortKeys, sorts);
-            int skip = match.skip() == null ? 0 : Math.toIntExact(match.skip());
-            if (skip > 0) {
-                rows = skip >= rows.size() ? List.of() : new ArrayList<>(rows.subList(skip, rows.size()));
-            }
-            if (match.limit() != null && match.limit() < rows.size()) {
-                rows = new ArrayList<>(rows.subList(0, match.limit().intValue()));
-            }
-            return new QueryResult(columns, rows, 0);
+            return project(match, names, sourceType, targetType, eval, hops, null, sourceProps, targetProps, aggregates, true);
         }
     }
 
@@ -415,55 +359,135 @@ final class MatchExecutor {
         return type == null ? null : type.name();
     }
 
-    private static void order(List<List<Object>> rows, List<List<Object>> keys, List<Stmt.Sort> sorts) {
-        if (sorts.isEmpty() || rows.size() < 2) {
-            return;
+    private QueryResult project(
+            Stmt.Match match,
+            Names names,
+            NodeType sourceType,
+            NodeType targetType,
+            ExprEval eval,
+            List<Hop> matched,
+            List<Map<String, Object>> edgeProps,
+            Map<Long, Map<String, Object>> sourceProps,
+            Map<Long, Map<String, Object>> targetProps,
+            String[] aggregates,
+            boolean limitAfter) {
+        List<String> columns = new ArrayList<>();
+        for (Stmt.Item item : match.items()) {
+            columns.add(item.alias() == null ? item.text() : item.alias());
         }
-        Integer[] index = new Integer[rows.size()];
-        for (int i = 0; i < index.length; i++) {
-            index[i] = i;
+        List<Stmt.Sort> sorts = aggregates == null ? sorts(match, names) : List.of();
+        List<List<Object>> rows = new ArrayList<>();
+        List<List<Object>> sortKeys = new ArrayList<>();
+        for (int i = 0; i < matched.size(); i++) {
+            Hop hop = matched.get(i);
+            eval.slots(slots(names, match, hop, sourceType, targetType,
+                    edgeProps == null ? null : edgeProps.get(i),
+                    sourceProps.get(hop.start()), targetProps.get(hop.neighbor())));
+            List<Object> row = new ArrayList<>();
+            for (int column = 0; column < match.items().size(); column++) {
+                row.add(cell(eval, match.items().get(column), aggregates == null ? null : aggregates[column]));
+            }
+            rows.add(row);
+            if (!sorts.isEmpty()) {
+                List<Object> keys = new ArrayList<>();
+                for (Stmt.Sort sort : sorts) {
+                    keys.add(DateTimes.plain(eval.eval(sort.expr())));
+                }
+                sortKeys.add(keys);
+            }
         }
-        java.util.Arrays.sort(index, (left, right) -> compareRow(keys.get(left), keys.get(right), sorts));
-        List<List<Object>> ordered = new ArrayList<>(rows.size());
-        for (int position : index) {
-            ordered.add(rows.get(position));
-        }
-        rows.clear();
-        rows.addAll(ordered);
+        return finish(match, columns, rows, sortKeys, sorts, aggregates, limitAfter);
     }
 
-    private static int compareRow(List<Object> left, List<Object> right, List<Stmt.Sort> sorts) {
-        for (int i = 0; i < sorts.size(); i++) {
-            int compared = compareValue(left.get(i), right.get(i));
-            if (compared != 0) {
-                return sorts.get(i).descending() ? -compared : compared;
+    private QueryResult finish(
+            Stmt.Match match,
+            List<String> columns,
+            List<List<Object>> rows,
+            List<List<Object>> sortKeys,
+            List<Stmt.Sort> sorts,
+            String[] aggregates,
+            boolean limitAfter) {
+        Long skip = match.skip();
+        Long limit = limitAfter ? match.limit() : null;
+        boolean reshape = aggregates != null || match.distinct() || !sorts.isEmpty() || (skip != null && skip > 0);
+        if (!reshape) {
+            if (limit != null && limit < rows.size()) {
+                rows = new ArrayList<>(rows.subList(0, limit.intValue()));
             }
+            return new QueryResult(columns, rows, 0);
         }
-        return 0;
+        List<List<Object>> shaped = aggregates != null
+                ? page(DuckResult.aggregate(rows, aggregates, duck), skip, limit)
+                : DuckResult.arrange(rows, sortKeys, sorts, match.distinct(), skip, limit, duck);
+        return new QueryResult(columns, shaped, 0);
     }
 
-    private static int compareValue(Object left, Object right) {
-        if (left == null || right == null) {
-            if (left == right) {
-                return 0;
+    private static List<List<Object>> page(List<List<Object>> rows, Long skip, Long limit) {
+        int from = skip == null ? 0 : Math.toIntExact(skip);
+        if (from >= rows.size()) {
+            return List.of();
+        }
+        int to = rows.size();
+        if (limit != null) {
+            to = (int) Math.min(to, (long) from + limit);
+        }
+        if (from == 0 && to == rows.size()) {
+            return rows;
+        }
+        return new ArrayList<>(rows.subList(from, to));
+    }
+
+    private static Object cell(ExprEval eval, Stmt.Item item, String kind) {
+        if (kind == null) {
+            return DateTimes.plain(eval.eval(item.expr()));
+        }
+        if ("star".equals(kind)) {
+            return 1L;
+        }
+        Expr.Call call = (Expr.Call) item.expr();
+        return DateTimes.plain(eval.eval(call.args().get(0)));
+    }
+
+    private static String[] aggregateKinds(Stmt.Match match) {
+        String[] kinds = new String[match.items().size()];
+        boolean aggregate = false;
+        boolean plain = false;
+        for (int i = 0; i < match.items().size(); i++) {
+            Expr expr = match.items().get(i).expr();
+            if (expr instanceof Expr.Call call && aggregateName(call.name())) {
+                aggregate = true;
+                boolean star = call.args().size() == 1
+                        && call.args().get(0) instanceof Expr.Literal literal
+                        && "*".equals(literal.value());
+                String name = call.name().toLowerCase(java.util.Locale.ROOT);
+                if (star && !"count".equals(name)) {
+                    throw new CengyanException(ErrorCode.SYNTAX, name + " 不能写星号");
+                }
+                kinds[i] = star ? "star" : name;
+            } else {
+                plain = true;
             }
-            return left == null ? 1 : -1;
         }
-        if (left instanceof Number && right instanceof Number) {
-            if (left instanceof Double || right instanceof Double) {
-                return Double.compare(((Number) left).doubleValue(), ((Number) right).doubleValue());
-            }
-            return Long.compare(((Number) left).longValue(), ((Number) right).longValue());
+        if (!aggregate) {
+            return null;
         }
-        if (left instanceof String text && right instanceof String other) {
-            return java.util.Arrays.compareUnsigned(
-                    text.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                    other.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        if (plain) {
+            throw new CengyanException(ErrorCode.SYNTAX, "聚合不能和普通列混在一起");
         }
-        if (left instanceof Boolean && right instanceof Boolean) {
-            return Boolean.compare((Boolean) left, (Boolean) right);
+        if (match.distinct()) {
+            throw new CengyanException(ErrorCode.SYNTAX, "聚合不能再写 DISTINCT");
         }
-        throw new CengyanException(ErrorCode.TYPE_MISMATCH, "这两边的类型不能排序");
+        if (!match.orderBy().isEmpty()) {
+            throw new CengyanException(ErrorCode.SYNTAX, "聚合结果不能再排序");
+        }
+        return kinds;
+    }
+
+    private static boolean aggregateName(String name) {
+        return switch (name.toLowerCase(java.util.Locale.ROOT)) {
+            case "count", "sum" -> true;
+            default -> false;
+        };
     }
 
     private static List<Stmt.Sort> sorts(Stmt.Match match, Names names) {
@@ -742,12 +766,15 @@ final class MatchExecutor {
             boolean source = !withoutId(match.source().properties()).isEmpty();
             boolean target = !withoutId(match.target().properties()).isEmpty();
             Walker walker = new Walker(names, sourceType, targetType, relType);
+            walker.place = 0;
             if (match.where() != null) {
                 walker.walk(match.where());
             }
+            walker.place = 1;
             for (Stmt.Item item : match.items()) {
                 walker.walk(item.expr());
             }
+            walker.place = 2;
             for (Stmt.Sort sort : orderBy) {
                 walker.walk(sort.expr());
             }
@@ -777,6 +804,7 @@ final class MatchExecutor {
         private boolean edge;
         private boolean source;
         private boolean target;
+        private int place;
 
         private Walker(Names names, NodeType sourceType, NodeType targetType, RelType relType) {
             this.names = names;
@@ -795,7 +823,25 @@ final class MatchExecutor {
                 case Expr.Prop prop -> property(prop);
                 case Expr.Call call -> {
                     checkFunction(call.name());
+                    if (aggregateName(call.name())) {
+                        if (place != 1) {
+                            throw new CengyanException(ErrorCode.SYNTAX, "聚合只能写在 RETURN");
+                        }
+                        boolean star = call.args().size() == 1
+                                && call.args().get(0) instanceof Expr.Literal literal
+                                && "*".equals(literal.value());
+                        String lower = call.name().toLowerCase(java.util.Locale.ROOT);
+                        if (star && !"count".equals(lower)) {
+                            throw new CengyanException(ErrorCode.SYNTAX, lower + " 不能写星号");
+                        }
+                        if (!star && call.args().size() != 1) {
+                            throw new CengyanException(ErrorCode.SYNTAX, call.name() + " 的参数个数不对");
+                        }
+                    }
                     for (Expr arg : call.args()) {
+                        if (arg instanceof Expr.Literal literal && "*".equals(literal.value())) {
+                            continue;
+                        }
                         walk(arg);
                     }
                 }
@@ -885,7 +931,7 @@ final class MatchExecutor {
 
         private static void checkFunction(String name) {
             switch (name.toLowerCase(java.util.Locale.ROOT)) {
-                case "id", "labels", "type", "properties", "startnode", "endnode", "coalesce", "size", "length" -> {
+                case "id", "labels", "type", "properties", "startnode", "endnode", "coalesce", "size", "length", "count", "sum" -> {
                 }
                 default -> throw new CengyanException(ErrorCode.SYNTAX, "未知函数 " + name);
             }

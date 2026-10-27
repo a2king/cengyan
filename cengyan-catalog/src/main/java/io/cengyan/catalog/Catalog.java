@@ -17,6 +17,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -383,6 +385,166 @@ public final class Catalog {
             }
             return rows;
         }
+    }
+
+    /**
+     * 在同一把写锁里修改或删除。点的边数超过上限时整句不提交。
+     * 只有边键的批次走成对提交，只改点或属性时走普通写入。
+     */
+    public int apply(int graphId, List<Mutation> mutations, int maxEdgesPerVertex) {
+        if (mutations == null) {
+            throw new IllegalArgumentException("修改不能为空");
+        }
+        if (maxEdgesPerVertex <= 0) {
+            throw new IllegalArgumentException("点的边数上限必须为正");
+        }
+        if (mutations.isEmpty()) {
+            return 0;
+        }
+        return store.withWriteLock(() -> applyLocked(graphId, mutations, maxEdgesPerVertex));
+    }
+
+    private int applyLocked(int graphId, List<Mutation> mutations, int maxEdgesPerVertex) {
+        requireGraph(graphId);
+        StoreBatch batch = new StoreBatch();
+        boolean edgeKeys = false;
+        int affected = 0;
+        try (ReadSession session = store.read()) {
+            for (Mutation mutation : mutations) {
+                switch (mutation) {
+                    case Mutation.SetVertex set -> affected += writeVertex(session, batch, graphId, set);
+                    case Mutation.SetEdge set -> affected += writeEdge(session, batch, graphId, set);
+                    case Mutation.DeleteEdge delete -> {
+                        if (removeEdge(session, batch, graphId, delete)) {
+                            affected++;
+                            edgeKeys = true;
+                        }
+                    }
+                    case Mutation.DeleteVertex delete -> {
+                        int removed = removeVertex(session, batch, graphId, delete.vid(), maxEdgesPerVertex);
+                        if (removed > 0) {
+                            affected++;
+                        }
+                        if (removed == 2) {
+                            edgeKeys = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (batch.isEmpty()) {
+            return 0;
+        }
+        if (edgeKeys) {
+            store.commitEdges(batch);
+        } else {
+            store.mutate(batch);
+        }
+        return affected;
+    }
+
+    private int writeVertex(ReadSession session, StoreBatch batch, int graphId, Mutation.SetVertex set) {
+        NodeType type = nodeType(graphId, set.typeName());
+        Map<String, Object> updates = checkedUpdates(type.properties(), set.updates());
+        byte[] key = KeyCodec.vertexKey(graphId, KeyCodec.partOf(set.vid()), set.vid(), type.id());
+        byte[] raw = session.get(Cf.VERTEX, key);
+        if (raw == null) {
+            return 0;
+        }
+        Map<String, Object> merged = new LinkedHashMap<>(PropCodec.decode(type.properties(), type.schemaVersion(), raw));
+        merged.putAll(updates);
+        batch.put(Cf.VERTEX, key, PropCodec.encode(type.schemaVersion(), type.properties(), merged));
+        return 1;
+    }
+
+    private int writeEdge(ReadSession session, StoreBatch batch, int graphId, Mutation.SetEdge set) {
+        samePart(set.outSrc(), set.outDst());
+        RelType type = relType(graphId, set.typeName());
+        Map<String, Object> updates = checkedUpdates(type.properties(), set.updates());
+        byte[] key = KeyCodec.propKey(graphId, type.id(), set.rank(), set.outSrc(), set.outDst());
+        byte[] raw = session.get(Cf.PROP, key);
+        if (raw == null) {
+            return 0;
+        }
+        Map<String, Object> merged = new LinkedHashMap<>(PropCodec.decode(type.properties(), type.schemaVersion(), raw));
+        merged.putAll(updates);
+        batch.put(Cf.PROP, key, PropCodec.encode(type.schemaVersion(), type.properties(), merged));
+        return 1;
+    }
+
+    private boolean removeEdge(ReadSession session, StoreBatch batch, int graphId, Mutation.DeleteEdge delete) {
+        samePart(delete.outSrc(), delete.outDst());
+        RelType type = relType(graphId, delete.typeName());
+        byte[] prop = KeyCodec.propKey(graphId, type.id(), delete.rank(), delete.outSrc(), delete.outDst());
+        byte[] out = edgeKey(graphId, type.id(), Direction.OUT, delete.outSrc(), delete.rank(), delete.outDst());
+        byte[] in = edgeKey(graphId, type.id(), Direction.IN, delete.outDst(), delete.rank(), delete.outSrc());
+        if (session.get(Cf.PROP, prop) == null && session.get(Cf.EDGE, out) == null) {
+            return false;
+        }
+        batch.delete(Cf.EDGE, out);
+        batch.delete(Cf.EDGE, in);
+        batch.delete(Cf.PROP, prop);
+        return true;
+    }
+
+    /** @return 0 没有这个点，1 只删了点，2 还删了边 */
+    private int removeVertex(
+            ReadSession session, StoreBatch batch, int graphId, long vid, int maxEdgesPerVertex) {
+        int part = KeyCodec.partOf(vid);
+        byte[] prefix = KeyCodec.vertexPrefix(graphId, part, vid);
+        LinkedHashSet<EdgeRef> edges = new LinkedHashSet<>();
+        for (byte[] key : session.keysWithPrefix(Cf.EDGE, prefix)) {
+            if (key.length != KeyCodec.EDGE_KEY_LENGTH) {
+                continue;
+            }
+            edges.add(KeyCodec.toLogical(key));
+            if (edges.size() > maxEdgesPerVertex) {
+                throw new CengyanException(ErrorCode.VERTEX_DEGREE_EXCEEDED,
+                        "点 " + vid + " 的边数为 " + edges.size() + "，超过上限 " + maxEdgesPerVertex);
+            }
+        }
+        List<byte[]> vertices = session.keysWithPrefix(Cf.VERTEX, prefix);
+        if (edges.isEmpty() && vertices.isEmpty()) {
+            return 0;
+        }
+        for (EdgeRef edge : edges) {
+            samePart(edge.outSrc(), edge.outDst());
+            batch.delete(Cf.EDGE, edgeKey(graphId, edge.edgeTypeId(), Direction.OUT, edge.outSrc(), edge.rank(), edge.outDst()));
+            batch.delete(Cf.EDGE, edgeKey(graphId, edge.edgeTypeId(), Direction.IN, edge.outDst(), edge.rank(), edge.outSrc()));
+            batch.delete(Cf.PROP, KeyCodec.propKey(graphId, edge.edgeTypeId(), edge.rank(), edge.outSrc(), edge.outDst()));
+        }
+        for (byte[] key : vertices) {
+            batch.delete(Cf.VERTEX, key);
+        }
+        return edges.isEmpty() ? 1 : 2;
+    }
+
+    private static Map<String, Object> checkedUpdates(List<PropDef> properties, Map<String, Object> updates) {
+        for (String name : updates.keySet()) {
+            if (!hasProperty(properties, name)) {
+                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "未知属性 " + name);
+            }
+        }
+        return updates;
+    }
+
+    private static boolean hasProperty(List<PropDef> properties, String name) {
+        for (PropDef property : properties) {
+            if (property.name().equals(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void samePart(long left, long right) {
+        if (KeyCodec.partOf(left) != KeyCodec.partOf(right)) {
+            throw new CengyanException(ErrorCode.CROSS_PART_UNSUPPORTED, "边的两端落在不同分片");
+        }
+    }
+
+    private static byte[] edgeKey(int graphId, int edgeTypeId, Direction direction, long src, long rank, long dst) {
+        return KeyCodec.edgeKey(graphId, KeyCodec.partOf(src), src, edgeTypeId, direction.code(), rank, dst);
     }
 
     private void reload() {
