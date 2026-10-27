@@ -55,6 +55,8 @@ final class GqlReader {
             Map.entry("set", Kind.SET),
             Map.entry("delete", Kind.DELETE),
             Map.entry("distinct", Kind.DISTINCT),
+            Map.entry("call", Kind.CALL),
+            Map.entry("yield", Kind.YIELD),
             Map.entry("true", Kind.TRUE),
             Map.entry("false", Kind.FALSE));
 
@@ -94,6 +96,7 @@ final class GqlReader {
             case ALTER -> alter();
             case INSERT -> insert();
             case MATCH -> match();
+            case CALL -> call();
             default -> fail("无法识别的语句");
         };
     }
@@ -204,6 +207,42 @@ final class GqlReader {
         return new Stmt.Match(source, edge, target, where, items, order, skip, limit, distinct);
     }
 
+    private Stmt call() {
+        expect(Kind.CALL, "缺少 CALL");
+        String namespace = name();
+        expect(Kind.DOT, "过程名要写成名字.名字");
+        String procedure = name();
+        expect(Kind.LP, "过程缺少左括号");
+        expect(Kind.LC, "过程参数要写在花括号里");
+        List<Stmt.Arg> args = new ArrayList<>();
+        if (!take(Kind.RC)) {
+            args.add(arg(args));
+            while (take(Kind.COMMA)) {
+                args.add(arg(args));
+            }
+            expect(Kind.RC, "过程参数缺少右花括号");
+        }
+        expect(Kind.RP, "过程缺少右括号");
+        expect(Kind.YIELD, "过程调用要写 YIELD");
+        List<String> columns = new ArrayList<>();
+        columns.add(name());
+        while (take(Kind.COMMA)) {
+            columns.add(name());
+        }
+        return new Stmt.Call(namespace + "." + procedure, args, columns);
+    }
+
+    private Stmt.Arg arg(List<Stmt.Arg> args) {
+        String key = name();
+        for (Stmt.Arg existing : args) {
+            if (existing.name().equals(key)) {
+                return fail("参数 " + key + " 写了两次");
+            }
+        }
+        expect(Kind.COLON, "参数名后面要写冒号");
+        return new Stmt.Arg(key, expr());
+    }
+
     private List<Stmt.Assign> assignments() {
         List<Stmt.Assign> assignments = new ArrayList<>();
         assignments.add(assignment());
@@ -307,6 +346,10 @@ final class GqlReader {
     }
 
     private int[] quantifier() {
+        if (peek() == Kind.STAR) {
+            next();
+            return fail("不支持所有路径，请用最短路或给跳数加上边界");
+        }
         if (!take(Kind.LC)) {
             return null;
         }
@@ -561,6 +604,15 @@ final class GqlReader {
         return next().text;
     }
 
+    /** 参数名和过程名可以和关键字重合，例如 {@code rel}。 */
+    private String name() {
+        Tok token = at();
+        if (token.kind == Kind.IDENT || KEYWORDS.containsKey(token.text.toLowerCase(Locale.ROOT))) {
+            return next().text;
+        }
+        return fail("这里要写名字");
+    }
+
     private long integer() {
         if (peek() != Kind.INTEGER) {
             fail("这里要写整数");
@@ -719,7 +771,8 @@ final class GqlReader {
                 tokens.add(new Tok(real ? Kind.REAL : Kind.INTEGER, source.substring(start, index), start, index, line, startColumn));
                 continue;
             }
-            if (current == '\'') {
+            if (current == '\'' || current == '"') {
+                char quote = current;
                 int startColumn = column;
                 int bodyStart = index + 1;
                 index++;
@@ -731,9 +784,9 @@ final class GqlReader {
                     if (next == '\n' || next == '\r') {
                         throw new ParseException("第 " + line + " 行第 " + column + " 列字符串没有结束");
                     }
-                    if (next == '\'') {
-                        if (index + 1 < length && source.charAt(index + 1) == '\'') {
-                            body.append('\'');
+                    if (next == quote) {
+                        if (index + 1 < length && source.charAt(index + 1) == quote) {
+                            body.append(quote);
                             index += 2;
                             column += 2;
                             continue;
@@ -817,7 +870,7 @@ final class GqlReader {
         BOOL, BOOLEAN, INT, INT64, INTEGER_WORD, DOUBLE, DATETIME,
         CREATE, GRAPH, GRAPHS, USE, ALIAS, ALIASES, FOR, DROP, SHOW, NODE, REL, TYPES, TYPE,
         DESCRIBE, ALTER, ADD, NULL, INSERT, MATCH, WHERE, RETURN, ORDER, BY, LIMIT, SKIP,
-        SET, DELETE, DISTINCT,
+        SET, DELETE, DISTINCT, CALL, YIELD,
         AND, OR, NOT, IS, IN, AS, ASC, DESC, TRUE, FALSE,
         ARROW, LARROW, LE, GE, NEQ, EQ, LT, GT, PLUS, MINUS, STAR, SLASH,
         LP, RP, LB, RB, LC, RC, COMMA, COLON, SEMI, DOT, AT, DOLLAR, EOF

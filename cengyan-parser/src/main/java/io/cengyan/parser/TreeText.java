@@ -54,6 +54,19 @@ final class TreeText {
             }
             case Stmt.Set set -> assignment(set.source(), set.edge(), set.target(), set.where(), set.assignments(), null);
             case Stmt.Delete delete -> assignment(delete.source(), delete.edge(), delete.target(), delete.where(), null, delete.variables());
+            case Stmt.Call call -> {
+                StringBuilder text = new StringBuilder("(call ");
+                text.append(call.name());
+                for (Stmt.Arg arg : call.args()) {
+                    text.append(' ').append(arg.name()).append('=').append(expr(arg.value()));
+                }
+                text.append(" (yield");
+                for (String column : call.yield()) {
+                    text.append(' ').append(column);
+                }
+                text.append("))");
+                yield text.toString();
+            }
         };
     }
 

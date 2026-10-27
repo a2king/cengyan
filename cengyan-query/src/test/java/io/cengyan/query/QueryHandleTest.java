@@ -31,4 +31,18 @@ class QueryHandleTest {
         handle.onCancel(hits::incrementAndGet);
         assertEquals(1, hits.get());
     }
+
+    @Test
+    void 到点后检查取消会自己超时() throws Exception {
+        QueryHandle handle = QueryHandle.start(0);
+        AtomicInteger hits = new AtomicInteger();
+        handle.onCancel(hits::incrementAndGet);
+        Thread.sleep(5);
+        assertTrue(handle.cancelled());
+        assertEquals("超时", handle.reason());
+        assertEquals(1, hits.get());
+        handle.cancel("再次");
+        assertEquals("超时", handle.reason());
+        assertEquals(1, hits.get());
+    }
 }

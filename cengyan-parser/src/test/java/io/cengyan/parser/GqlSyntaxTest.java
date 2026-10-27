@@ -56,6 +56,18 @@ class GqlSyntaxTest {
         assertTrue(Gql.tree("MATCH (a:Company {id:1})-[:holder]->(b) RETURN DISTINCT b.id").contains("distinct"));
         assertInstanceOf(Expr.Call.class, ((Stmt.Match) Gql.parse(
                 "MATCH (a:Company {id:1})-[:holder]->(b) RETURN count(*)")).items().get(0).expr());
+        assertEquals("(call path.shortest start=1 end=2 rel='holder' hops=10 (yield length vids))",
+                Gql.tree("CALL path.shortest({start: 1, end: 2, rel: 'holder', hops: 10}) YIELD length, vids"));
+        assertEquals("(call ownership.largest_holder start=1 rel='holder' ratioProp='ratio' hops=10 (yield vid ratio))",
+                Gql.tree("CALL ownership.largest_holder({start: 1, rel: \"holder\", ratioProp: \"ratio\", hops: 10}) YIELD vid, ratio"));
+    }
+
+    @Test
+    void 所有路径直接拒绝() {
+        ParseException all = assertThrows(ParseException.class,
+                () -> Gql.parse("MATCH (a:Company {id:1})-[:holder]->*(b) RETURN b.id"));
+        assertTrue(all.getMessage().contains("所有路径"));
+        assertTrue(all.getMessage().contains("最短路"));
     }
 
     @Test

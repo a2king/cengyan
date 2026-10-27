@@ -24,6 +24,7 @@ statement
     | MATCH node (edge node)? whereClause? SET assignment (',' assignment)* #setStmt
     | MATCH node (edge node)? whereClause? DELETE IDENT (',' IDENT)* #deleteStmt
     | MATCH node edge node whereClause? returnClause orderClause? skipClause? limitClause? #matchStmt
+    | CALL namespace=IDENT '.' name=IDENT '(' '{' callArgs? '}' ')' YIELD yieldItem (',' yieldItem)* #callStmt
     ;
 
 fields: field (',' field)*;
@@ -37,7 +38,11 @@ edge
     | '-' '[' edgeBody ']' '-' quantifier?    #edgeAny
     ;
 edgeBody: variable=IDENT? ':' typeName=IDENT ('@' rank=INTEGER_LIT)? props?;
-quantifier: '{' min=INTEGER_LIT (',' max=INTEGER_LIT)? '}';
+// 星号表示所有路径。手写解析器会拒绝，并提示改用最短路或加上边界。
+quantifier: '{' min=INTEGER_LIT (',' max=INTEGER_LIT)? '}' | '*';
+callArgs: callArg (',' callArg)*;
+callArg: name=IDENT ':' expr;
+yieldItem: IDENT;
 props: '{' (prop (',' prop)*)? '}';
 prop: name=IDENT ':' expr;
 
@@ -103,6 +108,11 @@ ADD: A D D;
 NULL: N U L L;
 INSERT: I N S E R T;
 MATCH: M A T C H;
+CALL: C A L L;
+YIELD: Y I E L D;
+SET: S E T;
+DELETE: D E L E T E;
+DISTINCT: D I S T I N C T;
 WHERE: W H E R E;
 RETURN: R E T U R N;
 ORDER: O R D E R;
@@ -149,7 +159,7 @@ fragment Z: [Zz];
 
 INTEGER_LIT: [0-9]+;
 REAL_LIT: [0-9]+ '.' [0-9]* | '.' [0-9]+;
-STRING_LIT: '\'' (~['\r\n] | '\'\'')* '\'';
+STRING_LIT: '\'' (~['\r\n] | '\'\'')* '\'' | '"' (~["\r\n] | '""')* '"';
 IDENT: [A-Za-z] [A-Za-z0-9_]*;
 
 WS: [ \t\r\n]+ -> skip;

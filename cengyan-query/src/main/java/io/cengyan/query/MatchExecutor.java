@@ -120,7 +120,7 @@ final class MatchExecutor {
                 }
             }
             return project(match, names, sourceType, targetType, eval, matched, matchedEdgeProps,
-                    sourceProps, targetProps, aggregates, false);
+                    sourceProps, targetProps, aggregates, false, cancel);
         }
     }
 
@@ -174,7 +174,7 @@ final class MatchExecutor {
             for (Reach hop : reached) {
                 hops.add(new Hop(hop.start(), hop.vid(), null));
             }
-            return project(match, names, sourceType, targetType, eval, hops, null, sourceProps, targetProps, aggregates, true);
+            return project(match, names, sourceType, targetType, eval, hops, null, sourceProps, targetProps, aggregates, true, cancel);
         }
     }
 
@@ -370,7 +370,8 @@ final class MatchExecutor {
             Map<Long, Map<String, Object>> sourceProps,
             Map<Long, Map<String, Object>> targetProps,
             String[] aggregates,
-            boolean limitAfter) {
+            boolean limitAfter,
+            CancelToken cancel) {
         List<String> columns = new ArrayList<>();
         for (Stmt.Item item : match.items()) {
             columns.add(item.alias() == null ? item.text() : item.alias());
@@ -396,7 +397,7 @@ final class MatchExecutor {
                 sortKeys.add(keys);
             }
         }
-        return finish(match, columns, rows, sortKeys, sorts, aggregates, limitAfter);
+        return finish(match, columns, rows, sortKeys, sorts, aggregates, limitAfter, cancel);
     }
 
     private QueryResult finish(
@@ -406,7 +407,8 @@ final class MatchExecutor {
             List<List<Object>> sortKeys,
             List<Stmt.Sort> sorts,
             String[] aggregates,
-            boolean limitAfter) {
+            boolean limitAfter,
+            CancelToken cancel) {
         Long skip = match.skip();
         Long limit = limitAfter ? match.limit() : null;
         boolean reshape = aggregates != null || match.distinct() || !sorts.isEmpty() || (skip != null && skip > 0);
@@ -417,8 +419,8 @@ final class MatchExecutor {
             return new QueryResult(columns, rows, 0);
         }
         List<List<Object>> shaped = aggregates != null
-                ? page(DuckResult.aggregate(rows, aggregates, duck), skip, limit)
-                : DuckResult.arrange(rows, sortKeys, sorts, match.distinct(), skip, limit, duck);
+                ? page(DuckResult.aggregate(rows, aggregates, duck, cancel), skip, limit)
+                : DuckResult.arrange(rows, sortKeys, sorts, match.distinct(), skip, limit, duck, cancel);
         return new QueryResult(columns, shaped, 0);
     }
 

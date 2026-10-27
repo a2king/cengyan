@@ -28,19 +28,34 @@ public final class QueryEngine {
     private final Catalog catalog;
     private final MatchExecutor match;
     private final MutateExecutor mutate;
+    private final ProcedureExecutor procedures;
 
     public QueryEngine(Catalog catalog, GraphStore store) {
         this(catalog, store, "1GB", Path.of(System.getProperty("java.io.tmpdir"), "cengyan-duck"));
     }
 
     public QueryEngine(Catalog catalog, GraphStore store, String duckdbMemory, Path duckdbTempDirectory) {
+        this(catalog, store, duckdbMemory, duckdbTempDirectory, 0.01d, 0.001d);
+    }
+
+    public QueryEngine(
+            Catalog catalog,
+            GraphStore store,
+            String duckdbMemory,
+            Path duckdbTempDirectory,
+            double minEdgeRatio,
+            double minAccumRatio) {
         if (catalog == null || store == null) {
             throw new IllegalArgumentException("目录和存储不能为空");
+        }
+        if (minEdgeRatio < 0d || minAccumRatio < 0d || !Double.isFinite(minEdgeRatio) || !Double.isFinite(minAccumRatio)) {
+            throw new IllegalArgumentException("比例阈值不能为负");
         }
         this.catalog = catalog;
         DuckSettings duck = new DuckSettings(duckdbMemory, duckdbTempDirectory);
         this.match = new MatchExecutor(catalog, store, duck);
         this.mutate = new MutateExecutor(catalog, store);
+        this.procedures = new ProcedureExecutor(catalog, store, minEdgeRatio, minAccumRatio);
     }
 
     public QueryResult execute(
@@ -105,6 +120,7 @@ public final class QueryEngine {
                 case Stmt.Delete delete -> QueryResult.changed(
                         mutate.delete(delete, graphId(session), values, limits, cancel));
                 case Stmt.Match query -> match.run(query, graphId(session), values, limits, cancel);
+                case Stmt.Call call -> procedures.call(call, graphId(session), values, limits, cancel);
             };
         }
     }

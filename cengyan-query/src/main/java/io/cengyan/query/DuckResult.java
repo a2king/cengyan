@@ -1,5 +1,6 @@
 package io.cengyan.query;
 
+import io.cengyan.CancelToken;
 import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
 import io.cengyan.parser.Stmt;
@@ -39,6 +40,19 @@ final class DuckResult {
             Long skip,
             Long limit,
             DuckSettings settings) {
+        return arrange(rows, sortKeys, sorts, distinct, skip, limit, settings, null);
+    }
+
+    static List<List<Object>> arrange(
+            List<List<Object>> rows,
+            List<List<Object>> sortKeys,
+            List<Stmt.Sort> sorts,
+            boolean distinct,
+            Long skip,
+            Long limit,
+            DuckSettings settings,
+            CancelToken cancel) {
+        cancelled(cancel);
         if (rows.isEmpty()) {
             return List.of();
         }
@@ -57,19 +71,24 @@ final class DuckResult {
         try (Held held = open(settings)) {
             try {
                 create(held.connection, distinct, width, keys);
-                insert(held.connection, rows, sortKeys, distinct, keys);
-                return read(held.connection, query(distinct, width, sorts, offset, limit), rows);
+                insert(held.connection, rows, sortKeys, distinct, keys, cancel);
+                return read(held.connection, query(distinct, width, sorts, offset, limit), rows, cancel);
             } finally {
                 if (settings.beforeClose() != null) {
                     settings.beforeClose().accept(settings.tempDirectory());
                 }
             }
         } catch (SQLException ex) {
-            throw new CengyanException(ErrorCode.INTERNAL, "排序失败：" + ex.getMessage(), ex);
+            throw canceledOr(ex, cancel, "排序失败：" + ex.getMessage());
         }
     }
 
     static List<List<Object>> aggregate(List<List<Object>> rows, String[] kinds, DuckSettings settings) {
+        return aggregate(rows, kinds, settings, null);
+    }
+
+    static List<List<Object>> aggregate(List<List<Object>> rows, String[] kinds, DuckSettings settings, CancelToken cancel) {
+        cancelled(cancel);
         if (kinds == null || kinds.length == 0) {
             throw new CengyanException(ErrorCode.INTERNAL, "聚合列不能为空");
         }
@@ -89,15 +108,15 @@ final class DuckResult {
         try (Held held = open(settings)) {
             try {
                 createAggregate(held.connection, columns);
-                insertAggregate(held.connection, rows, columns);
-                return readAggregate(held.connection, aggregateSql(kinds), kinds, integral);
+                insertAggregate(held.connection, rows, columns, cancel);
+                return readAggregate(held.connection, aggregateSql(kinds), kinds, integral, cancel);
             } finally {
                 if (settings.beforeClose() != null) {
                     settings.beforeClose().accept(settings.tempDirectory());
                 }
             }
         } catch (SQLException ex) {
-            throw new CengyanException(ErrorCode.INTERNAL, "聚合失败：" + ex.getMessage(), ex);
+            throw canceledOr(ex, cancel, "聚合失败：" + ex.getMessage());
         }
     }
 
@@ -170,7 +189,8 @@ final class DuckResult {
             List<List<Object>> rows,
             List<List<Object>> sortKeys,
             boolean distinct,
-            Kind[] keys) throws SQLException {
+            Kind[] keys,
+            CancelToken cancel) throws SQLException {
         StringBuilder sql = new StringBuilder("INSERT INTO t VALUES (?");
         int extras = (distinct ? rows.get(0).size() : 0) + keys.length;
         for (int i = 0; i < extras; i++) {
@@ -178,7 +198,12 @@ final class DuckResult {
         }
         sql.append(')');
         try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            Runnable hook = watch(statement, cancel);
+            try {
             for (int row = 0; row < rows.size(); row++) {
+                if ((row & 63) == 0) {
+                    cancelled(cancel);
+                }
                 int index = 1;
                 statement.setLong(index++, row);
                 if (distinct) {
@@ -198,23 +223,36 @@ final class DuckResult {
                 }
             }
             statement.executeBatch();
+            } finally {
+                unwatch(cancel, hook);
+            }
         }
     }
 
-    private static void insertAggregate(Connection connection, List<List<Object>> rows, Kind[] columns) throws SQLException {
+    private static void insertAggregate(
+            Connection connection, List<List<Object>> rows, Kind[] columns, CancelToken cancel) throws SQLException {
         StringBuilder sql = new StringBuilder("INSERT INTO t VALUES (?");
         for (int i = 1; i < columns.length; i++) {
             sql.append(", ?");
         }
         sql.append(')');
         try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
-            for (List<Object> row : rows) {
-                for (int i = 0; i < columns.length; i++) {
-                    set(statement, i + 1, row.get(i), columns[i], false);
+            Runnable hook = watch(statement, cancel);
+            try {
+                int rowIndex = 0;
+                for (List<Object> row : rows) {
+                    if ((rowIndex++ & 63) == 0) {
+                        cancelled(cancel);
+                    }
+                    for (int i = 0; i < columns.length; i++) {
+                        set(statement, i + 1, row.get(i), columns[i], false);
+                    }
+                    statement.addBatch();
                 }
-                statement.addBatch();
+                statement.executeBatch();
+            } finally {
+                unwatch(cancel, hook);
             }
-            statement.executeBatch();
         }
     }
 
@@ -269,9 +307,13 @@ final class DuckResult {
         return sql.toString();
     }
 
-    private static List<List<Object>> read(Connection connection, String sql, List<List<Object>> rows) throws SQLException {
+    private static List<List<Object>> read(
+            Connection connection, String sql, List<List<Object>> rows, CancelToken cancel) throws SQLException {
+        cancelled(cancel);
         List<List<Object>> ordered = new ArrayList<>();
-        try (Statement statement = connection.createStatement(); ResultSet result = statement.executeQuery(sql)) {
+        try (Statement statement = connection.createStatement()) {
+            Runnable hook = watch(statement, cancel);
+            try (ResultSet result = statement.executeQuery(sql)) {
             while (result.next()) {
                 int index = result.getInt(1);
                 if (index < 0 || index >= rows.size()) {
@@ -279,13 +321,19 @@ final class DuckResult {
                 }
                 ordered.add(rows.get(index));
             }
+            } finally {
+                unwatch(cancel, hook);
+            }
         }
         return ordered;
     }
 
     private static List<List<Object>> readAggregate(
-            Connection connection, String sql, String[] kinds, boolean[] integral) throws SQLException {
-        try (Statement statement = connection.createStatement(); ResultSet result = statement.executeQuery(sql)) {
+            Connection connection, String sql, String[] kinds, boolean[] integral, CancelToken cancel) throws SQLException {
+        cancelled(cancel);
+        try (Statement statement = connection.createStatement()) {
+            Runnable hook = watch(statement, cancel);
+            try (ResultSet result = statement.executeQuery(sql)) {
             if (!result.next()) {
                 throw new CengyanException(ErrorCode.INTERNAL, "聚合没有结果");
             }
@@ -301,6 +349,44 @@ final class DuckResult {
                 }
             }
             return List.of(row);
+            } finally {
+                unwatch(cancel, hook);
+            }
+        }
+    }
+
+    private static void cancelled(CancelToken cancel) {
+        if (cancel != null && cancel.cancelled()) {
+            throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
+        }
+    }
+
+    private static CengyanException canceledOr(SQLException ex, CancelToken cancel, String message) {
+        if (cancel != null && cancel.cancelled()) {
+            return new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消", ex);
+        }
+        return new CengyanException(ErrorCode.INTERNAL, message, ex);
+    }
+
+    /** 取消线程调用 {@link Statement#cancel()}，相当于打断正在执行的 DuckDB 语句。 */
+    private static Runnable watch(Statement statement, CancelToken cancel) {
+        if (cancel == null) {
+            return null;
+        }
+        Runnable hook = () -> {
+            try {
+                statement.cancel();
+            } catch (SQLException ex) {
+                // 查询线程会在语句失败或下一处检查点退出。
+            }
+        };
+        cancel.onCancel(hook);
+        return hook;
+    }
+
+    private static void unwatch(CancelToken cancel, Runnable hook) {
+        if (cancel != null && hook != null) {
+            cancel.forget(hook);
         }
     }
 

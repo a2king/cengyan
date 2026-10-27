@@ -112,7 +112,8 @@ public final class GraphDbServer implements AutoCloseable {
             boss = new NioEventLoopGroup(1, new DefaultThreadFactory("cengyan-boss"));
             worker = new NioEventLoopGroup(0, new DefaultThreadFactory("cengyan-io"));
             QueryEngine engine = new QueryEngine(
-                    catalog, store, config.duckdbMemory(), config.duckdbTempDirectory());
+                    catalog, store, config.duckdbMemory(), config.duckdbTempDirectory(),
+                    config.minEdgeRatio(), config.minAccumRatio());
             ExecuteService execute = new ExecuteService(engine, config, queries, queryPool, sessions);
             LineServer lineServer = new LineServer(queries, execute);
             ServerBootstrap bootstrap = new ServerBootstrap();

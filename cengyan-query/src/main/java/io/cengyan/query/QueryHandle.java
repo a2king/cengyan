@@ -49,7 +49,14 @@ public final class QueryHandle implements CancelToken {
 
     @Override
     public boolean cancelled() {
-        return canceled.get();
+        if (canceled.get()) {
+            return true;
+        }
+        if (System.nanoTime() - deadlineNanos >= 0) {
+            cancel("超时");
+            return true;
+        }
+        return false;
     }
 
     /**

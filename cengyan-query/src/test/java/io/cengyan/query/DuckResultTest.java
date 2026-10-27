@@ -1,5 +1,7 @@
 package io.cengyan.query;
 
+import io.cengyan.CengyanException;
+import io.cengyan.ErrorCode;
 import io.cengyan.parser.Expr;
 import io.cengyan.parser.Stmt;
 import org.junit.jupiter.api.Test;
@@ -11,6 +13,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DuckResultTest {
@@ -47,5 +50,23 @@ class DuckResultTest {
             return size;
         }
         return size;
+    }
+
+    @Test
+    void 已经取消时不再交给DuckDB() {
+        QueryHandle handle = QueryHandle.start(1_000);
+        handle.cancel("测试");
+        List<List<Object>> rows = List.of(List.of(1L), List.of(2L));
+        List<List<Object>> keys = List.of(List.of(2L), List.of(1L));
+        CengyanException canceled = assertThrows(CengyanException.class, () -> DuckResult.arrange(
+                rows,
+                keys,
+                List.of(new Stmt.Sort(new Expr.Literal(1L), false)),
+                false,
+                null,
+                null,
+                new DuckSettings("1GB", Path.of(System.getProperty("java.io.tmpdir"), "cengyan-duck")),
+                handle));
+        assertEquals(ErrorCode.QUERY_CANCELED, canceled.code());
     }
 }

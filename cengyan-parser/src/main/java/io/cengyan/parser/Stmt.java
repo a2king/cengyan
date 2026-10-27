@@ -58,6 +58,12 @@ public sealed interface Stmt {
     record Delete(NodePat source, EdgePat edge, NodePat target, Expr where, List<String> variables) implements Stmt {
     }
 
+    record Arg(String name, Expr value) {
+    }
+
+    record Call(String name, List<Arg> args, List<String> yield) implements Stmt {
+    }
+
     record Field(String name, String valueType, boolean nullable) {
     }
 
