@@ -2,6 +2,7 @@ package io.cengyan.server;
 
 import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
+import io.cengyan.catalog.Catalog;
 import io.cengyan.store.GraphStore;
 import io.cengyan.store.StoreOptions;
 import io.netty.bootstrap.ServerBootstrap;
@@ -37,6 +38,7 @@ public final class GraphDbServer implements AutoCloseable {
 
     private final ServerConfig config;
     private final GraphStore store;
+    private final Catalog catalog;
     private final QueryRegistry queries;
     private final ScheduledExecutorService timeoutThread;
     private final ExecutorService queryPool;
@@ -48,6 +50,7 @@ public final class GraphDbServer implements AutoCloseable {
     private GraphDbServer(
             ServerConfig config,
             GraphStore store,
+            Catalog catalog,
             QueryRegistry queries,
             ScheduledExecutorService timeoutThread,
             ExecutorService queryPool,
@@ -56,6 +59,7 @@ public final class GraphDbServer implements AutoCloseable {
             Channel channel) {
         this.config = config;
         this.store = store;
+        this.catalog = catalog;
         this.queries = queries;
         this.timeoutThread = timeoutThread;
         this.queryPool = queryPool;
@@ -81,7 +85,8 @@ public final class GraphDbServer implements AutoCloseable {
         EventLoopGroup worker = null;
         try {
             store = GraphStore.open(config.dataDir(), StoreOptions.server(config.blockCacheBytes()));
-            log.info("已读取目录列族");
+            Catalog catalog = Catalog.load(store);
+            log.info("已加载目录，共 {} 张图", catalog.graphs().size());
             QueryRegistry queries = new QueryRegistry();
             timeoutThread = Executors.newSingleThreadScheduledExecutor(runnable -> {
                 Thread thread = new Thread(runnable, "cengyan-timeout");
@@ -120,7 +125,7 @@ public final class GraphDbServer implements AutoCloseable {
                         }
                     });
             Channel channel = bootstrap.bind(config.port()).sync().channel();
-            return new GraphDbServer(config, store, queries, timeoutThread, queryPool, boss, worker, channel);
+            return new GraphDbServer(config, store, catalog, queries, timeoutThread, queryPool, boss, worker, channel);
         } catch (Exception ex) {
             if (worker != null) {
                 worker.shutdownGracefully();
@@ -145,6 +150,10 @@ public final class GraphDbServer implements AutoCloseable {
             }
             throw new CengyanException(ErrorCode.INTERNAL, "服务启动失败：" + ex.getMessage(), ex);
         }
+    }
+
+    public Catalog catalog() {
+        return catalog;
     }
 
     public int port() {

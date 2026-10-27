@@ -18,6 +18,10 @@
         </dependency>
         <dependency>
             <groupId>io.cengyan</groupId>
+            <artifactId>cengyan-catalog</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.cengyan</groupId>
             <artifactId>cengyan-query</artifactId>
         </dependency>
         <dependency>

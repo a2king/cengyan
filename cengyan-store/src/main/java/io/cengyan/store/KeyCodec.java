@@ -1,5 +1,6 @@
 package io.cengyan.store;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 /**
@@ -127,6 +128,162 @@ public final class KeyCodec {
 
     public static int compare(byte[] left, byte[] right) {
         return Arrays.compareUnsigned(left, right);
+    }
+
+    /** 阶段 9 之前恒为 0。阶段 9 起改为按 vid 取模，不能只改这个函数。 */
+    public static int partOf(long vid) {
+        return 0;
+    }
+
+    public static byte[] nextGraphIdKey() {
+        return new byte[] {0x01};
+    }
+
+    public static byte[] nameKey(String name) {
+        byte[] utf8 = nameUtf8(name);
+        byte[] key = new byte[1 + utf8.length];
+        key[0] = 0x10;
+        System.arraycopy(utf8, 0, key, 1, utf8.length);
+        return key;
+    }
+
+    public static byte[] namePrefix() {
+        return new byte[] {0x10};
+    }
+
+    public static byte[] graphRecordKey(int graphId) {
+        return markedGraphKey(0x11, graphId);
+    }
+
+    public static byte[] graphRecordPrefix() {
+        return new byte[] {0x11};
+    }
+
+    public static byte[] aliasRecordKey(int graphId, String alias) {
+        byte[] utf8 = nameUtf8(alias);
+        byte[] key = new byte[3 + utf8.length];
+        key[0] = 0x12;
+        putUint16(key, 1, graphId);
+        System.arraycopy(utf8, 0, key, 3, utf8.length);
+        return key;
+    }
+
+    public static byte[] aliasPrefix(int graphId) {
+        return markedGraphKey(0x12, graphId);
+    }
+
+    public static byte[] nextNodeTypeKey(int graphId) {
+        return markedGraphKey(0x21, graphId);
+    }
+
+    public static byte[] nextRelTypeKey(int graphId) {
+        return markedGraphKey(0x22, graphId);
+    }
+
+    public static byte[] typeKey(int graphId, int kind, int typeId) {
+        checkUint16(graphId, "graphId");
+        checkUint32(typeId, "typeId");
+        if (kind != 1 && kind != 2) {
+            throw new IllegalArgumentException("类型种类无效");
+        }
+        byte[] key = new byte[8];
+        key[0] = 0x20;
+        putUint16(key, 1, graphId);
+        key[3] = (byte) kind;
+        putUint32(key, 4, typeId);
+        return key;
+    }
+
+    public static byte[] typePrefix(int graphId) {
+        return markedGraphKey(0x20, graphId);
+    }
+
+    public static byte[] indexRecordPrefix(int graphId) {
+        return markedGraphKey(0x30, graphId);
+    }
+
+    /** 全部类型记录的前缀。节点类型和边类型都从 0x20 开始。 */
+    public static byte[] allTypePrefix() {
+        return new byte[] {0x20};
+    }
+
+    /** 索引列族里某个 indexId 的前缀。索引键以 indexId 开头。 */
+    public static byte[] indexDataPrefix(int indexId) {
+        checkUint32(indexId, "indexId");
+        byte[] key = new byte[4];
+        putUint32(key, 0, indexId);
+        return key;
+    }
+
+    public static int graphIdFromMarked(byte[] key) {
+        if (key == null || key.length < 3) {
+            throw new IllegalArgumentException("键里没有 graphId");
+        }
+        return getUint16(key, 1);
+    }
+
+    public static TypeKey decodeTypeKey(byte[] key) {
+        if (key == null || key.length != 8 || (key[0] & 0xFF) != 0x20) {
+            throw new IllegalArgumentException("不是类型键");
+        }
+        int kind = key[3] & 0xFF;
+        if (kind != 1 && kind != 2) {
+            throw new IllegalArgumentException("类型种类无效");
+        }
+        return new TypeKey(getUint16(key, 1), kind, getUint32(key, 4));
+    }
+
+    public static int indexIdFromRecord(byte[] key) {
+        if (key == null || key.length != 7 || (key[0] & 0xFF) != 0x30) {
+            throw new IllegalArgumentException("不是索引记录键");
+        }
+        return getUint32(key, 3);
+    }
+
+    public record TypeKey(int graphId, int kind, int typeId) {
+    }
+
+    public static byte[] graphIdPrefix(int graphId) {
+        checkUint16(graphId, "graphId");
+        byte[] key = new byte[2];
+        putUint16(key, 0, graphId);
+        return key;
+    }
+
+    public static byte[] propGraphPrefix(int graphId) {
+        checkUint16(graphId, "graphId");
+        byte[] key = new byte[3];
+        key[0] = PROP_MARK;
+        putUint16(key, 1, graphId);
+        return key;
+    }
+
+    public static String nameFromKey(byte[] key, int offset) {
+        return new String(key, offset, key.length - offset, StandardCharsets.UTF_8);
+    }
+
+    private static byte[] markedGraphKey(int mark, int graphId) {
+        checkUint16(graphId, "graphId");
+        byte[] key = new byte[3];
+        key[0] = (byte) mark;
+        putUint16(key, 1, graphId);
+        return key;
+    }
+
+    private static byte[] nameUtf8(String name) {
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("名字不能为空");
+        }
+        byte[] utf8 = name.getBytes(StandardCharsets.UTF_8);
+        if (utf8.length > 128) {
+            throw new IllegalArgumentException("名字最长 128 字节");
+        }
+        for (byte one : utf8) {
+            if (one == 0) {
+                throw new IllegalArgumentException("名字不能包含空字节");
+            }
+        }
+        return utf8;
     }
 
     private static void checkUint16(int value, String name) {

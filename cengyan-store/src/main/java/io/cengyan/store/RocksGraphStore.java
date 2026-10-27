@@ -26,7 +26,9 @@ import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 /**
  * 嵌入式 RocksDB。七个列族在第一次打开时建好，WAL 保持打开，边列族使用 17 字节前缀。
@@ -48,6 +50,8 @@ public final class RocksGraphStore implements GraphStore {
     private final BloomFilter edgeBloom;
     private final ReentrantLock writeLock = new ReentrantLock();
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+    private final AtomicLong propReads = new AtomicLong();
+    private volatile Runnable beforeWrite;
     private static final byte[] EMPTY = new byte[0];
 
     private RocksGraphStore(
@@ -197,6 +201,11 @@ public final class RocksGraphStore implements GraphStore {
                     writeBatch.put(family, op.key(), op.value());
                 }
             }
+            Runnable hook = beforeWrite;
+            if (hook != null) {
+                beforeWrite = null;
+                hook.run();
+            }
             db.write(options, writeBatch);
         } catch (RocksDBException ex) {
             throw new CengyanException(ErrorCode.INTERNAL, "写入失败：" + ex.getMessage(), ex);
@@ -234,9 +243,38 @@ public final class RocksGraphStore implements GraphStore {
         return new RocksReadSession(this, db.getSnapshot());
     }
 
+    @Override
+    public <T> T withWriteLock(Supplier<T> action) {
+        if (action == null) {
+            throw new IllegalArgumentException("写入动作不能为空");
+        }
+        writeLock.lock();
+        try {
+            return action.get();
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    @Override
+    public void injectBeforeWrite(Runnable hook) {
+        this.beforeWrite = hook;
+    }
+
+    @Override
+    public long propReads() {
+        return propReads.get();
+    }
+
+    void addPropReads(int count) {
+        if (count > 0) {
+            propReads.addAndGet(count);
+        }
+    }
+
     /** 阶段 1 的分片号恒为 0。阶段 9 再按 vid 计算。 */
     public static int partOf(long vid) {
-        return 0;
+        return KeyCodec.partOf(vid);
     }
 
     private static void requireEdgePairs(StoreBatch batch) {

@@ -1,6 +1,7 @@
 package io.cengyan.store;
 
 import java.nio.file.Path;
+import java.util.function.Supplier;
 
 /**
  * 进程内图存储。查询模块只依赖这个接口，不引用 RocksDB 的类。
@@ -31,6 +32,18 @@ public interface GraphStore extends AutoCloseable {
 
     /** 打开一个读快照。用完关闭。 */
     ReadSession read();
+
+    /**
+     * 占住进程写锁做「先读再写」。{@link #mutate} 可以在里面重入。
+     * 创建名字必须走这里，避免两个会话抢同一个名字都成功。
+     */
+    <T> T withWriteLock(Supplier<T> action);
+
+    /** 下一次提交前运行，然后清除。测试用来模拟提交前进程退出。 */
+    void injectBeforeWrite(Runnable hook);
+
+    /** {@code prop} 列族被 get 或 multiGet 命中的键次数。扫拓扑时应当保持为 0。 */
+    long propReads();
 
     @Override
     void close();
