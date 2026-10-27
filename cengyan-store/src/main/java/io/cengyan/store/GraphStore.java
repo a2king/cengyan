@@ -17,6 +17,21 @@ public interface GraphStore extends AutoCloseable {
         return RocksGraphStore.open(path, options);
     }
 
+    /** 原始批次。不检查出边和入边是否成对，目录写入走这里。 */
+    void mutate(StoreBatch batch);
+
+    /**
+     * 提交边批次。每条逻辑边都必须同时有出边和入边，只写一个方向直接失败。
+     * 批次里可以同时带上点和属性键。
+     */
+    void commitEdges(StoreBatch batch);
+
+    /** 插入一条逻辑边，写出边和入边两条键，值是空的。 */
+    void insertEdge(int graphId, int edgeTypeId, long rank, long outSrc, long outDst);
+
+    /** 打开一个读快照。用完关闭。 */
+    ReadSession read();
+
     @Override
     void close();
 }

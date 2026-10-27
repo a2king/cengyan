@@ -76,6 +76,13 @@ public final class QueryHandle implements CancelToken {
         }
     }
 
+    @Override
+    public void forget(Runnable hook) {
+        if (hook != null) {
+            hooks.remove(hook);
+        }
+    }
+
     private static void runHook(Runnable hook) {
         try {
             hook.run();

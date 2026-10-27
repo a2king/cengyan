@@ -124,6 +124,9 @@
                     <version>3.6.1</version>
                     <configuration>
                         <argLine>-Dfile.encoding=UTF-8</argLine>
+                        <systemPropertyVariables>
+                            <cengyan.report>${maven.multiModuleProjectDirectory}/docs/perf-report.md</cengyan.report>
+                        </systemPropertyVariables>
                     </configuration>
                 </plugin>
                 <plugin>

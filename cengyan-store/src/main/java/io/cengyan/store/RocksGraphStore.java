@@ -13,6 +13,8 @@ import org.rocksdb.DBOptions;
 import org.rocksdb.LRUCache;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,9 +23,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 嵌入式 RocksDB。七个列族在第一次打开时建好，WAL 保持打开，边列族使用 17 字节前缀。
@@ -43,7 +46,9 @@ public final class RocksGraphStore implements GraphStore {
     private final Map<Cf, ColumnFamilyHandle> byFamily;
     private final Cache blockCache;
     private final BloomFilter edgeBloom;
-    private final AtomicBoolean closed = new AtomicBoolean();
+    private final ReentrantLock writeLock = new ReentrantLock();
+    private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+    private static final byte[] EMPTY = new byte[0];
 
     private RocksGraphStore(
             Path directory,
@@ -145,7 +150,7 @@ public final class RocksGraphStore implements GraphStore {
         table.setCacheIndexAndFilterBlocks(true);
         if (cf == Cf.EDGE) {
             // 出边前缀是前 17 字节。前缀布隆只挂在边列族上。
-            cfOptions.useFixedLengthPrefixExtractor(17);
+            cfOptions.useFixedLengthPrefixExtractor(KeyCodec.EDGE_PREFIX_LENGTH);
             cfOptions.setMemtablePrefixBloomSizeRatio(0.125);
             table.setFilterPolicy(bloom);
             table.setWholeKeyFiltering(false);
@@ -168,6 +173,110 @@ public final class RocksGraphStore implements GraphStore {
 
     RocksDB db() {
         return db;
+    }
+
+    @Override
+    public void mutate(StoreBatch batch) {
+        if (batch == null) {
+            throw new IllegalArgumentException("批次不能为空");
+        }
+        if (closed.get()) {
+            throw new CengyanException(ErrorCode.INTERNAL, "数据库已关闭");
+        }
+        if (batch.isEmpty()) {
+            return;
+        }
+        writeLock.lock();
+        try (WriteBatch writeBatch = new WriteBatch(); WriteOptions options = new WriteOptions()) {
+            options.setDisableWAL(false);
+            for (StoreBatch.Op op : batch.operations()) {
+                ColumnFamilyHandle family = handle(op.family());
+                if (op.delete()) {
+                    writeBatch.delete(family, op.key());
+                } else {
+                    writeBatch.put(family, op.key(), op.value());
+                }
+            }
+            db.write(options, writeBatch);
+        } catch (RocksDBException ex) {
+            throw new CengyanException(ErrorCode.INTERNAL, "写入失败：" + ex.getMessage(), ex);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    @Override
+    public void commitEdges(StoreBatch batch) {
+        requireEdgePairs(batch);
+        mutate(batch);
+    }
+
+    @Override
+    public void insertEdge(int graphId, int edgeTypeId, long rank, long outSrc, long outDst) {
+        int outPart = partOf(outSrc);
+        int inPart = partOf(outDst);
+        if (outPart != inPart) {
+            throw new CengyanException(ErrorCode.CROSS_PART_UNSUPPORTED, "边的两端落在不同分片");
+        }
+        StoreBatch batch = new StoreBatch();
+        batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                graphId, outPart, outSrc, edgeTypeId, Direction.OUT.code(), rank, outDst), EMPTY);
+        batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                graphId, inPart, outDst, edgeTypeId, Direction.IN.code(), rank, outSrc), EMPTY);
+        commitEdges(batch);
+    }
+
+    @Override
+    public ReadSession read() {
+        if (closed.get()) {
+            throw new CengyanException(ErrorCode.INTERNAL, "数据库已关闭");
+        }
+        return new RocksReadSession(this, db.getSnapshot());
+    }
+
+    /** 阶段 1 的分片号恒为 0。阶段 9 再按 vid 计算。 */
+    public static int partOf(long vid) {
+        return 0;
+    }
+
+    private static void requireEdgePairs(StoreBatch batch) {
+        Map<Boolean, Map<LogicalEdge, boolean[]>> groups = new HashMap<>();
+        int edgeOps = 0;
+        for (StoreBatch.Op op : batch.operations()) {
+            if (op.family() != Cf.EDGE) {
+                continue;
+            }
+            edgeOps++;
+            KeyCodec.DecodedEdge decoded = KeyCodec.decodeEdge(op.key());
+            long outSrc;
+            long outDst;
+            if (decoded.direction() == Direction.OUT.code()) {
+                outSrc = decoded.src();
+                outDst = decoded.dst();
+            } else if (decoded.direction() == Direction.IN.code()) {
+                outSrc = decoded.dst();
+                outDst = decoded.src();
+            } else {
+                throw new CengyanException(ErrorCode.INTERNAL, "边方向无效");
+            }
+            LogicalEdge id = new LogicalEdge(
+                    decoded.graphId(), decoded.edgeTypeId(), decoded.rank(), outSrc, outDst);
+            groups.computeIfAbsent(op.delete(), ignored -> new HashMap<>())
+                    .computeIfAbsent(id, ignored -> new boolean[2])[decoded.direction()] = true;
+        }
+        if (edgeOps == 0) {
+            throw new CengyanException(ErrorCode.INTERNAL, "插入边必须同时写出边和入边");
+        }
+        for (Map<LogicalEdge, boolean[]> group : groups.values()) {
+            for (boolean[] directions : group.values()) {
+                if (!directions[0] || !directions[1]) {
+                    throw new CengyanException(ErrorCode.INTERNAL, "插入边必须同时写出边和入边");
+                }
+            }
+        }
+    }
+
+    private record LogicalEdge(int graphId, int edgeTypeId, long rank, long outSrc, long outDst) {
     }
 
     @Override

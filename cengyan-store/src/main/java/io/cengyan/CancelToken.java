@@ -11,4 +11,8 @@ public interface CancelToken {
      * 钩子可能跑在超时线程上，不能在里面做长时间阻塞。
      */
     void onCancel(Runnable hook);
+
+    /** 扫描正常结束后摘掉钩子，避免同一次查询里钩子越积越多。 */
+    default void forget(Runnable hook) {
+    }
 }
