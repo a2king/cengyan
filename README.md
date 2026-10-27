@@ -31,6 +31,14 @@ java -jar cengyan-cli\target\cengyan-cli-1.0.0-SNAPSHOT.jar
 
 `--host` 和 `--port` 可改连接地址，默认 `127.0.0.1:19669`。交互模式里输入 `exit` 或 `quit` 退出。不要用「启动一次只发一条命令」的方式连续操作：每次新进程都不记得上次的登录。
 
+浏览器控制台另开一个终端：
+
+```powershell
+java -jar cengyan-studio\target\cengyan-studio-1.0.0-SNAPSHOT.jar
+```
+
+打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--port`、`--db-host`、`--db-port` 可改。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
+
 ## 第一段查询
 
 空库第一次启动会创建读写用户 `root`，密码是配置里的 `root_password`，仓库自带配置是 `cengyan`。先登录，再写语句。一次一行，不要用分号把多条拼在一起。
