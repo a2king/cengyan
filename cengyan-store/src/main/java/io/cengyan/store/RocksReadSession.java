@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
 
 final class RocksReadSession implements ReadSession {
     private final RocksGraphStore store;
@@ -46,7 +47,96 @@ final class RocksReadSession implements ReadSession {
                 direction,
                 queryLimit,
                 maxEdgesPerVertex,
-                cancel);
+                cancel,
+                null,
+                store::addEdgeExamined);
+    }
+
+    @Override
+    public EdgeCursor scanEdges(
+            int graphId,
+            long vid,
+            int edgeTypeId,
+            Direction direction,
+            int queryLimit,
+            int maxEdgesPerVertex,
+            Predicate<EdgeRef> predicate,
+            CancelToken cancel) {
+        ensureOpen();
+        return EdgeScanner.open(
+                store.db(),
+                store.handle(Cf.EDGE),
+                snapshot,
+                graphId,
+                vid,
+                edgeTypeId,
+                direction,
+                queryLimit,
+                maxEdgesPerVertex,
+                cancel,
+                predicate,
+                store::addEdgeExamined);
+    }
+
+    @Override
+    public List<VertexId> scanVertices(
+            int graphId, int tagId, int queryLimit, int maxExamined, CancelToken cancel) {
+        ensureOpen();
+        if (queryLimit == 0) {
+            return List.of();
+        }
+        byte[] prefix = KeyCodec.graphIdPrefix(graphId);
+        byte[] upper = KeyCodec.upperBound(prefix);
+        List<VertexId> found = new ArrayList<>();
+        ReadOptions options = new ReadOptions();
+        Slice upperSlice = null;
+        RocksIterator iterator = null;
+        int examined = 0;
+        try {
+            options.setSnapshot(snapshot);
+            options.setTotalOrderSeek(true);
+            options.setPrefixSameAsStart(false);
+            if (upper != null) {
+                upperSlice = new Slice(upper);
+                options.setIterateUpperBound(upperSlice);
+            }
+            iterator = store.db().newIterator(store.handle(Cf.VERTEX), options);
+            iterator.seek(prefix);
+            while (iterator.isValid()) {
+                if ((examined & 63) == 0 && cancel != null && cancel.cancelled()) {
+                    throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
+                }
+                byte[] raw = iterator.key();
+                byte[] key = Arrays.copyOf(raw, raw.length);
+                if (!KeyCodec.startsWith(key, prefix)) {
+                    break;
+                }
+                iterator.next();
+                examined++;
+                if (maxExamined >= 0 && examined > maxExamined) {
+                    throw new CengyanException(ErrorCode.TRUNCATED,
+                            "扫描起点已检查 " + examined + " 个点，超过上限 " + maxExamined);
+                }
+                if (key.length == KeyCodec.VERTEX_KEY_LENGTH && KeyCodec.tagIdOf(key) == tagId) {
+                    found.add(new VertexId(KeyCodec.vidOf(key), tagId));
+                    if (queryLimit >= 0 && found.size() == queryLimit) {
+                        break;
+                    }
+                }
+            }
+            iterator.status();
+            return found;
+        } catch (RocksDBException ex) {
+            throw new CengyanException(ErrorCode.INTERNAL, "扫描点失败：" + ex.getMessage(), ex);
+        } finally {
+            if (iterator != null) {
+                iterator.close();
+            }
+            if (upperSlice != null) {
+                upperSlice.close();
+            }
+            options.close();
+        }
     }
 
     @Override

@@ -51,6 +51,7 @@ public final class RocksGraphStore implements GraphStore {
     private final ReentrantLock writeLock = new ReentrantLock();
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
     private final AtomicLong propReads = new AtomicLong();
+    private final AtomicLong edgesExamined = new AtomicLong();
     private volatile Runnable beforeWrite;
     private static final byte[] EMPTY = new byte[0];
 
@@ -266,10 +267,19 @@ public final class RocksGraphStore implements GraphStore {
         return propReads.get();
     }
 
+    @Override
+    public long edgesExamined() {
+        return edgesExamined.get();
+    }
+
     void addPropReads(int count) {
         if (count > 0) {
             propReads.addAndGet(count);
         }
+    }
+
+    void addEdgeExamined() {
+        edgesExamined.incrementAndGet();
     }
 
     /** 阶段 1 的分片号恒为 0。阶段 9 再按 vid 计算。 */

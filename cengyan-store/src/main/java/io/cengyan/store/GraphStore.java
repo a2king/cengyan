@@ -45,6 +45,9 @@ public interface GraphStore extends AutoCloseable {
     /** {@code prop} 列族被 get 或 multiGet 命中的键次数。扫拓扑时应当保持为 0。 */
     long propReads();
 
+    /** 扫边时实际检查过的键数，包含没通过条件下推的边。 */
+    long edgesExamined();
+
     @Override
     void close();
 }

@@ -13,6 +13,7 @@ import org.rocksdb.Snapshot;
 
 import java.util.Arrays;
 import java.util.NoSuchElementException;
+import java.util.function.Predicate;
 
 /**
  * 按 17 字节前缀向后扫。每 64 条看一次取消；超过每点上限抛 {@code TRUNCATED}，而不是少返回一些。
@@ -25,6 +26,8 @@ final class EdgeScanner implements EdgeCursor {
     private final int queryLimit;
     private final int maxEdgesPerVertex;
     private final long vid;
+    private final Predicate<EdgeRef> predicate;
+    private final Runnable onExamined;
     private ReadOptions readOptions;
     private Slice upperSlice;
     private RocksIterator iterator;
@@ -43,6 +46,8 @@ final class EdgeScanner implements EdgeCursor {
             int queryLimit,
             int maxEdgesPerVertex,
             long vid,
+            Predicate<EdgeRef> predicate,
+            Runnable onExamined,
             ReadOptions readOptions,
             Slice upperSlice,
             RocksIterator iterator) {
@@ -52,6 +57,8 @@ final class EdgeScanner implements EdgeCursor {
         this.queryLimit = queryLimit;
         this.maxEdgesPerVertex = maxEdgesPerVertex;
         this.vid = vid;
+        this.predicate = predicate;
+        this.onExamined = onExamined;
         this.readOptions = readOptions;
         this.upperSlice = upperSlice;
         this.iterator = iterator;
@@ -68,11 +75,28 @@ final class EdgeScanner implements EdgeCursor {
             int queryLimit,
             int maxEdgesPerVertex,
             CancelToken cancel) {
+        return open(db, edgeFamily, snapshot, graphId, vid, edgeTypeId, direction,
+                queryLimit, maxEdgesPerVertex, cancel, null, null);
+    }
+
+    static EdgeScanner open(
+            RocksDB db,
+            ColumnFamilyHandle edgeFamily,
+            Snapshot snapshot,
+            int graphId,
+            long vid,
+            int edgeTypeId,
+            Direction direction,
+            int queryLimit,
+            int maxEdgesPerVertex,
+            CancelToken cancel,
+            Predicate<EdgeRef> predicate,
+            Runnable onExamined) {
         if (direction == null) {
             throw new IllegalArgumentException("方向不能为空");
         }
         if (queryLimit == 0) {
-            return new EdgeScanner(cancel, null, null, 0, maxEdgesPerVertex, vid, null, null, null);
+            return new EdgeScanner(cancel, null, null, 0, maxEdgesPerVertex, vid, predicate, onExamined, null, null, null);
         }
         byte[] prefix = KeyCodec.edgePrefix(graphId, RocksGraphStore.partOf(vid), vid, edgeTypeId, direction.code());
         byte[] upper = KeyCodec.upperBound(prefix);
@@ -91,7 +115,8 @@ final class EdgeScanner implements EdgeCursor {
             iterator.seek(prefix);
             iterator.status();
             EdgeScanner scanner = new EdgeScanner(
-                    cancel, prefix, upper, queryLimit, maxEdgesPerVertex, vid, readOptions, upperSlice, iterator);
+                    cancel, prefix, upper, queryLimit, maxEdgesPerVertex, vid, predicate, onExamined,
+                    readOptions, upperSlice, iterator);
             if (cancel != null) {
                 cancel.onCancel(scanner.closeHook);
             }
@@ -169,6 +194,9 @@ final class EdgeScanner implements EdgeCursor {
                 throw new CengyanException(ErrorCode.INTERNAL, "扫边失败：" + ex.getMessage(), ex);
             }
             examined++;
+            if (onExamined != null) {
+                onExamined.run();
+            }
             if (maxEdgesPerVertex >= 0 && examined > maxEdgesPerVertex) {
                 int seen = examined;
                 finish();
@@ -176,8 +204,12 @@ final class EdgeScanner implements EdgeCursor {
                         ErrorCode.TRUNCATED,
                         "点 " + vid + " 已检查 " + seen + " 条边，超过每点上限 " + maxEdgesPerVertex);
             }
+            EdgeRef logical = KeyCodec.toLogical(key);
+            if (predicate != null && !predicate.test(logical)) {
+                continue;
+            }
             matched++;
-            pending = KeyCodec.toLogical(key);
+            pending = logical;
             pendingReady = true;
             if (queryLimit >= 0 && matched == queryLimit) {
                 stopAfterPending = true;

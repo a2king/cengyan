@@ -20,9 +20,11 @@ final class LineServer extends SimpleChannelInboundHandler<String> {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final QueryRegistry queries;
+    private final ExecuteService execute;
 
-    LineServer(QueryRegistry queries) {
+    LineServer(QueryRegistry queries, ExecuteService execute) {
         this.queries = queries;
+        this.execute = execute;
     }
 
     @Override
@@ -49,7 +51,7 @@ final class LineServer extends SimpleChannelInboundHandler<String> {
         String op = node.path("op").asText("");
         switch (op) {
             case "ping" -> ok(ctx);
-            case "execute" -> error(ctx, ErrorCode.SYNTAX, "当前版本还不能执行查询");
+            case "execute" -> execute.execute(ctx, node);
             case "cancel" -> cancel(ctx, node);
             case "admin" -> error(ctx, ErrorCode.SYNTAX, "当前版本还不能执行管理命令");
             default -> error(ctx, ErrorCode.SYNTAX, "无法识别的操作");
@@ -89,6 +91,12 @@ final class LineServer extends SimpleChannelInboundHandler<String> {
             log.error("响应序列化失败", ex);
             ctx.close();
         }
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        execute.onInactive(ctx);
+        super.channelInactive(ctx);
     }
 
     @Override

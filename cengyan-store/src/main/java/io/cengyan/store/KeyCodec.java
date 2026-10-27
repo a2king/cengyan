@@ -258,8 +258,24 @@ public final class KeyCodec {
         return key;
     }
 
+    public static long vidOf(byte[] vertexKey) {
+        requireVertexKey(vertexKey);
+        return getInt64(vertexKey, 4);
+    }
+
+    public static int tagIdOf(byte[] vertexKey) {
+        requireVertexKey(vertexKey);
+        return getUint32(vertexKey, 12);
+    }
+
     public static String nameFromKey(byte[] key, int offset) {
         return new String(key, offset, key.length - offset, StandardCharsets.UTF_8);
+    }
+
+    private static void requireVertexKey(byte[] key) {
+        if (key == null || key.length != VERTEX_KEY_LENGTH) {
+            throw new IllegalArgumentException("不是点键");
+        }
     }
 
     private static byte[] markedGraphKey(int mark, int graphId) {

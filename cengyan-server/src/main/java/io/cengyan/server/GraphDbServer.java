@@ -3,6 +3,7 @@ package io.cengyan.server;
 import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
 import io.cengyan.catalog.Catalog;
+import io.cengyan.query.QueryEngine;
 import io.cengyan.store.GraphStore;
 import io.cengyan.store.StoreOptions;
 import io.netty.bootstrap.ServerBootstrap;
@@ -88,6 +89,7 @@ public final class GraphDbServer implements AutoCloseable {
             Catalog catalog = Catalog.load(store);
             log.info("已加载目录，共 {} 张图", catalog.graphs().size());
             QueryRegistry queries = new QueryRegistry();
+            Sessions sessions = new Sessions();
             timeoutThread = Executors.newSingleThreadScheduledExecutor(runnable -> {
                 Thread thread = new Thread(runnable, "cengyan-timeout");
                 thread.setDaemon(true);
@@ -97,6 +99,7 @@ public final class GraphDbServer implements AutoCloseable {
             timeout.scheduleAtFixedRate(() -> {
                 try {
                     queries.sweep();
+                    sessions.sweep();
                 } catch (RuntimeException ex) {
                     log.warn("超时扫描失败：{}", ex.toString());
                 }
@@ -108,7 +111,9 @@ public final class GraphDbServer implements AutoCloseable {
             });
             boss = new NioEventLoopGroup(1, new DefaultThreadFactory("cengyan-boss"));
             worker = new NioEventLoopGroup(0, new DefaultThreadFactory("cengyan-io"));
-            LineServer lineServer = new LineServer(queries);
+            QueryEngine engine = new QueryEngine(catalog, store);
+            ExecuteService execute = new ExecuteService(engine, config, queries, queryPool, sessions);
+            LineServer lineServer = new LineServer(queries, execute);
             ServerBootstrap bootstrap = new ServerBootstrap();
             bootstrap.group(boss, worker)
                     .channel(NioServerSocketChannel.class)
