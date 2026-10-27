@@ -2,7 +2,8 @@
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
             <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
-            <charset>UTF-8</charset>
+            <!-- 跟 JVM 的 native.encoding 走。中文 Windows 上这是 GBK，和 Cursor 终端的解码一致。 -->
+            <charset>${native.encoding:-UTF-8}</charset>
         </encoder>
     </appender>
     <root level="info">
