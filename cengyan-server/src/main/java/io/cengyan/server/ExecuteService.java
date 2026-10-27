@@ -126,20 +126,86 @@ final class ExecuteService {
             return;
         }
         try {
-            queryPool.execute(() -> runAdmin(ctx, session, command, index, timeoutMs));
+            queryPool.execute(() -> runAdmin(
+                    ctx, session, command, index,
+                    node.path("user").asText(""),
+                    node.path("password").asText(""),
+                    node.path("role").asText(""),
+                    timeoutMs));
         } catch (RejectedExecutionException ex) {
             permits.release();
             error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
         }
     }
 
-    private void runAdmin(ChannelHandlerContext ctx, String sessionId, String command, String index, long timeoutMs) {
+    void login(ChannelHandlerContext ctx, JsonNode node) {
+        String sessionId = node.path("session").asText("");
+        if (sessionId.isBlank()) {
+            sessionId = UUID.randomUUID().toString();
+        }
+        String session = sessionId;
+        String user = node.path("user").asText("");
+        String password = node.path("password").asText("");
+        long timeoutMs = timeout(node);
+        if (timeoutMs <= 0) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间必须为正");
+            return;
+        }
+        if (!acquire(ctx, session)) {
+            return;
+        }
+        try {
+            queryPool.execute(() -> runLogin(ctx, session, user, password, timeoutMs));
+        } catch (RejectedExecutionException ex) {
+            permits.release();
+            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
+        }
+    }
+
+    private void runLogin(
+            ChannelHandlerContext ctx, String sessionId, String user, String password, long timeoutMs) {
         QueryHandle handle = QueryHandle.start(timeoutMs);
         queries.register(handle);
         byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
         try {
             SessionState session = sessions.open(sessionId);
-            QueryResult result = engine.admin(session, command, index, handle);
+            QueryResult result = engine.login(session, user, password);
+            ObjectNode node = MAPPER.createObjectNode();
+            node.put("code", ErrorCode.OK.name());
+            node.put("session", sessionId);
+            node.put("queryId", handle.id());
+            node.set("columns", MAPPER.valueToTree(result.columns()));
+            node.set("rows", MAPPER.valueToTree(result.rows()));
+            node.put("rowsAffected", result.rowsAffected());
+            write(ctx, node);
+        } catch (CengyanException ex) {
+            error(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
+        } catch (RuntimeException ex) {
+            log.warn("登录失败：{}", ex.toString());
+            error(ctx, sessionId, handle.id(), ErrorCode.INTERNAL, "登录失败");
+        } finally {
+            finish(ctx, handle);
+        }
+    }
+
+    private void runAdmin(
+            ChannelHandlerContext ctx,
+            String sessionId,
+            String command,
+            String index,
+            String user,
+            String password,
+            String role,
+            long timeoutMs) {
+        QueryHandle handle = QueryHandle.start(timeoutMs);
+        queries.register(handle);
+        byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
+        try {
+            SessionState session = sessions.open(sessionId);
+            if (!session.authenticated()) {
+                throw new CengyanException(ErrorCode.FORBIDDEN, "请先登录");
+            }
+            QueryResult result = engine.admin(session, command, index, user, password, role, handle);
             ObjectNode node = MAPPER.createObjectNode();
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);
@@ -154,12 +220,7 @@ final class ExecuteService {
             log.warn("执行管理命令失败：{}", ex.toString());
             error(ctx, sessionId, handle.id(), ErrorCode.INTERNAL, "执行管理命令失败");
         } finally {
-            queries.unregister(handle.id());
-            Set<String> ids = byChannel.get(ctx.channel().id());
-            if (ids != null) {
-                ids.remove(handle.id());
-            }
-            permits.release();
+            finish(ctx, handle);
         }
     }
 
@@ -179,6 +240,9 @@ final class ExecuteService {
         byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
         try {
             SessionState session = sessions.open(sessionId);
+            if (!session.authenticated()) {
+                throw new CengyanException(ErrorCode.FORBIDDEN, "请先登录");
+            }
             QueryResult result = engine.execute(
                     session, query, params, new QueryLimits(
                             config.maxEdgesPerVertex(),
@@ -200,13 +264,33 @@ final class ExecuteService {
             log.warn("执行查询失败：{}", ex.toString());
             error(ctx, sessionId, handle.id(), ErrorCode.INTERNAL, "执行查询失败");
         } finally {
-            queries.unregister(handle.id());
-            Set<String> ids = byChannel.get(ctx.channel().id());
-            if (ids != null) {
-                ids.remove(handle.id());
-            }
-            permits.release();
+            finish(ctx, handle);
         }
+    }
+
+    private boolean acquire(ChannelHandlerContext ctx, String session) {
+        boolean acquired;
+        try {
+            acquired = permits.tryAcquire(50, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
+            return false;
+        }
+        if (!acquired) {
+            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
+            return false;
+        }
+        return true;
+    }
+
+    private void finish(ChannelHandlerContext ctx, QueryHandle handle) {
+        queries.unregister(handle.id());
+        Set<String> ids = byChannel.get(ctx.channel().id());
+        if (ids != null) {
+            ids.remove(handle.id());
+        }
+        permits.release();
     }
 
     private long timeout(JsonNode node) {

@@ -23,5 +23,15 @@ class CengyanCliTest {
         JsonNode flush = MAPPER.readTree(cli.request(":flush"));
         assertEquals("admin", flush.get("op").asText());
         assertEquals("flush", flush.get("command").asText());
+        assertEquals("", flush.get("session").asText());
+        JsonNode login = MAPPER.readTree(cli.request(":login root cengyan"));
+        assertEquals("login", login.get("op").asText());
+        assertEquals("root", login.get("user").asText());
+        assertEquals("cengyan", login.get("password").asText());
+        JsonNode created = MAPPER.readTree(cli.request(":createUser reader secret read"));
+        assertEquals("admin", created.get("op").asText());
+        assertEquals("createUser", created.get("command").asText());
+        assertEquals("reader", created.get("user").asText());
+        assertEquals("read", created.get("role").asText());
     }
 }

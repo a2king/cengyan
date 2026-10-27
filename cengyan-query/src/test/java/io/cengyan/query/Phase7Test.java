@@ -176,7 +176,7 @@ class Phase7Test {
             assertEquals(ErrorCode.QUERY_CANCELED, canceled.code());
             assertEquals(false, run(db, "SHOW INDEXES").rows().get(0).get(5));
             CengyanException unknown = assertThrows(CengyanException.class,
-                    () -> db.engine.admin(db.session, "compact", "", null));
+                    () -> db.engine.admin(db.session, "vacuum", "", null));
             assertEquals(ErrorCode.SYNTAX, unknown.code());
             CengyanException missing = assertThrows(CengyanException.class,
                     () -> run(db, "CREATE INDEX bad ON NODE TYPE Company (missing)"));

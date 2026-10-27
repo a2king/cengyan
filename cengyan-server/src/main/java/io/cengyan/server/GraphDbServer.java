@@ -2,6 +2,7 @@ package io.cengyan.server;
 
 import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
+import io.cengyan.catalog.Auth;
 import io.cengyan.catalog.Catalog;
 import io.cengyan.query.QueryEngine;
 import io.cengyan.store.GraphStore;
@@ -88,6 +89,8 @@ public final class GraphDbServer implements AutoCloseable {
             store = GraphStore.open(config.dataDir(), StoreOptions.server(config.blockCacheBytes()));
             Catalog catalog = Catalog.load(store);
             log.info("已加载目录，共 {} 张图", catalog.graphs().size());
+            Auth auth = new Auth(store);
+            auth.ensureRoot(config.rootPassword());
             QueryRegistry queries = new QueryRegistry();
             Sessions sessions = new Sessions();
             timeoutThread = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -113,7 +116,7 @@ public final class GraphDbServer implements AutoCloseable {
             worker = new NioEventLoopGroup(0, new DefaultThreadFactory("cengyan-io"));
             QueryEngine engine = new QueryEngine(
                     catalog, store, config.duckdbMemory(), config.duckdbTempDirectory(),
-                    config.minEdgeRatio(), config.minAccumRatio());
+                    config.minEdgeRatio(), config.minAccumRatio(), auth);
             ExecuteService execute = new ExecuteService(engine, config, queries, queryPool, sessions);
             LineServer lineServer = new LineServer(queries, execute);
             ServerBootstrap bootstrap = new ServerBootstrap();

@@ -4,6 +4,7 @@ import io.cengyan.CancelToken;
 import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
 import io.cengyan.catalog.AliasRow;
+import io.cengyan.catalog.Auth;
 import io.cengyan.catalog.Catalog;
 import io.cengyan.catalog.GraphName;
 import io.cengyan.catalog.IndexDef;
@@ -28,6 +29,8 @@ import java.util.Map;
 /** 执行一条 GQL。同一会话上的语句串行，失败时不返回半截结果。 */
 public final class QueryEngine {
     private final Catalog catalog;
+    private final GraphStore store;
+    private final Auth auth;
     private final MatchExecutor match;
     private final MutateExecutor mutate;
     private final ProcedureExecutor procedures;
@@ -47,6 +50,17 @@ public final class QueryEngine {
             Path duckdbTempDirectory,
             double minEdgeRatio,
             double minAccumRatio) {
+        this(catalog, store, duckdbMemory, duckdbTempDirectory, minEdgeRatio, minAccumRatio, null);
+    }
+
+    public QueryEngine(
+            Catalog catalog,
+            GraphStore store,
+            String duckdbMemory,
+            Path duckdbTempDirectory,
+            double minEdgeRatio,
+            double minAccumRatio,
+            Auth auth) {
         if (catalog == null || store == null) {
             throw new IllegalArgumentException("目录和存储不能为空");
         }
@@ -54,6 +68,8 @@ public final class QueryEngine {
             throw new IllegalArgumentException("比例阈值不能为负");
         }
         this.catalog = catalog;
+        this.store = store;
+        this.auth = auth;
         DuckSettings duck = new DuckSettings(duckdbMemory, duckdbTempDirectory);
         this.match = new MatchExecutor(catalog, store, duck);
         this.mutate = new MutateExecutor(catalog, store);
@@ -81,6 +97,9 @@ public final class QueryEngine {
             }
             if (cancel != null && cancel.cancelled()) {
                 throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
+            }
+            if (session.readOnly() && writes(stmt)) {
+                throw new CengyanException(ErrorCode.FORBIDDEN, "只读会话不能修改数据");
             }
             Map<String, Object> values = normalize(params);
             return switch (stmt) {
@@ -190,7 +209,36 @@ public final class QueryEngine {
         throw new CengyanException(ErrorCode.INTERNAL, "索引类型丢失：" + index.name());
     }
 
+    public QueryResult login(SessionState session, String user, String password) {
+        if (session == null) {
+            throw new IllegalArgumentException("会话不能为空");
+        }
+        if (auth == null) {
+            throw new CengyanException(ErrorCode.INTERNAL, "还没有打开用户管理");
+        }
+        synchronized (session) {
+            Auth.User found = auth.authenticate(user, password);
+            if (found == null) {
+                throw new CengyanException(ErrorCode.FORBIDDEN, "用户或密码不正确");
+            }
+            session.bind(found.name(), found.role());
+            String roleName = found.role() == Auth.ROLE_READ ? "read" : "write";
+            return new QueryResult(List.of("user", "role"), List.of(List.of(found.name(), roleName)), 0);
+        }
+    }
+
     public QueryResult admin(SessionState session, String command, String index, CancelToken cancel) {
+        return admin(session, command, index, "", "", "", cancel);
+    }
+
+    public QueryResult admin(
+            SessionState session,
+            String command,
+            String index,
+            String user,
+            String password,
+            String role,
+            CancelToken cancel) {
         if (session == null) {
             throw new IllegalArgumentException("会话不能为空");
         }
@@ -203,6 +251,7 @@ public final class QueryEngine {
             }
             return switch (command) {
                 case "rebuildIndex" -> {
+                    requireWrite(session);
                     if (index == null || index.isBlank()) {
                         throw new CengyanException(ErrorCode.SYNTAX, "缺少索引名");
                     }
@@ -215,9 +264,74 @@ public final class QueryEngine {
                     }
                     yield new QueryResult(List.of("target", "name", "count", "maxDegree"), rows, 0);
                 }
+                case "flush" -> {
+                    requireWrite(session);
+                    store.flush();
+                    yield QueryResult.changed(0);
+                }
+                case "compact" -> {
+                    requireWrite(session);
+                    store.compact();
+                    yield QueryResult.changed(0);
+                }
+                case "createUser" -> {
+                    requireWrite(session);
+                    requireAuth();
+                    auth.createUser(user, password, parseRole(role));
+                    yield QueryResult.changed(1);
+                }
+                case "setPassword" -> {
+                    requireWrite(session);
+                    requireAuth();
+                    auth.setPassword(user, password);
+                    yield QueryResult.changed(1);
+                }
+                case "setRole" -> {
+                    requireWrite(session);
+                    requireAuth();
+                    auth.setRole(user, parseRole(role));
+                    yield QueryResult.changed(1);
+                }
+                case "dropUser" -> {
+                    requireWrite(session);
+                    requireAuth();
+                    auth.dropUser(user);
+                    yield QueryResult.changed(1);
+                }
                 default -> throw new CengyanException(ErrorCode.SYNTAX, "无法识别的管理命令");
             };
         }
+    }
+
+    private void requireAuth() {
+        if (auth == null) {
+            throw new CengyanException(ErrorCode.INTERNAL, "还没有打开用户管理");
+        }
+    }
+
+    private static void requireWrite(SessionState session) {
+        if (session.readOnly()) {
+            throw new CengyanException(ErrorCode.FORBIDDEN, "只读会话不能修改数据");
+        }
+    }
+
+    private static boolean writes(Stmt stmt) {
+        return !(stmt instanceof Stmt.Use
+                || stmt instanceof Stmt.Show
+                || stmt instanceof Stmt.Describe
+                || stmt instanceof Stmt.Match
+                || stmt instanceof Stmt.Call);
+    }
+
+    private static int parseRole(String role) {
+        if (role == null || role.isBlank()) {
+            throw new CengyanException(ErrorCode.SYNTAX, "缺少角色");
+        }
+        return switch (role.toLowerCase(Locale.ROOT)) {
+            case "read" -> Auth.ROLE_READ;
+            case "write" -> Auth.ROLE_WRITE;
+            default -> throw new CengyanException(ErrorCode.SYNTAX, "角色只能是 read 或 write");
+        };
     }
 
     private QueryResult types(boolean node, int graphId) {

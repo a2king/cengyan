@@ -13,6 +13,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -85,10 +86,39 @@ public final class CengyanCli {
             node.put("op", "ping");
         } else if (trimmed.startsWith(":")) {
             String body = trimmed.substring(1).trim();
-            int space = body.indexOf(' ');
-            String command = space < 0 ? body : body.substring(0, space);
-            node.put("op", "admin");
-            node.put("command", command);
+            String[] parts = body.isEmpty() ? new String[0] : body.split("\\s+");
+            String command = parts.length == 0 ? "" : parts[0];
+            if (command.equalsIgnoreCase("login")) {
+                node.put("op", "login");
+                node.put("session", session);
+                node.put("user", part(parts, 1));
+                node.put("password", parts.length > 2
+                        ? String.join(" ", Arrays.copyOfRange(parts, 2, parts.length))
+                        : "");
+            } else {
+                node.put("op", "admin");
+                node.put("session", session);
+                node.put("command", command);
+                switch (command) {
+                    case "rebuildIndex" -> node.put("index", part(parts, 1));
+                    case "createUser" -> {
+                        node.put("user", part(parts, 1));
+                        node.put("password", part(parts, 2));
+                        node.put("role", part(parts, 3));
+                    }
+                    case "setPassword" -> {
+                        node.put("user", part(parts, 1));
+                        node.put("password", part(parts, 2));
+                    }
+                    case "setRole" -> {
+                        node.put("user", part(parts, 1));
+                        node.put("role", part(parts, 2));
+                    }
+                    case "dropUser" -> node.put("user", part(parts, 1));
+                    default -> {
+                    }
+                }
+            }
         } else {
             node.put("op", "execute");
             node.put("session", session);
@@ -96,6 +126,10 @@ public final class CengyanCli {
             node.set("params", MAPPER.createObjectNode());
         }
         return MAPPER.writeValueAsString(node);
+    }
+
+    private static String part(String[] parts, int index) {
+        return parts.length > index ? parts[index] : "";
     }
 
     private void print(String response) throws IOException {

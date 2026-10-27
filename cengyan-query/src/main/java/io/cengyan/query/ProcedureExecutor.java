@@ -8,6 +8,7 @@ import io.cengyan.catalog.PropDef;
 import io.cengyan.catalog.RelType;
 import io.cengyan.catalog.ValueType;
 import io.cengyan.parser.Stmt;
+import io.cengyan.store.Direction;
 import io.cengyan.store.GraphStore;
 import io.cengyan.store.ReadSession;
 
@@ -23,8 +24,10 @@ import java.util.Set;
 final class ProcedureExecutor {
     private static final Set<String> SHORTEST_ARGS = Set.of("start", "end", "rel", "hops");
     private static final Set<String> OWNERSHIP_ARGS = Set.of("start", "rel", "ratioProp", "hops");
+    private static final Set<String> SUBGRAPH_ARGS = Set.of("start", "rel", "hops");
     private static final Set<String> SHORTEST_YIELD = Set.of("length", "vids");
     private static final Set<String> OWNERSHIP_YIELD = Set.of("vid", "ratio");
+    private static final Set<String> SUBGRAPH_YIELD = Set.of("vid");
 
     private final Catalog catalog;
     private final GraphStore store;
@@ -44,6 +47,7 @@ final class ProcedureExecutor {
         return switch (name) {
             case "path.shortest" -> shortest(graphId, args, call.yield(), limits, cancel);
             case "ownership.largest_holder" -> ownership(graphId, args, call.yield(), limits, cancel);
+            case "subgraph.bounded" -> subgraph(graphId, args, call.yield(), limits, cancel);
             default -> throw new CengyanException(ErrorCode.SYNTAX, "未知过程 " + call.name());
         };
     }
@@ -98,6 +102,36 @@ final class ProcedureExecutor {
         }
         Map<String, Object> values = Map.of("vid", result.vid(), "ratio", result.ratio());
         return new QueryResult(columns, List.of(row(columns, values)), 0);
+    }
+
+    /** 从起点沿这种边的两个方向扩展。起点算在结果里，只返回 vid。 */
+    private QueryResult subgraph(
+            int graphId,
+            Map<String, Object> args,
+            List<String> yield,
+            QueryLimits limits,
+            CancelToken cancel) {
+        known(args, SUBGRAPH_ARGS);
+        List<String> columns = columns(yield, SUBGRAPH_YIELD);
+        long start = requiredLong(args, "start");
+        String rel = requiredString(args, "rel");
+        int hops = hops(requiredLong(args, "hops"), limits.maxHops());
+        RelType type = catalog.relType(graphId, rel);
+        List<Long> vids = new ArrayList<>();
+        vids.add(start);
+        if (hops > 0) {
+            try (ReadSession session = store.read()) {
+                vids.addAll(HopLoop.expandRange(
+                        session, graphId, type.id(), List.of(Direction.OUT, Direction.IN),
+                        start, 1, hops, limits.maxHops(), limits.maxEdgesPerVertex(),
+                        limits.maxFrontierPerHop(), null, null, cancel));
+            }
+        }
+        List<List<Object>> rows = new ArrayList<>();
+        for (long vid : vids) {
+            rows.add(row(columns, Map.<String, Object>of("vid", vid)));
+        }
+        return new QueryResult(columns, rows, 0);
     }
 
     private static void requireRatio(RelType type, String ratioProp) {

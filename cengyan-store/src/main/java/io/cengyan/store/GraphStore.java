@@ -54,6 +54,12 @@ public interface GraphStore extends AutoCloseable {
     /** 按类型扫描起点时检查过的点键数。走索引时应当保持不变。 */
     long verticesExamined();
 
+    /** 把内存表刷到磁盘。进行中的快照读可以继续。 */
+    void flush();
+
+    /** 压缩全部列族。进行中的快照读可以继续。 */
+    void compact();
+
     @Override
     void close();
 }

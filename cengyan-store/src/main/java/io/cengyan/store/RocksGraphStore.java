@@ -10,6 +10,7 @@ import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.CompressionType;
 import org.rocksdb.DBOptions;
+import org.rocksdb.FlushOptions;
 import org.rocksdb.LRUCache;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
@@ -302,6 +303,35 @@ public final class RocksGraphStore implements GraphStore {
 
     void addVerticesExamined() {
         verticesExamined.incrementAndGet();
+    }
+
+    @Override
+    public void flush() {
+        if (closed.get()) {
+            throw new CengyanException(ErrorCode.INTERNAL, "数据库已关闭");
+        }
+        try (FlushOptions options = new FlushOptions()) {
+            options.setWaitForFlush(true);
+            db.flush(options, handles);
+        } catch (RocksDBException ex) {
+            throw new CengyanException(ErrorCode.INTERNAL, "刷盘失败：" + ex.getMessage(), ex);
+        }
+        log.info("已刷盘");
+    }
+
+    @Override
+    public void compact() {
+        if (closed.get()) {
+            throw new CengyanException(ErrorCode.INTERNAL, "数据库已关闭");
+        }
+        try {
+            for (ColumnFamilyHandle handle : handles) {
+                db.compactRange(handle);
+            }
+        } catch (RocksDBException ex) {
+            throw new CengyanException(ErrorCode.INTERNAL, "压缩失败：" + ex.getMessage(), ex);
+        }
+        log.info("已压缩");
     }
 
     /** 阶段 1 的分片号恒为 0。阶段 9 再按 vid 计算。 */

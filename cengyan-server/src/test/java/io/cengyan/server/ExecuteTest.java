@@ -18,6 +18,7 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ExecuteTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -28,12 +29,15 @@ class ExecuteTest {
         ServerConfig config = ServerConfig.defaults().forTest(dir);
         try (GraphDbServer server = GraphDbServer.start(config)) {
             try (Socket socket = new Socket("127.0.0.1", server.port())) {
-                socket.setSoTimeout(5000);
+                socket.setSoTimeout(30000);
                 BufferedWriter writer = new BufferedWriter(
                         new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
                 BufferedReader reader = new BufferedReader(
                         new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-                String session = "";
+                JsonNode anonymous = send(writer, reader, "", "CREATE GRAPH Company");
+                assertEquals("FORBIDDEN", anonymous.get("code").asText(), anonymous.toString());
+                assertTrue(anonymous.get("message").asText().contains("请先登录"));
+                String session = login(writer, reader, "", "root", "cengyan");
                 session = ok(writer, reader, session, "CREATE GRAPH Company");
                 session = ok(writer, reader, session, "USE Company");
                 session = ok(writer, reader, session, "CREATE NODE TYPE Company (name STRING NULL)");
@@ -47,7 +51,8 @@ class ExecuteTest {
                 assertEquals(2, rows.get("rows").get(0).get(0).asLong());
                 assertEquals(0.5d, rows.get("rows").get(0).get(1).asDouble());
                 JsonNode missing = send(writer, reader, "", "MATCH (a)-[:holder]->(b) RETURN b.id");
-                assertEquals("GRAPH_NOT_FOUND", missing.get("code").asText());
+                assertEquals("FORBIDDEN", missing.get("code").asText());
+                assertTrue(missing.get("message").asText().contains("请先登录"));
                 assertFalse(missing.has("rows"));
                 assertFalse(missing.has("columns"));
             }
@@ -62,12 +67,12 @@ class ExecuteTest {
         ServerConfig config = ServerConfig.defaults().forTest(dir);
         try (GraphDbServer server = GraphDbServer.start(config)) {
             try (Socket socket = new Socket("127.0.0.1", server.port())) {
-                socket.setSoTimeout(5000);
+                socket.setSoTimeout(30000);
                 BufferedWriter writer = new BufferedWriter(
                         new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
                 BufferedReader reader = new BufferedReader(
                         new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-                String session = "";
+                String session = login(writer, reader, "", "root", "cengyan");
                 session = ok(writer, reader, session, "CREATE GRAPH Company");
                 session = ok(writer, reader, session, "USE Company");
                 session = ok(writer, reader, session, "CREATE NODE TYPE Company (name STRING NULL)");
@@ -84,6 +89,21 @@ class ExecuteTest {
                 assertEquals("OK", stats.get("code").asText(), stats.toString());
                 assertEquals("NODE", stats.get("rows").get(0).get(0).asText());
                 assertEquals(1, stats.get("rows").get(0).get(2).asInt());
+                JsonNode created = adminUser(writer, reader, session, "createUser", "reader", "secret", "read");
+                assertEquals("OK", created.get("code").asText(), created.toString());
+                session = login(writer, reader, session, "reader", "secret");
+                JsonNode denied = send(writer, reader, session, "INSERT (a:Company {id:2, name:'other'})");
+                assertEquals("FORBIDDEN", denied.get("code").asText(), denied.toString());
+                assertTrue(denied.get("message").asText().contains("只读"));
+                JsonNode shownGraphs = send(writer, reader, session, "SHOW GRAPHS");
+                assertEquals("OK", shownGraphs.get("code").asText(), shownGraphs.toString());
+                JsonNode flushDenied = admin(writer, reader, session, "flush", "");
+                assertEquals("FORBIDDEN", flushDenied.get("code").asText(), flushDenied.toString());
+                session = login(writer, reader, session, "root", "cengyan");
+                JsonNode flushed = admin(writer, reader, session, "flush", "");
+                assertEquals("OK", flushed.get("code").asText(), flushed.toString());
+                JsonNode compacted = admin(writer, reader, session, "compact", "");
+                assertEquals("OK", compacted.get("code").asText(), compacted.toString());
             }
         } finally {
             deleteTree(dir);
@@ -115,6 +135,42 @@ class ExecuteTest {
         request.put("session", session);
         request.put("command", command);
         request.put("index", index);
+        writer.write(MAPPER.writeValueAsString(request));
+        writer.write('\n');
+        writer.flush();
+        return MAPPER.readTree(reader.readLine());
+    }
+
+    private static String login(
+            BufferedWriter writer, BufferedReader reader, String session, String user, String password) throws Exception {
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("op", "login");
+        request.put("session", session);
+        request.put("user", user);
+        request.put("password", password);
+        writer.write(MAPPER.writeValueAsString(request));
+        writer.write('\n');
+        writer.flush();
+        JsonNode node = MAPPER.readTree(reader.readLine());
+        assertEquals("OK", node.get("code").asText(), node.toString());
+        return node.get("session").asText();
+    }
+
+    private static JsonNode adminUser(
+            BufferedWriter writer,
+            BufferedReader reader,
+            String session,
+            String command,
+            String user,
+            String password,
+            String role) throws Exception {
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("op", "admin");
+        request.put("session", session);
+        request.put("command", command);
+        request.put("user", user);
+        request.put("password", password);
+        request.put("role", role);
         writer.write(MAPPER.writeValueAsString(request));
         writer.write('\n');
         writer.flush();

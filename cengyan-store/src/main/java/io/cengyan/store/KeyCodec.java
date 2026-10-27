@@ -336,6 +336,25 @@ public final class KeyCodec {
         return getInt64(key, 23);
     }
 
+    public static String userName(byte[] key) {
+        if (key == null || key.length < 2 || (key[0] & 0xFF) != 0x40) {
+            throw new IllegalArgumentException("不是用户键");
+        }
+        return nameFromKey(key, 1);
+    }
+
+    public static byte[] userKey(String name) {
+        byte[] utf8 = nameUtf8(name);
+        byte[] key = new byte[1 + utf8.length];
+        key[0] = 0x40;
+        System.arraycopy(utf8, 0, key, 1, utf8.length);
+        return key;
+    }
+
+    public static byte[] userPrefix() {
+        return new byte[] {0x40};
+    }
+
     public record TypeKey(int graphId, int kind, int typeId) {
     }
 
