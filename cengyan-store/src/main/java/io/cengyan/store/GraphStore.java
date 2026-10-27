@@ -48,6 +48,12 @@ public interface GraphStore extends AutoCloseable {
     /** 扫边时实际检查过的键数，包含没通过条件下推的边。 */
     long edgesExamined();
 
+    /** 索引范围扫描返回的键数。建完前的普通扫描应当保持不变。 */
+    long indexReads();
+
+    /** 按类型扫描起点时检查过的点键数。走索引时应当保持不变。 */
+    long verticesExamined();
+
     @Override
     void close();
 }

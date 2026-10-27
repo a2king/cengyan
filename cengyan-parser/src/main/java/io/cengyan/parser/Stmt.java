@@ -21,7 +21,7 @@ public sealed interface Stmt {
 
     record Show(Kind kind) implements Stmt {
         public enum Kind {
-            GRAPHS, ALIASES, NODE_TYPES, REL_TYPES
+            GRAPHS, ALIASES, NODE_TYPES, REL_TYPES, INDEXES
         }
     }
 
@@ -29,6 +29,13 @@ public sealed interface Stmt {
     }
 
     record CreateType(boolean node, String name, List<Field> fields) implements Stmt {
+    }
+
+    record CreateIndex(boolean unique, String name, boolean node, String typeName, List<String> properties)
+            implements Stmt {
+    }
+
+    record DropIndex(String name) implements Stmt {
     }
 
     record AlterType(boolean node, String typeName, String property, String valueType) implements Stmt {

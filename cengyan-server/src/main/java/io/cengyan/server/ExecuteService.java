@@ -96,6 +96,73 @@ final class ExecuteService {
         }
     }
 
+    void admin(ChannelHandlerContext ctx, JsonNode node) {
+        String sessionId = node.path("session").asText("");
+        if (sessionId.isBlank()) {
+            sessionId = UUID.randomUUID().toString();
+        }
+        String session = sessionId;
+        String command = node.path("command").asText("");
+        if (command.isBlank()) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "缺少 command");
+            return;
+        }
+        String index = node.path("index").asText("");
+        long timeoutMs = timeout(node);
+        if (timeoutMs <= 0) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间必须为正");
+            return;
+        }
+        boolean acquired;
+        try {
+            acquired = permits.tryAcquire(50, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
+            return;
+        }
+        if (!acquired) {
+            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
+            return;
+        }
+        try {
+            queryPool.execute(() -> runAdmin(ctx, session, command, index, timeoutMs));
+        } catch (RejectedExecutionException ex) {
+            permits.release();
+            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
+        }
+    }
+
+    private void runAdmin(ChannelHandlerContext ctx, String sessionId, String command, String index, long timeoutMs) {
+        QueryHandle handle = QueryHandle.start(timeoutMs);
+        queries.register(handle);
+        byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
+        try {
+            SessionState session = sessions.open(sessionId);
+            QueryResult result = engine.admin(session, command, index, handle);
+            ObjectNode node = MAPPER.createObjectNode();
+            node.put("code", ErrorCode.OK.name());
+            node.put("session", sessionId);
+            node.put("queryId", handle.id());
+            node.set("columns", MAPPER.valueToTree(result.columns()));
+            node.set("rows", MAPPER.valueToTree(result.rows()));
+            node.put("rowsAffected", result.rowsAffected());
+            write(ctx, node);
+        } catch (CengyanException ex) {
+            error(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
+        } catch (RuntimeException ex) {
+            log.warn("执行管理命令失败：{}", ex.toString());
+            error(ctx, sessionId, handle.id(), ErrorCode.INTERNAL, "执行管理命令失败");
+        } finally {
+            queries.unregister(handle.id());
+            Set<String> ids = byChannel.get(ctx.channel().id());
+            if (ids != null) {
+                ids.remove(handle.id());
+            }
+            permits.release();
+        }
+    }
+
     void onInactive(ChannelHandlerContext ctx) {
         Set<String> ids = byChannel.remove(ctx.channel().id());
         if (ids == null) {

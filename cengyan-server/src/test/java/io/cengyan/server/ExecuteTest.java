@@ -56,6 +56,40 @@ class ExecuteTest {
         }
     }
 
+    @Test
+    void 管理命令在查询线程上重建索引() throws Exception {
+        Path dir = Files.createTempDirectory("cengyan-admin-");
+        ServerConfig config = ServerConfig.defaults().forTest(dir);
+        try (GraphDbServer server = GraphDbServer.start(config)) {
+            try (Socket socket = new Socket("127.0.0.1", server.port())) {
+                socket.setSoTimeout(5000);
+                BufferedWriter writer = new BufferedWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+                BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                String session = "";
+                session = ok(writer, reader, session, "CREATE GRAPH Company");
+                session = ok(writer, reader, session, "USE Company");
+                session = ok(writer, reader, session, "CREATE NODE TYPE Company (name STRING NULL)");
+                session = ok(writer, reader, session, "CREATE REL TYPE holder ()");
+                session = ok(writer, reader, session, "INSERT (a:Company {id:1, name:'root'})");
+                session = ok(writer, reader, session, "CREATE INDEX by_name ON NODE TYPE Company (name)");
+                JsonNode rebuilt = admin(writer, reader, session, "rebuildIndex", "by_name");
+                assertEquals("OK", rebuilt.get("code").asText(), rebuilt.toString());
+                assertEquals(1, rebuilt.get("rowsAffected").asInt());
+                JsonNode shown = send(writer, reader, session, "SHOW INDEXES");
+                assertEquals("OK", shown.get("code").asText(), shown.toString());
+                assertEquals(true, shown.get("rows").get(0).get(5).asBoolean());
+                JsonNode stats = admin(writer, reader, session, "stats", "");
+                assertEquals("OK", stats.get("code").asText(), stats.toString());
+                assertEquals("NODE", stats.get("rows").get(0).get(0).asText());
+                assertEquals(1, stats.get("rows").get(0).get(2).asInt());
+            }
+        } finally {
+            deleteTree(dir);
+        }
+    }
+
     private static String ok(BufferedWriter writer, BufferedReader reader, String session, String query) throws Exception {
         JsonNode node = send(writer, reader, session, query);
         assertEquals("OK", node.get("code").asText(), node.toString());
@@ -68,6 +102,19 @@ class ExecuteTest {
         request.put("session", session);
         request.put("query", query);
         request.set("params", MAPPER.createObjectNode());
+        writer.write(MAPPER.writeValueAsString(request));
+        writer.write('\n');
+        writer.flush();
+        return MAPPER.readTree(reader.readLine());
+    }
+
+    private static JsonNode admin(
+            BufferedWriter writer, BufferedReader reader, String session, String command, String index) throws Exception {
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("op", "admin");
+        request.put("session", session);
+        request.put("command", command);
+        request.put("index", index);
         writer.write(MAPPER.writeValueAsString(request));
         writer.write('\n');
         writer.flush();

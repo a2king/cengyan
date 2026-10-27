@@ -10,14 +10,18 @@ statement
     | CREATE ALIAS alias=IDENT FOR GRAPH target=IDENT         #createAlias
     | DROP ALIAS name=IDENT                                   #dropAlias
     | DROP GRAPH name=IDENT                                   #dropGraph
+    | DROP INDEX name=IDENT                                   #dropIndex
     | SHOW GRAPHS                                             #showGraphs
     | SHOW ALIASES                                            #showAliases
     | SHOW NODE TYPES                                         #showNodeTypes
     | SHOW REL TYPES                                          #showRelTypes
+    | SHOW INDEXES                                            #showIndexes
     | DESCRIBE NODE TYPE name=IDENT                           #describeNode
     | DESCRIBE REL TYPE name=IDENT                            #describeRel
     | CREATE NODE TYPE name=IDENT '(' fields? ')'             #createNodeType
     | CREATE REL TYPE name=IDENT '(' fields? ')'              #createRelType
+    | CREATE UNIQUE? INDEX name=IDENT ON NODE TYPE typeName=IDENT '(' indexCols ')' #createNodeIndex
+    | CREATE UNIQUE? INDEX name=IDENT ON REL TYPE typeName=IDENT '(' indexCols ')' #createRelIndex
     | ALTER NODE TYPE typeName=IDENT ADD prop=IDENT valueType NULL #alterNode
     | ALTER REL TYPE typeName=IDENT ADD prop=IDENT valueType NULL #alterRel
     | INSERT node (edge node)?                                #insertStmt
@@ -29,6 +33,7 @@ statement
 
 fields: field (',' field)*;
 field: name=IDENT valueType NULL?;
+indexCols: IDENT (',' IDENT)*;
 valueType: BOOL | BOOLEAN | INT | INTEGER | INT64 | DOUBLE | STRING | DATETIME;
 
 node: '(' variable=IDENT? (':' typeName=IDENT)? props? ')';
@@ -129,6 +134,10 @@ ASC: A S C;
 DESC: D E S C;
 TRUE: T R U E;
 FALSE: F A L S E;
+INDEXES: I N D E X E S;
+INDEX: I N D E X;
+UNIQUE: U N I Q U E;
+ON: O N;
 
 fragment A: [Aa];
 fragment B: [Bb];

@@ -57,6 +57,10 @@ final class GqlReader {
             Map.entry("distinct", Kind.DISTINCT),
             Map.entry("call", Kind.CALL),
             Map.entry("yield", Kind.YIELD),
+            Map.entry("index", Kind.INDEX),
+            Map.entry("indexes", Kind.INDEXES),
+            Map.entry("unique", Kind.UNIQUE),
+            Map.entry("on", Kind.ON),
             Map.entry("true", Kind.TRUE),
             Map.entry("false", Kind.FALSE));
 
@@ -112,6 +116,9 @@ final class GqlReader {
             expect(Kind.GRAPH, "别名后面要写 FOR GRAPH");
             return new Stmt.CreateAlias(alias, ident());
         }
+        if (peek() == Kind.UNIQUE || peek() == Kind.INDEX) {
+            return createIndex(take(Kind.UNIQUE));
+        }
         boolean node = nodeOrRel();
         expect(Kind.TYPE, "缺少 TYPE");
         String name = ident();
@@ -121,12 +128,35 @@ final class GqlReader {
         return new Stmt.CreateType(node, name, fields);
     }
 
+    private Stmt createIndex(boolean unique) {
+        expect(Kind.INDEX, "缺少 INDEX");
+        String name = ident();
+        expect(Kind.ON, "索引后面要写 ON");
+        boolean node = nodeOrRel();
+        expect(Kind.TYPE, "缺少 TYPE");
+        String typeName = ident();
+        expect(Kind.LP, "索引列缺少左括号");
+        if (peek() == Kind.RP) {
+            fail("索引至少要有一列");
+        }
+        List<String> properties = new ArrayList<>();
+        properties.add(ident());
+        while (take(Kind.COMMA)) {
+            properties.add(ident());
+        }
+        expect(Kind.RP, "索引列缺少右括号");
+        return new Stmt.CreateIndex(unique, name, node, typeName, properties);
+    }
+
     private Stmt drop() {
         expect(Kind.DROP, "缺少 DROP");
         if (take(Kind.ALIAS)) {
             return new Stmt.DropAlias(ident());
         }
-        expect(Kind.GRAPH, "只能 DROP GRAPH 或 DROP ALIAS");
+        if (take(Kind.INDEX)) {
+            return new Stmt.DropIndex(ident());
+        }
+        expect(Kind.GRAPH, "只能 DROP GRAPH、DROP ALIAS 或 DROP INDEX");
         return new Stmt.DropGraph(ident());
     }
 
@@ -137,6 +167,9 @@ final class GqlReader {
         }
         if (take(Kind.ALIASES)) {
             return new Stmt.Show(Stmt.Show.Kind.ALIASES);
+        }
+        if (take(Kind.INDEXES)) {
+            return new Stmt.Show(Stmt.Show.Kind.INDEXES);
         }
         if (take(Kind.NODE)) {
             expect(Kind.TYPES, "SHOW NODE 后面要写 TYPES");
@@ -870,7 +903,7 @@ final class GqlReader {
         BOOL, BOOLEAN, INT, INT64, INTEGER_WORD, DOUBLE, DATETIME,
         CREATE, GRAPH, GRAPHS, USE, ALIAS, ALIASES, FOR, DROP, SHOW, NODE, REL, TYPES, TYPE,
         DESCRIBE, ALTER, ADD, NULL, INSERT, MATCH, WHERE, RETURN, ORDER, BY, LIMIT, SKIP,
-        SET, DELETE, DISTINCT, CALL, YIELD,
+        SET, DELETE, DISTINCT, CALL, YIELD, INDEX, INDEXES, UNIQUE, ON,
         AND, OR, NOT, IS, IN, AS, ASC, DESC, TRUE, FALSE,
         ARROW, LARROW, LE, GE, NEQ, EQ, LT, GT, PLUS, MINUS, STAR, SLASH,
         LP, RP, LB, RB, LC, RC, COMMA, COLON, SEMI, DOT, AT, DOLLAR, EOF

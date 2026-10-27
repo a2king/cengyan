@@ -18,6 +18,10 @@ final class TreeText {
             case Stmt.Describe describe -> "(describe " + (describe.node() ? "node " : "rel ") + describe.name() + ")";
             case Stmt.CreateType type -> "(createType " + (type.node() ? "node " : "rel ") + type.name()
                     + " " + fields(type.fields()) + ")";
+            case Stmt.CreateIndex index -> "(createIndex " + (index.unique() ? "unique " : "")
+                    + index.name() + " " + (index.node() ? "node " : "rel ") + index.typeName()
+                    + " " + String.join(",", index.properties()) + ")";
+            case Stmt.DropIndex drop -> "(dropIndex " + drop.name() + ")";
             case Stmt.AlterType alter -> "(alter " + (alter.node() ? "node " : "rel ") + alter.typeName()
                     + " " + alter.property() + " " + alter.valueType() + ")";
             case Stmt.Insert insert -> "(insert " + node(insert.source())

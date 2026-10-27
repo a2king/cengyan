@@ -53,7 +53,7 @@ final class LineServer extends SimpleChannelInboundHandler<String> {
             case "ping" -> ok(ctx);
             case "execute" -> execute.execute(ctx, node);
             case "cancel" -> cancel(ctx, node);
-            case "admin" -> error(ctx, ErrorCode.SYNTAX, "当前版本还不能执行管理命令");
+            case "admin" -> execute.admin(ctx, node);
             default -> error(ctx, ErrorCode.SYNTAX, "无法识别的操作");
         }
     }

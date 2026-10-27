@@ -60,6 +60,12 @@ class GqlSyntaxTest {
                 Gql.tree("CALL path.shortest({start: 1, end: 2, rel: 'holder', hops: 10}) YIELD length, vids"));
         assertEquals("(call ownership.largest_holder start=1 rel='holder' ratioProp='ratio' hops=10 (yield vid ratio))",
                 Gql.tree("CALL ownership.largest_holder({start: 1, rel: \"holder\", ratioProp: \"ratio\", hops: 10}) YIELD vid, ratio"));
+        assertEquals("(createIndex unique by_name node Company name,capital)",
+                Gql.tree("CREATE UNIQUE INDEX by_name ON NODE TYPE Company (name, capital)"));
+        assertEquals("(createIndex by_ratio rel holder ratio)",
+                Gql.tree("CREATE INDEX by_ratio ON REL TYPE holder (ratio)"));
+        assertEquals("(dropIndex by_name)", Gql.tree("DROP INDEX by_name"));
+        assertEquals("(show INDEXES)", Gql.tree("SHOW INDEXES"));
     }
 
     @Test
@@ -68,6 +74,9 @@ class GqlSyntaxTest {
                 () -> Gql.parse("MATCH (a:Company {id:1})-[:holder]->*(b) RETURN b.id"));
         assertTrue(all.getMessage().contains("所有路径"));
         assertTrue(all.getMessage().contains("最短路"));
+        ParseException emptyIndex = assertThrows(ParseException.class,
+                () -> Gql.parse("CREATE INDEX idx ON NODE TYPE Company ()"));
+        assertTrue(emptyIndex.getMessage().contains("至少要有一列"));
     }
 
     @Test

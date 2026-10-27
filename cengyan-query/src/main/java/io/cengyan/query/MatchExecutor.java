@@ -4,6 +4,7 @@ import io.cengyan.CancelToken;
 import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
 import io.cengyan.catalog.Catalog;
+import io.cengyan.catalog.IndexDef;
 import io.cengyan.catalog.NodeType;
 import io.cengyan.catalog.PropCodec;
 import io.cengyan.catalog.PropDef;
@@ -68,27 +69,62 @@ final class MatchExecutor {
         }
         List<Hop> hops = new ArrayList<>();
         try (ReadSession session = store.read()) {
-            List<Long> starts = filterStarts(
-                session, graphId, sourceType, eval, match.source(),
-                starts(session, graphId, match.source(), sourceType, startId, maxEdges, cancel));
-            for (Direction direction : directions(match.edge().direction())) {
-                for (long start : starts) {
-                    if (window >= 0 && hops.size() >= window) {
-                        break;
+            List<IndexDef> indexDefs = catalog.indexes(graphId);
+            List<EdgeRef> indexed = names.edge == null || relType == null
+                    ? null
+                    : IndexLookup.edges(
+                            indexDefs, session, graphId, relType.id(), relType.properties(),
+                            names.edge, match.where(), eval, cancel);
+            if (indexed != null) {
+                boolean restrict = false;
+                List<Long> allowed = null;
+                if (startId != null) {
+                    allowed = List.of(startId);
+                    restrict = true;
+                } else if (sourceType != null && names.source != null) {
+                    List<Long> fromVertex = IndexLookup.vertexIds(
+                            indexDefs, session, graphId, sourceType.id(), sourceType.properties(),
+                            names.source, match.where(), eval, cancel);
+                    if (fromVertex != null) {
+                        allowed = fromVertex;
+                        restrict = true;
                     }
-                    cancelled(cancel);
-                    int remaining = window < 0 ? -1 : window - hops.size();
-                    try (EdgeCursor cursor = session.scanEdges(
-                            graphId, start, relType.id(), direction, remaining, maxEdges,
-                            edge -> rankOk(rankOnly, edge.rank()) && neighborOk(neighborOnly, other(edge, direction)),
-                            cancel)) {
-                        while (cursor.hasNext()) {
-                            EdgeRef edge = cursor.next();
-                            if (match.edge().direction() == Stmt.EdgePat.Direction.ANY && !names.seen.add(edge)) {
-                                continue;
+                }
+                if (restrict) {
+                    allowed = filterStarts(session, graphId, sourceType, eval, match.source(), allowed);
+                }
+                hops.addAll(hopsFromIndex(
+                        indexed, match.edge().direction(), allowed, restrict, rankOnly, neighborOnly, window, cancel));
+            } else {
+                List<Long> indexedStarts = startId == null && sourceType != null && names.source != null
+                        ? IndexLookup.vertexIds(
+                                indexDefs, session, graphId, sourceType.id(), sourceType.properties(),
+                                names.source, match.where(), eval, cancel)
+                        : null;
+                List<Long> starts = filterStarts(
+                        session, graphId, sourceType, eval, match.source(),
+                        indexedStarts != null
+                                ? indexedStarts
+                                : starts(session, graphId, match.source(), sourceType, startId, maxEdges, cancel));
+                for (Direction direction : directions(match.edge().direction())) {
+                    for (long start : starts) {
+                        if (window >= 0 && hops.size() >= window) {
+                            break;
+                        }
+                        cancelled(cancel);
+                        int remaining = window < 0 ? -1 : window - hops.size();
+                        try (EdgeCursor cursor = session.scanEdges(
+                                graphId, start, relType.id(), direction, remaining, maxEdges,
+                                edge -> rankOk(rankOnly, edge.rank()) && neighborOk(neighborOnly, other(edge, direction)),
+                                cancel)) {
+                            while (cursor.hasNext()) {
+                                EdgeRef edge = cursor.next();
+                                if (match.edge().direction() == Stmt.EdgePat.Direction.ANY && !names.seen.add(edge)) {
+                                    continue;
+                                }
+                                long other = other(edge, direction);
+                                hops.add(new Hop(start, other, edge));
                             }
-                            long other = other(edge, direction);
-                            hops.add(new Hop(start, other, edge));
                         }
                     }
                 }
@@ -676,6 +712,62 @@ final class MatchExecutor {
 
     private static boolean neighborOk(LongPredicate neighbor, long value) {
         return neighbor == null || neighbor.test(value);
+    }
+
+    private static List<Hop> hopsFromIndex(
+            List<EdgeRef> edges,
+            Stmt.EdgePat.Direction direction,
+            List<Long> allowed,
+            boolean restrict,
+            LongPredicate rankOnly,
+            LongPredicate neighborOnly,
+            int window,
+            CancelToken cancel) {
+        java.util.Set<Long> allow = restrict ? new java.util.HashSet<>(allowed) : null;
+        List<Hop> hops = new ArrayList<>();
+        int seen = 0;
+        for (EdgeRef edge : edges) {
+            if ((seen++ & 63) == 0) {
+                cancelled(cancel);
+            }
+            if (!rankOk(rankOnly, edge.rank())) {
+                continue;
+            }
+            boolean room = switch (direction) {
+                case OUT -> allow == null || allow.contains(edge.outSrc())
+                        ? addHop(hops, edge.outSrc(), edge.outDst(), edge, neighborOnly, window)
+                        : true;
+                case IN -> allow == null || allow.contains(edge.outDst())
+                        ? addHop(hops, edge.outDst(), edge.outSrc(), edge, neighborOnly, window)
+                        : true;
+                case ANY -> {
+                    if (allow == null || allow.contains(edge.outSrc())) {
+                        yield addHop(hops, edge.outSrc(), edge.outDst(), edge, neighborOnly, window);
+                    }
+                    if (allow.contains(edge.outDst())) {
+                        yield addHop(hops, edge.outDst(), edge.outSrc(), edge, neighborOnly, window);
+                    }
+                    yield true;
+                }
+            };
+            if (!room) {
+                break;
+            }
+        }
+        return hops;
+    }
+
+    /** @return 窗口还没满 */
+    private static boolean addHop(
+            List<Hop> hops, long start, long neighbor, EdgeRef edge, LongPredicate neighborOnly, int window) {
+        if (window >= 0 && hops.size() >= window) {
+            return false;
+        }
+        if (!neighborOk(neighborOnly, neighbor)) {
+            return true;
+        }
+        hops.add(new Hop(start, neighbor, edge));
+        return window < 0 || hops.size() < window;
     }
 
     private static long other(EdgeRef edge, Direction direction) {

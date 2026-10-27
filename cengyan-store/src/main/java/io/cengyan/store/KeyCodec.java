@@ -240,6 +240,102 @@ public final class KeyCodec {
         return getUint32(key, 3);
     }
 
+    public static byte[] indexRecordKey(int graphId, int indexId) {
+        checkUint16(graphId, "graphId");
+        checkUint32(indexId, "indexId");
+        byte[] key = new byte[7];
+        key[0] = 0x30;
+        putUint16(key, 1, graphId);
+        putUint32(key, 3, indexId);
+        return key;
+    }
+
+    /** 全部图的索引记录。索引编号全局递增，不随删图回收。 */
+    public static byte[] allIndexRecordPrefix() {
+        return new byte[] {0x30};
+    }
+
+    public static byte[] nextIndexIdKey() {
+        return new byte[] {0x31};
+    }
+
+    public static final int VERTEX_IDENTITY_LENGTH = 12;
+    public static final int EDGE_IDENTITY_LENGTH = 28;
+
+    /** 索引列族的查找起点：indexId 后面接已经编码好的属性。 */
+    public static byte[] indexSeek(int indexId, byte[] encoded) {
+        checkUint32(indexId, "indexId");
+        if (encoded == null) {
+            encoded = new byte[0];
+        }
+        byte[] key = new byte[4 + encoded.length];
+        putUint32(key, 0, indexId);
+        System.arraycopy(encoded, 0, key, 4, encoded.length);
+        return key;
+    }
+
+    public static byte[] indexKey(int indexId, byte[] encoded, int graphId, byte[] identity) {
+        checkUint16(graphId, "graphId");
+        if (identity == null || identity.length == 0) {
+            throw new IllegalArgumentException("索引身份不能为空");
+        }
+        byte[] head = indexSeek(indexId, encoded);
+        byte[] key = Arrays.copyOf(head, head.length + 2 + identity.length);
+        putUint16(key, head.length, graphId);
+        System.arraycopy(identity, 0, key, head.length + 2, identity.length);
+        return key;
+    }
+
+    public static byte[] vertexIdentity(int tagId, long vid) {
+        checkUint32(tagId, "tagId");
+        byte[] identity = new byte[VERTEX_IDENTITY_LENGTH];
+        putUint32(identity, 0, tagId);
+        putInt64(identity, 4, vid);
+        return identity;
+    }
+
+    public static byte[] edgeIdentity(int edgeTypeId, long rank, long outSrc, long outDst) {
+        checkUint32(edgeTypeId, "edgeTypeId");
+        byte[] identity = new byte[EDGE_IDENTITY_LENGTH];
+        putUint32(identity, 0, edgeTypeId);
+        putInt64(identity, 4, rank);
+        putInt64(identity, 12, outSrc);
+        putInt64(identity, 20, outDst);
+        return identity;
+    }
+
+    public static long identityVid(byte[] key, int offset) {
+        return getInt64(key, offset + 4);
+    }
+
+    public static EdgeRef identityEdge(byte[] key, int offset) {
+        return new EdgeRef(
+                getUint32(key, offset),
+                getInt64(key, offset + 4),
+                getInt64(key, offset + 12),
+                getInt64(key, offset + 20));
+    }
+
+    public static int propEdgeType(byte[] key) {
+        requirePropKey(key);
+        return getUint32(key, 3);
+    }
+
+    public static long propRank(byte[] key) {
+        requirePropKey(key);
+        return getInt64(key, 7);
+    }
+
+    public static long propSrc(byte[] key) {
+        requirePropKey(key);
+        return getInt64(key, 15);
+    }
+
+    public static long propDst(byte[] key) {
+        requirePropKey(key);
+        return getInt64(key, 23);
+    }
+
     public record TypeKey(int graphId, int kind, int typeId) {
     }
 
@@ -275,6 +371,12 @@ public final class KeyCodec {
     private static void requireVertexKey(byte[] key) {
         if (key == null || key.length != VERTEX_KEY_LENGTH) {
             throw new IllegalArgumentException("不是点键");
+        }
+    }
+
+    private static void requirePropKey(byte[] key) {
+        if (key == null || key.length != PROP_KEY_LENGTH || key[0] != PROP_MARK) {
+            throw new IllegalArgumentException("不是属性键");
         }
     }
 

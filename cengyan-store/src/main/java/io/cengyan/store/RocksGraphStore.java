@@ -52,6 +52,8 @@ public final class RocksGraphStore implements GraphStore {
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
     private final AtomicLong propReads = new AtomicLong();
     private final AtomicLong edgesExamined = new AtomicLong();
+    private final AtomicLong indexReads = new AtomicLong();
+    private final AtomicLong verticesExamined = new AtomicLong();
     private volatile Runnable beforeWrite;
     private static final byte[] EMPTY = new byte[0];
 
@@ -272,6 +274,16 @@ public final class RocksGraphStore implements GraphStore {
         return edgesExamined.get();
     }
 
+    @Override
+    public long indexReads() {
+        return indexReads.get();
+    }
+
+    @Override
+    public long verticesExamined() {
+        return verticesExamined.get();
+    }
+
     void addPropReads(int count) {
         if (count > 0) {
             propReads.addAndGet(count);
@@ -280,6 +292,16 @@ public final class RocksGraphStore implements GraphStore {
 
     void addEdgeExamined() {
         edgesExamined.incrementAndGet();
+    }
+
+    void addIndexReads(int count) {
+        if (count > 0) {
+            indexReads.addAndGet(count);
+        }
+    }
+
+    void addVerticesExamined() {
+        verticesExamined.incrementAndGet();
     }
 
     /** 阶段 1 的分片号恒为 0。阶段 9 再按 vid 计算。 */

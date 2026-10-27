@@ -3,6 +3,7 @@ package io.cengyan.store;
 import io.cengyan.CancelToken;
 
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 /** 一次查询的快照。写在快照打开之后提交的话，这次读取看不见。 */
@@ -47,6 +48,18 @@ public interface ReadSession extends AutoCloseable {
 
     /** 按前缀收集键。短前缀用全序扫描，不走边列族的 17 字节前缀布隆。 */
     List<byte[]> keysWithPrefix(Cf family, byte[] prefix);
+
+    /**
+     * 按前缀逐个访问键，每 64 个检查一次取消。
+     * 重建和统计用它，避免把整段键先装进内存再没法停下。
+     */
+    void visitPrefix(Cf family, byte[] prefix, CancelToken cancel, Consumer<byte[]> consumer);
+
+    /**
+     * 索引列族的范围扫描，含起点，不含终点。
+     * {@code limit} 小于 0 表示不限条数。终点为空表示扫到这个 indexId 结束。
+     */
+    List<byte[]> scanIndex(byte[] startInclusive, byte[] endExclusive, int limit, CancelToken cancel);
 
     @Override
     void close();

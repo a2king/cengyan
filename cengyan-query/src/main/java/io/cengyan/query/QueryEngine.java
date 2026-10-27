@@ -6,9 +6,11 @@ import io.cengyan.ErrorCode;
 import io.cengyan.catalog.AliasRow;
 import io.cengyan.catalog.Catalog;
 import io.cengyan.catalog.GraphName;
+import io.cengyan.catalog.IndexDef;
 import io.cengyan.catalog.NodeType;
 import io.cengyan.catalog.PropDef;
 import io.cengyan.catalog.RelType;
+import io.cengyan.catalog.StatsRow;
 import io.cengyan.catalog.ValueType;
 import io.cengyan.catalog.VertexWrite;
 import io.cengyan.parser.Gql;
@@ -108,6 +110,16 @@ public final class QueryEngine {
                     createType(graphId(session), create);
                     yield QueryResult.changed(1);
                 }
+                case Stmt.CreateIndex create -> {
+                    catalog.createIndex(
+                            graphId(session), create.unique(), create.name(), create.node(),
+                            create.typeName(), create.properties());
+                    yield QueryResult.changed(1);
+                }
+                case Stmt.DropIndex drop -> {
+                    catalog.dropIndex(graphId(session), drop.name());
+                    yield QueryResult.changed(1);
+                }
                 case Stmt.AlterType alter -> {
                     alterType(graphId(session), alter);
                     yield QueryResult.changed(1);
@@ -143,7 +155,69 @@ public final class QueryEngine {
             }
             case NODE_TYPES -> types(true, graphId(session));
             case REL_TYPES -> types(false, graphId(session));
+            case INDEXES -> indexes(graphId(session));
         };
+    }
+
+    private QueryResult indexes(int graphId) {
+        List<List<Object>> rows = new ArrayList<>();
+        for (IndexDef index : catalog.indexes(graphId)) {
+            rows.add(List.of(
+                    index.name(),
+                    index.node() ? "NODE" : "REL",
+                    typeName(graphId, index),
+                    String.join(",", index.properties()),
+                    index.unique(),
+                    index.ready()));
+        }
+        return new QueryResult(List.of("name", "target", "type", "properties", "unique", "ready"), rows, 0);
+    }
+
+    private String typeName(int graphId, IndexDef index) {
+        if (index.node()) {
+            for (NodeType type : catalog.nodeTypes(graphId)) {
+                if (type.id() == index.typeId()) {
+                    return type.name();
+                }
+            }
+        } else {
+            for (RelType type : catalog.relTypes(graphId)) {
+                if (type.id() == index.typeId()) {
+                    return type.name();
+                }
+            }
+        }
+        throw new CengyanException(ErrorCode.INTERNAL, "索引类型丢失：" + index.name());
+    }
+
+    public QueryResult admin(SessionState session, String command, String index, CancelToken cancel) {
+        if (session == null) {
+            throw new IllegalArgumentException("会话不能为空");
+        }
+        if (command == null || command.isBlank()) {
+            throw new CengyanException(ErrorCode.SYNTAX, "缺少 command");
+        }
+        synchronized (session) {
+            if (cancel != null && cancel.cancelled()) {
+                throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
+            }
+            return switch (command) {
+                case "rebuildIndex" -> {
+                    if (index == null || index.isBlank()) {
+                        throw new CengyanException(ErrorCode.SYNTAX, "缺少索引名");
+                    }
+                    yield QueryResult.changed(catalog.rebuildIndex(graphId(session), index, cancel));
+                }
+                case "stats" -> {
+                    List<List<Object>> rows = new ArrayList<>();
+                    for (StatsRow row : catalog.stats(graphId(session), cancel)) {
+                        rows.add(List.of(row.target(), row.name(), row.count(), row.maxDegree()));
+                    }
+                    yield new QueryResult(List.of("target", "name", "count", "maxDegree"), rows, 0);
+                }
+                default -> throw new CengyanException(ErrorCode.SYNTAX, "无法识别的管理命令");
+            };
+        }
     }
 
     private QueryResult types(boolean node, int graphId) {

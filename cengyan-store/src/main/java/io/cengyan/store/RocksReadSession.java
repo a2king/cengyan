@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 final class RocksReadSession implements ReadSession {
@@ -113,6 +114,7 @@ final class RocksReadSession implements ReadSession {
                 }
                 iterator.next();
                 examined++;
+                store.addVerticesExamined();
                 if (maxExamined >= 0 && examined > maxExamined) {
                     throw new CengyanException(ErrorCode.TRUNCATED,
                             "扫描起点已检查 " + examined + " 个点，超过上限 " + maxExamined);
@@ -207,6 +209,75 @@ final class RocksReadSession implements ReadSession {
             return found;
         } catch (RocksDBException ex) {
             throw new CengyanException(ErrorCode.INTERNAL, "前缀扫描失败：" + ex.getMessage(), ex);
+        } finally {
+            if (iterator != null) {
+                iterator.close();
+            }
+            if (upperSlice != null) {
+                upperSlice.close();
+            }
+            options.close();
+        }
+    }
+
+    @Override
+    public void visitPrefix(Cf family, byte[] prefix, CancelToken cancel, Consumer<byte[]> consumer) {
+        ensureOpen();
+        if (prefix == null || prefix.length == 0) {
+            throw new IllegalArgumentException("前缀不能为空");
+        }
+        if (consumer == null) {
+            throw new IllegalArgumentException("访问动作不能为空");
+        }
+        byte[] upper = KeyCodec.upperBound(prefix);
+        ReadOptions options = new ReadOptions();
+        Slice upperSlice = null;
+        RocksIterator iterator = null;
+        try {
+            options.setSnapshot(snapshot);
+            options.setTotalOrderSeek(true);
+            options.setPrefixSameAsStart(false);
+            if (upper != null) {
+                upperSlice = new Slice(upper);
+                options.setIterateUpperBound(upperSlice);
+            }
+            iterator = store.db().newIterator(store.handle(family), options);
+            IndexScan.visit(iterator, prefix, cancel, consumer);
+        } finally {
+            if (iterator != null) {
+                iterator.close();
+            }
+            if (upperSlice != null) {
+                upperSlice.close();
+            }
+            options.close();
+        }
+    }
+
+    @Override
+    public List<byte[]> scanIndex(byte[] startInclusive, byte[] endExclusive, int limit, CancelToken cancel) {
+        ensureOpen();
+        if (startInclusive == null || startInclusive.length < 4) {
+            throw new IllegalArgumentException("索引扫描需要起点");
+        }
+        if (limit == 0) {
+            return List.of();
+        }
+        byte[] indexPrefix = Arrays.copyOf(startInclusive, 4);
+        ReadOptions options = new ReadOptions();
+        Slice upperSlice = null;
+        RocksIterator iterator = null;
+        try {
+            options.setSnapshot(snapshot);
+            options.setTotalOrderSeek(true);
+            options.setPrefixSameAsStart(false);
+            if (endExclusive != null) {
+                upperSlice = new Slice(endExclusive);
+                options.setIterateUpperBound(upperSlice);
+            }
+            iterator = store.db().newIterator(store.handle(Cf.INDEX), options);
+            return IndexScan.collect(
+                    iterator, indexPrefix, startInclusive, endExclusive, limit, cancel, store::addIndexReads);
         } finally {
             if (iterator != null) {
                 iterator.close();

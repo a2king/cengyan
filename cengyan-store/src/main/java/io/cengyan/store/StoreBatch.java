@@ -1,6 +1,7 @@
 package io.cengyan.store;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
@@ -28,6 +29,28 @@ public final class StoreBatch {
 
     List<Op> operations() {
         return Collections.unmodifiableList(operations);
+    }
+
+    public boolean deletes(Cf family, byte[] key) {
+        for (Op op : operations) {
+            if (op.delete && op.family == family && Arrays.equals(op.key, key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 同一前缀上是否已经放入了另一条索引键。同一身份的覆盖不算冲突。 */
+    public boolean putsOther(Cf family, byte[] prefix, byte[] exceptKey) {
+        for (Op op : operations) {
+            if (op.delete || op.family != family || Arrays.equals(op.key, exceptKey)) {
+                continue;
+            }
+            if (KeyCodec.startsWith(op.key, prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     record Op(Cf family, byte[] key, byte[] value, boolean delete) {
