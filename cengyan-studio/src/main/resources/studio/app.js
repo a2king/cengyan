@@ -480,18 +480,24 @@ function requireGraph() {
   }
 }
 
+function messageBox() {
+  return document.getElementById("error");
+}
+
 function showError(error) {
-  const node = document.getElementById("error");
+  const node = messageBox();
   if (node) {
-    node.className = "error";
+    node.classList.remove("ok");
+    node.classList.add("error");
     node.textContent = error && error.message ? error.message : "";
   }
 }
 
 function showStatus(message) {
-  const node = document.getElementById("error");
+  const node = messageBox();
   if (node) {
-    node.className = "ok";
+    node.classList.remove("error");
+    node.classList.add("ok");
     node.textContent = message || "";
   }
 }
@@ -542,7 +548,7 @@ async function onSubmit(event) {
   try {
     await login(form);
   } catch (error) {
-    form.querySelector(".error").textContent = error.message;
+    showError(error);
   }
 }
 
