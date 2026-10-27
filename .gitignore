@@ -1,4 +1,5 @@
 target/
+gql-rewrite-plan.md
 .idea/
 *.iml
 .classpath
