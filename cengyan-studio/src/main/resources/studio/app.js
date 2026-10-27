@@ -1,10 +1,19 @@
 const TYPES = ["BOOL", "INT64", "DOUBLE", "STRING", "DATETIME"];
+const MAX_TABLE_ROWS = 200;
+const MAX_GRAPH_NODES = 200;
+const MAX_GRAPH_EDGES = 500;
+const QUERY_TIMEOUT_MS = 10000;
+const CONSOLE_TIMEOUT_MS = 30000;
+const HISTORY_KEY = "cengyan.history";
+const HISTORY_LIMIT = 20;
+
 const state = {
   session: sessionStorage.getItem("cengyan.session") || "",
   user: sessionStorage.getItem("cengyan.user") || "",
   role: sessionStorage.getItem("cengyan.role") || "",
   graph: sessionStorage.getItem("cengyan.graph") || "",
-  page: "graphs",
+  view: sessionStorage.getItem("cengyan.graph") ? "workbench" : "spaces",
+  page: "console",
 };
 const draft = { fields: [{ name: "", type: "STRING", nullable: true }] };
 
@@ -12,6 +21,7 @@ const app = document.getElementById("app");
 app.addEventListener("click", onClick);
 app.addEventListener("change", onChange);
 app.addEventListener("submit", onSubmit);
+app.addEventListener("keydown", onKey);
 
 boot();
 
@@ -24,12 +34,17 @@ async function boot() {
     const names = await graphNames();
     if (state.graph && !names.includes(state.graph)) {
       state.graph = "";
+      state.view = "spaces";
       persist();
     }
     if (state.graph) {
       await gql("USE " + ident(state.graph));
+      state.view = "workbench";
+      renderWorkbench();
+      return;
     }
-    renderShell(names);
+    state.view = "spaces";
+    renderSpaces(names);
   } catch (error) {
     clearSession();
     renderLogin(error.message);
@@ -48,7 +63,16 @@ function clearSession() {
   state.user = "";
   state.role = "";
   state.graph = "";
+  state.view = "spaces";
   persist();
+}
+
+function canWrite() {
+  return state.role === "write";
+}
+
+function writeOnly(html) {
+  return canWrite() ? html : "";
 }
 
 async function call(path, body, timeoutMs) {
@@ -81,7 +105,7 @@ async function call(path, body, timeoutMs) {
 }
 
 function gql(query, timeoutMs) {
-  return call("/api/query", { query }, timeoutMs || 10000);
+  return call("/api/query", { query }, timeoutMs || QUERY_TIMEOUT_MS);
 }
 
 function admin(command, index, timeoutMs) {
@@ -131,11 +155,16 @@ function objects(data) {
   });
 }
 
+function userBar() {
+  return `<span class="user-meta">${esc(state.user)} · ${esc(state.role || "未识别角色")}</span>
+    <button class="quiet" type="button" data-action="logout">退出</button>`;
+}
+
 function renderLogin(message) {
   app.innerHTML = `
     <form class="login" data-action="login">
-      <h1>层岩控制台</h1>
-      <p class="muted">先启动图数据库，再在这里登录。默认用户 root，密码见 cengyan.properties。</p>
+      <h1>层岩控制台 <span>Studio</span></h1>
+      <p class="muted">登录即连接本机图库会话，不是独立 Studio 账号。默认用户 root，密码见 cengyan.properties。</p>
       <label>用户</label>
       <input name="user" value="root" autocomplete="username">
       <label>密码</label>
@@ -148,34 +177,63 @@ function renderLogin(message) {
     </form>`;
 }
 
-function renderShell(names) {
+function renderSpaces(names) {
+  state.view = "spaces";
+  const create = writeOnly(`
+    <div class="row">
+      <input id="graph-name" placeholder="图名，例如 Company">
+      <button class="primary" type="button" data-action="create-graph">创建</button>
+    </div>`);
+  const cards = names.length
+    ? `<div class="cards">${names.map((name) => `
+        <div class="card">
+          <strong>${esc(name)}</strong>
+          <div class="row">
+            <button class="primary" type="button" data-action="use-graph" data-name="${esc(name)}">打开</button>
+            ${writeOnly(`<button class="danger" type="button" data-action="drop-graph" data-name="${esc(name)}">删除</button>`)}
+          </div>
+        </div>`).join("")}</div>`
+    : `<p class="muted">${canWrite() ? "还没有图空间。用上面的名字创建一个。" : "还没有图空间。"}</p>`;
+  app.innerHTML = `
+    <div class="spaces">
+      <div class="spaces-top">
+        <span class="brand">层岩控制台</span>
+        <div class="row">${userBar()}</div>
+      </div>
+      <h1>图空间</h1>
+      <p class="muted">打开一个空间进入工作台。删除图会清掉类型、索引和数据，需要输入图名确认。</p>
+      ${create}
+      <p class="error" id="error"></p>
+      ${cards}
+    </div>`;
+}
+
+function renderWorkbench() {
+  state.view = "workbench";
   app.innerHTML = `
     <div class="shell">
       <nav class="nav">
-        <strong>层岩控制台</strong>
-        <button type="button" data-page="graphs">图</button>
+        <strong class="brand">层岩控制台</strong>
+        <button type="button" data-page="console">GQL</button>
         <button type="button" data-page="nodes">点类型</button>
         <button type="button" data-page="rels">边类型</button>
         <button type="button" data-page="indexes">索引</button>
         <button type="button" data-page="stats">统计</button>
-        <button type="button" data-page="console">控制台</button>
+        <div class="nav-spacer"></div>
+        <button type="button" class="placeholder" disabled title="用户管理不在本机控制台">用户权限</button>
       </nav>
       <div>
         <div class="top">
-          <span>${esc(state.user)} · ${esc(state.role)}</span>
-          <select id="graph-select">${graphOptions(names)}</select>
-          <button class="quiet" type="button" data-action="logout">退出</button>
+          <span class="graph-name">${esc(state.graph)}</span>
+          <span class="badge">${esc(state.role)}</span>
+          <button class="ghost" type="button" data-action="back-spaces">图空间列表</button>
+          <span style="flex:1"></span>
+          ${userBar()}
         </div>
         <main class="main" id="main"></main>
       </div>
     </div>`;
-  document.getElementById("graph-select").value = state.graph;
-  markNav();
   showPage();
-}
-
-function graphOptions(names) {
-  return `<option value="">未选择图</option>` + names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
 }
 
 function markNav() {
@@ -185,13 +243,14 @@ function markNav() {
 }
 
 async function showPage() {
+  if (state.view !== "workbench") {
+    return;
+  }
   markNav();
   const main = document.getElementById("main");
   main.innerHTML = `<p class="muted">正在加载…</p>`;
   try {
-    if (state.page === "graphs") {
-      await renderGraphs(main);
-    } else if (state.page === "nodes") {
+    if (state.page === "nodes") {
       await renderTypes(main, true);
     } else if (state.page === "rels") {
       await renderTypes(main, false);
@@ -207,50 +266,12 @@ async function showPage() {
   }
 }
 
-async function renderGraphs(main) {
-  const names = await graphNames();
-  fillGraphSelect(names);
-  main.innerHTML = `
-    <h1>图</h1>
-    <div class="row">
-      <input id="graph-name" placeholder="图名，例如 Company">
-      <button class="primary" type="button" data-action="create-graph">创建</button>
-    </div>
-    <p class="error" id="error"></p>
-    ${table(["图名", ""], names.map((name) => [
-      esc(name),
-      `<button class="quiet" type="button" data-action="use-graph" data-name="${esc(name)}">进入</button>
-       <button class="quiet" type="button" data-action="drop-graph" data-name="${esc(name)}">删除</button>`,
-    ]))}
-    <p class="muted">删除图会删掉里面的类型、索引和数据。</p>`;
-}
-
-function fillGraphSelect(names) {
-  const select = document.getElementById("graph-select");
-  if (!select) {
-    return;
-  }
-  const current = select.value || state.graph;
-  select.innerHTML = graphOptions(names);
-  select.value = names.includes(current) ? current : "";
-}
-
 async function renderTypes(main, node) {
   requireGraph();
-  const kind = node ? "NODE" : "REL";
   const title = node ? "点类型" : "边类型";
   const data = await gql(node ? "SHOW NODE TYPES" : "SHOW REL TYPES");
   const rows = objects(data);
-  main.innerHTML = `
-    <h1>${title}</h1>
-    <p class="muted">当前图 ${esc(state.graph)}。建好之后只能在末尾追加可空列。</p>
-    ${table(["名字", "编号", "版本", ""], rows.map((row) => [
-      esc(row.name),
-      esc(row.id),
-      esc(row.schemaVersion),
-      `<button class="quiet" type="button" data-action="describe-type" data-node="${node}" data-name="${esc(row.name)}">查看列</button>`,
-    ]))}
-    <div id="detail"></div>
+  const create = writeOnly(`
     <h2>新建</h2>
     <div class="row"><input id="type-name" placeholder="类型名"></div>
     <div id="fields">${draft.fields.map(fieldRow).join("")}</div>
@@ -264,7 +285,18 @@ async function renderTypes(main, node) {
       <input id="alter-prop" placeholder="新列名">
       <select id="alter-value-type">${TYPES.map((type) => `<option>${type}</option>`).join("")}</select>
       <button class="primary" type="button" data-action="alter-type" data-node="${node}">追加</button>
-    </div>
+    </div>`);
+  main.innerHTML = `
+    <h1>${title}</h1>
+    <p class="muted">当前图 ${esc(state.graph)}。建好之后只能在末尾追加可空列。</p>
+    ${table(["名字", "编号", "版本", ""], rows.map((row) => [
+      esc(row.name),
+      esc(row.id),
+      esc(row.schemaVersion),
+      `<button class="quiet" type="button" data-action="describe-type" data-node="${node}" data-name="${esc(row.name)}">查看列</button>`,
+    ]))}
+    <div id="detail"></div>
+    ${create}
     <p class="error" id="error"></p>`;
 }
 
@@ -292,19 +324,7 @@ async function renderIndexes(main) {
   const rows = objects(data);
   const nodes = objects(await gql("SHOW NODE TYPES")).map((row) => row.name);
   const rels = objects(await gql("SHOW REL TYPES")).map((row) => row.name);
-  main.innerHTML = `
-    <h1>索引</h1>
-    <p class="muted">当前图 ${esc(state.graph)}。新建之后 ready 为 false，查询还不会用它，需要重建。</p>
-    ${table(["名字", "目标", "类型", "列", "唯一", "可用", ""], rows.map((row) => [
-      esc(row.name),
-      esc(row.target),
-      esc(row.type),
-      esc(row.properties),
-      row.unique ? "是" : "否",
-      row.ready ? "是" : "否",
-      `<button class="quiet" type="button" data-action="rebuild-index" data-name="${esc(row.name)}">重建</button>
-       <button class="quiet" type="button" data-action="drop-index" data-name="${esc(row.name)}">删除</button>`,
-    ]))}
+  const create = writeOnly(`
     <h2>新建索引</h2>
     <div class="row">
       <input id="index-name" placeholder="索引名">
@@ -316,9 +336,26 @@ async function renderIndexes(main) {
       <label><input id="index-unique" type="checkbox">唯一</label>
       <button class="primary" type="button" data-action="create-index">创建</button>
     </div>
-    <div id="index-props"></div>
+    <div id="index-props"></div>`);
+  main.innerHTML = `
+    <h1>索引</h1>
+    <p class="muted">当前图 ${esc(state.graph)}。新建之后 ready 为 false，查询还不会用它，需要重建。</p>
+    ${table(["名字", "目标", "类型", "列", "唯一", "可用", ""], rows.map((row) => [
+      esc(row.name),
+      esc(row.target),
+      esc(row.type),
+      esc(row.properties),
+      row.unique ? "是" : "否",
+      row.ready ? "是" : "否",
+      writeOnly(`<button class="quiet" type="button" data-action="rebuild-index" data-name="${esc(row.name)}">重建</button>
+       <button class="danger" type="button" data-action="drop-index" data-name="${esc(row.name)}">删除</button>`),
+    ]))}
+    ${create}
     <p class="error" id="error"></p>`;
   const typeSelect = document.getElementById("index-type");
+  if (!typeSelect) {
+    return;
+  }
   typeSelect.dataset.nodes = JSON.stringify(nodes);
   typeSelect.dataset.rels = JSON.stringify(rels);
   fillIndexTypes();
@@ -335,6 +372,9 @@ function fillIndexTypes() {
 async function loadIndexProps() {
   const box = document.getElementById("index-props");
   const typeSelect = document.getElementById("index-type");
+  if (!box || !typeSelect) {
+    return;
+  }
   if (!typeSelect.value) {
     box.innerHTML = `<p class="muted">这个图里还没有对应的类型。</p>`;
     return;
@@ -353,7 +393,7 @@ async function loadIndexProps() {
 
 async function renderStats(main) {
   requireGraph();
-  const data = await admin("stats", "", 60000);
+  const data = await admin("stats", "");
   const rows = objects(data);
   let nodes = 0;
   let edges = 0;
@@ -366,7 +406,7 @@ async function renderStats(main) {
   }
   main.innerHTML = `
     <h1>统计</h1>
-    <p class="muted">当前图 ${esc(state.graph)}。数量按类型分开，最大度数是观察值。</p>
+    <p class="muted">当前图 ${esc(state.graph)}。按类型计数，不含磁盘空间大小。</p>
     <p>点 ${nodes} · 边 ${edges}</p>
     <button class="quiet" type="button" data-action="reload">刷新</button>
     ${table(["目标", "名字", "数量", "最大度数"], rows.map((row) => [
@@ -377,14 +417,43 @@ async function renderStats(main) {
 
 function renderConsole(main) {
   main.innerHTML = `
-    <h1>控制台</h1>
-    <p class="muted">一次提交一行。边要写类型，起点要写类型或编号。要画出图，RETURN 里需要整点或整边。</p>
-    <textarea id="gql" placeholder="MATCH (a:Person)-[e:knows]->(b) RETURN a, e, b"></textarea>
+    <h1>GQL</h1>
+    <p class="muted">一次提交一行。图画需要 RETURN 整点或整边。超时硬顶 ${CONSOLE_TIMEOUT_MS / 1000} 秒；表格最多 ${MAX_TABLE_ROWS} 行；图画上限 ${MAX_GRAPH_NODES} 点 / ${MAX_GRAPH_EDGES} 边。</p>
+    <textarea id="gql" spellcheck="false" placeholder="MATCH (a:Person)-[e:knows]->(b) RETURN a, e, b"></textarea>
     <div class="row">
       <button class="primary" type="button" data-action="run-query">执行</button>
+      <span class="muted">Ctrl + Enter</span>
     </div>
+    ${historyBlock()}
     <p class="error" id="error"></p>
     <div id="result"></div>`;
+}
+
+function historyBlock() {
+  const items = loadHistory();
+  if (!items.length) {
+    return "";
+  }
+  return `<details class="history">
+    <summary>查询历史</summary>
+    ${items.map((item, index) => `<button type="button" data-action="use-history" data-index="${index}">${esc(item)}</button>`).join("")}
+  </details>`;
+}
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const items = raw ? JSON.parse(raw) : [];
+    return Array.isArray(items) ? items.filter((item) => typeof item === "string") : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function saveHistory(query) {
+  const items = loadHistory().filter((item) => item !== query);
+  items.unshift(query);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, HISTORY_LIMIT)));
 }
 
 function table(headers, rows) {
@@ -395,17 +464,79 @@ function table(headers, rows) {
     <tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 }
 
+function resultTable(columns, rows) {
+  const total = rows.length;
+  const shown = rows.slice(0, MAX_TABLE_ROWS);
+  let html = table(columns, shown.map((row) => row.map((value) => esc(cellText(value)))));
+  if (total > MAX_TABLE_ROWS) {
+    html += `<p class="warn">表格已截断：显示前 ${MAX_TABLE_ROWS} 行，共 ${total} 行。</p>`;
+  }
+  return html;
+}
+
 function requireGraph() {
   if (!state.graph) {
-    throw new Error("先在「图」里进入一张图");
+    throw new Error("先打开一个图空间");
   }
 }
 
+function messageBox() {
+  return document.getElementById("error");
+}
+
 function showError(error) {
-  const node = document.getElementById("error");
+  const node = messageBox();
   if (node) {
+    node.classList.remove("ok");
+    node.classList.add("error");
     node.textContent = error && error.message ? error.message : "";
   }
+}
+
+function showStatus(message) {
+  const node = messageBox();
+  if (node) {
+    node.classList.remove("error");
+    node.classList.add("ok");
+    node.textContent = message || "";
+  }
+}
+
+function confirmAction({ title, body, typed, confirmLabel }) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true">
+        <h2>${esc(title)}</h2>
+        <p class="muted">${esc(body)}</p>
+        ${typed ? `<label>输入 ${esc(typed)} 确认</label><input id="confirm-typed" autocomplete="off">` : ""}
+        <div class="row">
+          <button class="quiet" type="button" data-cancel>取消</button>
+          <button class="danger" type="button" data-ok ${typed ? "disabled" : ""}>${esc(confirmLabel || "确认")}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const ok = overlay.querySelector("[data-ok]");
+    const input = overlay.querySelector("#confirm-typed");
+    const finish = (value) => {
+      overlay.remove();
+      resolve(value);
+    };
+    overlay.querySelector("[data-cancel]").onclick = () => finish(false);
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) {
+        finish(false);
+      }
+    });
+    if (input) {
+      input.addEventListener("input", () => {
+        ok.disabled = input.value !== typed;
+      });
+      input.focus();
+    }
+    ok.onclick = () => finish(true);
+  });
 }
 
 async function onSubmit(event) {
@@ -417,26 +548,36 @@ async function onSubmit(event) {
   try {
     await login(form);
   } catch (error) {
-    form.querySelector(".error").textContent = error.message;
+    showError(error);
+  }
+}
+
+function onKey(event) {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && document.getElementById("gql")) {
+    event.preventDefault();
+    runQuery().catch(showError);
   }
 }
 
 async function onClick(event) {
   const pageButton = event.target.closest("[data-page]");
   if (pageButton) {
+    if (pageButton.disabled) {
+      return;
+    }
     state.page = pageButton.dataset.page;
     await showPage();
     return;
   }
   const target = event.target.closest("[data-action]");
-  if (!target) {
+  if (!target || target.disabled) {
     return;
   }
   const action = target.dataset.action;
   try {
     if (action === "ping") {
       await call("/api/ping", {});
-      showError({ message: "图数据库已连通" });
+      showStatus("图数据库已连通");
       return;
     }
     if (action === "logout") {
@@ -444,25 +585,44 @@ async function onClick(event) {
       renderLogin();
       return;
     }
+    if (action === "back-spaces") {
+      state.graph = "";
+      state.view = "spaces";
+      persist();
+      renderSpaces(await graphNames());
+      return;
+    }
     if (action === "create-graph") {
+      if (!canWrite()) {
+        return;
+      }
       await createGraph();
       return;
     }
     if (action === "use-graph") {
-      await useGraph(target.dataset.name);
+      await openGraph(target.dataset.name);
       return;
     }
     if (action === "drop-graph") {
+      if (!canWrite()) {
+        return;
+      }
       await dropGraph(target.dataset.name);
       return;
     }
     if (action === "add-field") {
+      if (!canWrite()) {
+        return;
+      }
       draft.fields = readFields();
       draft.fields.push({ name: "", type: "STRING", nullable: true });
       await showPage();
       return;
     }
     if (action === "remove-field") {
+      if (!canWrite()) {
+        return;
+      }
       const rows = [...document.querySelectorAll(".field-row")];
       const index = rows.indexOf(target.closest(".field-row"));
       draft.fields = readFields();
@@ -473,10 +633,16 @@ async function onClick(event) {
       return;
     }
     if (action === "create-type") {
+      if (!canWrite()) {
+        return;
+      }
       await createType(target.dataset.node === "true");
       return;
     }
     if (action === "alter-type") {
+      if (!canWrite()) {
+        return;
+      }
       await alterType(target.dataset.node === "true");
       return;
     }
@@ -485,17 +651,39 @@ async function onClick(event) {
       return;
     }
     if (action === "create-index") {
+      if (!canWrite()) {
+        return;
+      }
       await createIndex();
       return;
     }
     if (action === "rebuild-index") {
+      if (!canWrite()) {
+        return;
+      }
+      const ok = await confirmAction({
+        title: "重建索引",
+        body: "重建 " + target.dataset.name + " 会重扫当前图的数据，并标记为可用。",
+        confirmLabel: "重建",
+      });
+      if (!ok) {
+        return;
+      }
       target.disabled = true;
-      await admin("rebuildIndex", target.dataset.name, 120000);
+      await admin("rebuildIndex", target.dataset.name);
       await showPage();
       return;
     }
     if (action === "drop-index") {
-      if (!window.confirm("删除索引 " + target.dataset.name + "？")) {
+      if (!canWrite()) {
+        return;
+      }
+      const ok = await confirmAction({
+        title: "删除索引",
+        body: "删除索引 " + target.dataset.name + " 之后，等值和范围查询不再走它。",
+        confirmLabel: "删除",
+      });
+      if (!ok) {
         return;
       }
       await gql("DROP INDEX " + ident(target.dataset.name));
@@ -504,6 +692,16 @@ async function onClick(event) {
     }
     if (action === "reload") {
       await showPage();
+      return;
+    }
+    if (action === "use-history") {
+      const items = loadHistory();
+      const query = items[Number(target.dataset.index)];
+      const box = document.getElementById("gql");
+      if (box && query) {
+        box.value = query;
+        box.focus();
+      }
       return;
     }
     if (action === "run-query") {
@@ -516,14 +714,6 @@ async function onClick(event) {
 }
 
 async function onChange(event) {
-  if (event.target.id === "graph-select") {
-    try {
-      await useGraph(event.target.value);
-    } catch (error) {
-      showError(error);
-    }
-    return;
-  }
   if (event.target.id === "index-target") {
     fillIndexTypes();
     try {
@@ -549,42 +739,35 @@ async function login(form) {
   });
   state.user = data.rows && data.rows[0] ? data.rows[0][0] : form.user.value.trim();
   state.role = data.rows && data.rows[0] ? data.rows[0][1] : "";
+  state.graph = "";
+  state.view = "spaces";
   persist();
-  const names = await graphNames();
-  renderShell(names);
+  renderSpaces(await graphNames());
 }
 
 async function createGraph() {
   const name = ident(document.getElementById("graph-name").value.trim());
   await gql("CREATE GRAPH " + name);
-  await useGraph(name);
+  await openGraph(name);
 }
 
-async function useGraph(name) {
-  if (!name) {
-    state.graph = "";
-    persist();
-    const select = document.getElementById("graph-select");
-    if (select) {
-      select.value = "";
-    }
-    await showPage();
-    return;
-  }
+async function openGraph(name) {
   await gql("USE " + ident(name));
   state.graph = name;
+  state.view = "workbench";
+  state.page = "console";
   persist();
-  const select = document.getElementById("graph-select");
-  if (select) {
-    select.value = name;
-  }
-  if (state.page !== "console") {
-    await showPage();
-  }
+  renderWorkbench();
 }
 
 async function dropGraph(name) {
-  if (!window.confirm("删除图 " + name + "？图里的数据会一起删除。")) {
+  const ok = await confirmAction({
+    title: "删除图空间",
+    body: "删除图 " + name + " 会删掉里面的类型、索引和数据，且不能撤销。",
+    typed: name,
+    confirmLabel: "删除图",
+  });
+  if (!ok) {
     return;
   }
   await gql("DROP GRAPH " + ident(name));
@@ -592,7 +775,7 @@ async function dropGraph(name) {
     state.graph = "";
     persist();
   }
-  await showPage();
+  renderSpaces(await graphNames());
 }
 
 async function createType(node) {
@@ -644,21 +827,26 @@ async function runQuery() {
   showError({ message: "" });
   const result = document.getElementById("result");
   result.innerHTML = "";
-  const data = await gql(text, 30000);
+  const data = await gql(text, CONSOLE_TIMEOUT_MS);
+  saveHistory(text);
   const columns = data.columns || [];
   const rows = data.rows || [];
   let html = "";
   if (!columns.length) {
     html += `<p>完成，影响 ${esc(data.rowsAffected || 0)} 行。</p>`;
   } else {
-    html += table(columns, rows.map((row) => row.map((value) => esc(cellText(value)))));
+    html += resultTable(columns, rows);
   }
   const model = graphModel(rows);
-  html += model.nodes.length
-    ? `<canvas id="graph"></canvas><p class="muted">点 ${model.nodes.length} · 边 ${model.edges.length}。可以拖动圆点。</p>`
-    : `<p class="muted">这次结果里没有完整的点或边，所以没有图。</p>`;
+  if (model.nodes.length > MAX_GRAPH_NODES || model.edges.length > MAX_GRAPH_EDGES) {
+    html += `<p class="warn">点 ${model.nodes.length} / 边 ${model.edges.length}，超过图画上限（${MAX_GRAPH_NODES}/${MAX_GRAPH_EDGES}），只显示表格。</p>`;
+  } else if (model.nodes.length) {
+    html += `<canvas id="graph"></canvas><p class="muted">点 ${model.nodes.length} · 边 ${model.edges.length}。可以拖动圆点。</p>`;
+  } else {
+    html += `<p class="muted">这次结果里没有完整的点或边，所以没有图。</p>`;
+  }
   result.innerHTML = html;
-  if (model.nodes.length) {
+  if (model.nodes.length && model.nodes.length <= MAX_GRAPH_NODES && model.edges.length <= MAX_GRAPH_EDGES) {
     drawGraph(document.getElementById("graph"), model);
   }
 }
@@ -759,9 +947,9 @@ function drawGraph(canvas, model) {
 
   function paint() {
     ctx.clearRect(0, 0, width, height);
-    ctx.strokeStyle = "#8aa0c8";
-    ctx.fillStyle = "#334155";
-    ctx.font = "12px sans-serif";
+    ctx.strokeStyle = "#35506A";
+    ctx.fillStyle = "#8B9BB4";
+    ctx.font = "12px ui-monospace, Consolas, monospace";
     for (const link of links) {
       ctx.beginPath();
       ctx.moveTo(link.source.x, link.source.y);
@@ -771,10 +959,10 @@ function drawGraph(canvas, model) {
     }
     for (const node of nodes) {
       ctx.beginPath();
-      ctx.fillStyle = "#1f4b99";
+      ctx.fillStyle = "#2DD4BF";
       ctx.arc(node.x, node.y, 14, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = "#1c1c1c";
+      ctx.fillStyle = "#E6EDF3";
       ctx.textAlign = "center";
       ctx.fillText(node.label, node.x, node.y + 28);
       ctx.textAlign = "left";

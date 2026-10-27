@@ -20,6 +20,12 @@ import java.util.concurrent.Executors;
 public final class StudioServer implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final int MAX_BODY = 1024 * 1024;
+    /** 查询默认超时。客户端可以调低，但不能超过 {@link #QUERY_TIMEOUT_MAX_MS}。 */
+    static final int QUERY_TIMEOUT_DEFAULT_MS = 10_000;
+    /** 查询超时硬顶，禁止浏览器传任意大 timeoutMs。 */
+    static final int QUERY_TIMEOUT_MAX_MS = 30_000;
+    static final int STATS_TIMEOUT_MS = 60_000;
+    static final int REBUILD_TIMEOUT_MS = 120_000;
 
     private final DbClient db;
     private final HttpServer http;
@@ -114,13 +120,13 @@ public final class StudioServer implements AutoCloseable {
         request.put("query", query);
         request.set("params", body.has("params") && body.get("params").isObject()
                 ? body.get("params") : MAPPER.createObjectNode());
-        int timeout = timeout(body, 10000);
-        if (timeout <= 0) {
+        int timeoutMs = clampTimeout(body, QUERY_TIMEOUT_DEFAULT_MS, QUERY_TIMEOUT_MAX_MS);
+        if (timeoutMs <= 0) {
             send(exchange, 400, error("SYNTAX", "超时时间必须为正"));
             return;
         }
-        request.put("timeoutMs", timeout);
-        forward(exchange, request, timeout);
+        request.put("timeoutMs", timeoutMs);
+        forward(exchange, request, timeoutMs);
     }
 
     private void admin(HttpExchange exchange) {
@@ -138,13 +144,14 @@ public final class StudioServer implements AutoCloseable {
         request.put("session", session(exchange, body));
         request.put("command", command);
         request.put("index", text(body, "index"));
-        int timeout = timeout(body, command.equals("rebuildIndex") ? 120000 : 60000);
-        if (timeout <= 0) {
+        int cap = command.equals("rebuildIndex") ? REBUILD_TIMEOUT_MS : STATS_TIMEOUT_MS;
+        int timeoutMs = clampTimeout(body, cap, cap);
+        if (timeoutMs <= 0) {
             send(exchange, 400, error("SYNTAX", "超时时间必须为正"));
             return;
         }
-        request.put("timeoutMs", timeout);
-        forward(exchange, request, timeout);
+        request.put("timeoutMs", timeoutMs);
+        forward(exchange, request, timeoutMs);
     }
 
     private void page(HttpExchange exchange) throws IOException {
@@ -221,7 +228,10 @@ public final class StudioServer implements AutoCloseable {
         return text(body, "session");
     }
 
-    private static int timeout(JsonNode body, int fallback) {
+    /**
+     * 读取客户端超时：缺省用 fallback，非法返回 -1，超过 max 时压到 max。
+     */
+    static int clampTimeout(JsonNode body, int fallback, int max) {
         JsonNode node = body.get("timeoutMs");
         if (node == null || node.isNull()) {
             return fallback;
@@ -229,7 +239,11 @@ public final class StudioServer implements AutoCloseable {
         if (!node.isNumber()) {
             return -1;
         }
-        return node.asInt();
+        int value = node.asInt();
+        if (value <= 0) {
+            return -1;
+        }
+        return Math.min(value, max);
     }
 
     private static String text(JsonNode body, String field) {
