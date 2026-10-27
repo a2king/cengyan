@@ -85,6 +85,13 @@ final class TreeText {
         if (edge.rank() != null) {
             text.append('@').append(edge.rank());
         }
+        if (edge.minHop() != null) {
+            text.append('{').append(edge.minHop());
+            if (!edge.minHop().equals(edge.maxHop())) {
+                text.append(',').append(edge.maxHop());
+            }
+            text.append('}');
+        }
         for (Stmt.Prop prop : edge.properties()) {
             text.append(' ').append(prop.name()).append('=').append(expr(prop.value()));
         }

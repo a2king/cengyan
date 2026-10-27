@@ -93,8 +93,7 @@ public final class QueryEngine {
                     insert(graphId(session), insert, values);
                     yield QueryResult.changed(1);
                 }
-                case Stmt.Match query -> match.run(
-                        query, graphId(session), values, limits.maxEdgesPerVertex(), cancel);
+                case Stmt.Match query -> match.run(query, graphId(session), values, limits, cancel);
             };
         }
     }
@@ -173,6 +172,9 @@ public final class QueryEngine {
             catalog.insertVertex(graphId, requireType(insert.source()), idOf(insert.source(), eval),
                     properties(insert.source(), eval), false);
             return;
+        }
+        if (insert.edge().minHop() != null) {
+            throw new CengyanException(ErrorCode.SYNTAX, "插入边不能是多跳");
         }
         if (insert.edge().direction() == Stmt.EdgePat.Direction.ANY) {
             throw new CengyanException(ErrorCode.SYNTAX, "插入边必须有方向");

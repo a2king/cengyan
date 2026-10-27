@@ -245,7 +245,7 @@ final class GqlReader {
             Stmt.EdgePat edge = edgeBody(direction);
             expect(Kind.RB, "边缺少右方括号");
             expect(Kind.MINUS, "入边的箭头不完整");
-            return edge;
+            return hops(edge, quantifier());
         }
         expect(Kind.MINUS, "边缺少方向");
         expect(Kind.LB, "边缺少左方括号");
@@ -258,7 +258,35 @@ final class GqlReader {
         } else {
             return fail("边的方向不完整");
         }
-        return new Stmt.EdgePat(direction, undecided.variable(), undecided.typeName(), undecided.rank(), undecided.properties());
+        return hops(new Stmt.EdgePat(
+                direction, undecided.variable(), undecided.typeName(), undecided.rank(), undecided.properties(),
+                null, null), quantifier());
+    }
+
+    private int[] quantifier() {
+        if (!take(Kind.LC)) {
+            return null;
+        }
+        long min = integer();
+        Long max = null;
+        if (take(Kind.COMMA)) {
+            max = integer();
+        }
+        expect(Kind.RC, "跳数缺少右花括号");
+        if (min > Integer.MAX_VALUE || (max != null && max > Integer.MAX_VALUE) || min < 0) {
+            return fail("跳数超出范围");
+        }
+        int upper = max == null ? (int) min : max.intValue();
+        return new int[] {(int) min, upper};
+    }
+
+    private static Stmt.EdgePat hops(Stmt.EdgePat edge, int[] range) {
+        if (range == null) {
+            return edge;
+        }
+        return new Stmt.EdgePat(
+                edge.direction(), edge.variable(), edge.typeName(), edge.rank(), edge.properties(),
+                range[0], range[1]);
     }
 
     private Stmt.EdgePat edgeBody(Stmt.EdgePat.Direction direction) {
@@ -272,7 +300,7 @@ final class GqlReader {
         if (take(Kind.AT)) {
             rank = integer();
         }
-        return new Stmt.EdgePat(direction, variable, typeName, rank, props());
+        return new Stmt.EdgePat(direction, variable, typeName, rank, props(), null, null);
     }
 
     private List<Stmt.Prop> props() {

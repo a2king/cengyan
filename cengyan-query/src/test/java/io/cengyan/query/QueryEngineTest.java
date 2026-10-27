@@ -243,18 +243,18 @@ class QueryEngineTest {
         return values;
     }
 
-    private static final class Db implements AutoCloseable {
-        private final Path dir;
-        private final GraphStore store;
-        private final Catalog catalog;
-        private final QueryEngine engine;
-        private final SessionState session = new SessionState();
+    static final class Db implements AutoCloseable {
+        final Path dir;
+        final GraphStore store;
+        final Catalog catalog;
+        final QueryEngine engine;
+        final SessionState session = new SessionState();
 
-        private Db() throws Exception {
+        Db() throws Exception {
             this(StoreOptions.development());
         }
 
-        private Db(StoreOptions options) throws Exception {
+        Db(StoreOptions options) throws Exception {
             dir = Files.createTempDirectory("cengyan-gql-");
             store = GraphStore.open(dir, options);
             catalog = Catalog.load(store);

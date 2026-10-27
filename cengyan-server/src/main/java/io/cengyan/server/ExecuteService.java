@@ -113,7 +113,12 @@ final class ExecuteService {
         try {
             SessionState session = sessions.open(sessionId);
             QueryResult result = engine.execute(
-                    session, query, params, new QueryLimits(config.maxEdgesPerVertex()), handle);
+                    session, query, params, new QueryLimits(
+                            config.maxEdgesPerVertex(),
+                            config.maxFrontierPerHop(),
+                            config.maxHops(),
+                            config.maxPaths()),
+                    handle);
             ObjectNode node = MAPPER.createObjectNode();
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);

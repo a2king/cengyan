@@ -54,7 +54,14 @@ public sealed interface Stmt {
     record NodePat(String variable, String typeName, List<Prop> properties) {
     }
 
-    record EdgePat(Direction direction, String variable, String typeName, Long rank, List<Prop> properties) {
+    record EdgePat(
+            Direction direction,
+            String variable,
+            String typeName,
+            Long rank,
+            List<Prop> properties,
+            Integer minHop,
+            Integer maxHop) {
         public enum Direction {
             OUT, IN, ANY
         }

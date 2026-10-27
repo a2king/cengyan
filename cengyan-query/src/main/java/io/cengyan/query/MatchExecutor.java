@@ -41,7 +41,8 @@ final class MatchExecutor {
         this.store = store;
     }
 
-    QueryResult run(Stmt.Match match, int graphId, Map<String, Object> params, int maxEdges, CancelToken cancel) {
+    QueryResult run(Stmt.Match match, int graphId, Map<String, Object> params, QueryLimits limits, CancelToken cancel) {
+        int maxEdges = limits.maxEdgesPerVertex();
         Names names = names(match);
         RelType relType = catalog.relType(graphId, match.edge().typeName());
         NodeType sourceType = match.source().typeName() == null ? null : catalog.nodeType(graphId, match.source().typeName());
@@ -58,6 +59,10 @@ final class MatchExecutor {
         }
         LongPredicate rankOnly = rankFilter;
         LongPredicate neighborOnly = push.neighbor;
+        if (match.edge().minHop() != null) {
+            return multi(match, graphId, limits, cancel, names, relType, sourceType, targetType, needs, eval,
+                    rankOnly, neighborOnly);
+        }
         List<Hop> hops = new ArrayList<>();
         try (ReadSession session = store.read()) {
             List<Long> starts = filterStarts(
@@ -147,6 +152,99 @@ final class MatchExecutor {
             }
             return new QueryResult(columns, rows, 0);
         }
+    }
+
+    private QueryResult multi(
+            Stmt.Match match,
+            int graphId,
+            QueryLimits limits,
+            CancelToken cancel,
+            Names names,
+            RelType relType,
+            NodeType sourceType,
+            NodeType targetType,
+            Needs needs,
+            ExprEval eval,
+            LongPredicate rank,
+            LongPredicate neighbor) {
+        int minHop = match.edge().minHop();
+        int maxHop = match.edge().maxHop() == null ? minHop : match.edge().maxHop();
+        Long startId = constantId(match.source().properties(), eval);
+        List<Reach> reached = new ArrayList<>();
+        java.util.Set<Long> seen = new java.util.LinkedHashSet<>();
+        try (ReadSession session = store.read()) {
+            List<Long> starts = filterStarts(
+                    session, graphId, sourceType, eval, match.source(),
+                    starts(session, graphId, match.source(), sourceType, startId, limits.maxEdgesPerVertex(), cancel));
+            for (long start : starts) {
+                cancelled(cancel);
+                java.util.Set<Long> vids = HopLoop.expandRange(
+                        session, graphId, relType.id(), directions(match.edge().direction()), start,
+                        minHop, maxHop, limits.maxHops(), limits.maxEdgesPerVertex(), limits.maxFrontierPerHop(),
+                        rank, neighbor, cancel);
+                for (long vid : vids) {
+                    if (seen.add(vid)) {
+                        reached.add(new Reach(start, vid));
+                    }
+                }
+            }
+            if (needs.edgeValue && reached.size() > limits.maxPaths()) {
+                throw new CengyanException(ErrorCode.PATH_LIMIT_EXCEEDED,
+                        "路径结果有 " + reached.size() + " 行，超过上限 " + limits.maxPaths());
+            }
+            if (needs.edge || needs.edgeValue || (match.where() != null && residual(match, names, eval))) {
+                throw new CengyanException(ErrorCode.SYNTAX, "多跳查询的条件目前只能比较 rank 和终点 id");
+            }
+            Map<Long, Map<String, Object>> sourceProps = needs.source
+                    ? vertexProps(session, graphId, sourceType, reachHops(reached, true), true) : Map.of();
+            Map<Long, Map<String, Object>> targetProps = needs.target
+                    ? vertexProps(session, graphId, targetType, reachHops(reached, false), false) : Map.of();
+            List<String> columns = new ArrayList<>();
+            for (Stmt.Item item : match.items()) {
+                columns.add(item.alias() == null ? item.text() : item.alias());
+            }
+            List<List<Object>> rows = new ArrayList<>();
+            List<List<Object>> sortKeys = new ArrayList<>();
+            List<Stmt.Sort> sorts = sorts(match, names);
+            for (Reach hop : reached) {
+                eval.slots(slots(names, match, new Hop(hop.start(), hop.vid(), null), sourceType, targetType,
+                        null, sourceProps.get(hop.start()), targetProps.get(hop.vid())));
+                List<Object> row = new ArrayList<>();
+                for (Stmt.Item item : match.items()) {
+                    row.add(DateTimes.plain(eval.eval(item.expr())));
+                }
+                rows.add(row);
+                if (!sorts.isEmpty()) {
+                    List<Object> keys = new ArrayList<>();
+                    for (Stmt.Sort sort : sorts) {
+                        keys.add(DateTimes.plain(eval.eval(sort.expr())));
+                    }
+                    sortKeys.add(keys);
+                }
+            }
+            order(rows, sortKeys, sorts);
+            int skip = match.skip() == null ? 0 : Math.toIntExact(match.skip());
+            if (skip > 0) {
+                rows = skip >= rows.size() ? List.of() : new ArrayList<>(rows.subList(skip, rows.size()));
+            }
+            if (match.limit() != null && match.limit() < rows.size()) {
+                rows = new ArrayList<>(rows.subList(0, match.limit().intValue()));
+            }
+            return new QueryResult(columns, rows, 0);
+        }
+    }
+
+    private static boolean residual(Stmt.Match match, Names names, ExprEval eval) {
+        return push(match.where(), names, eval).residual != null;
+    }
+
+    private static List<Hop> reachHops(List<Reach> reached, boolean start) {
+        List<Hop> hops = new ArrayList<>();
+        for (Reach reach : reached) {
+            long vid = start ? reach.start() : reach.vid();
+            hops.add(new Hop(vid, vid, null));
+        }
+        return hops;
     }
 
     private static List<Long> starts(
@@ -306,7 +404,7 @@ final class MatchExecutor {
         if (names.target != null) {
             slots.put(names.target, ExprEval.Slot.node(hop.neighbor(), typeName(targetType), targetProps));
         }
-        if (names.edge != null) {
+        if (names.edge != null && hop.edge() != null) {
             slots.put(names.edge, ExprEval.Slot.edge(
                     match.edge().typeName(), hop.edge().rank(), hop.edge().outSrc(), hop.edge().outDst(), edgeProps));
         }
@@ -601,6 +699,9 @@ final class MatchExecutor {
     private record Hop(long start, long neighbor, EdgeRef edge) {
     }
 
+    private record Reach(long start, long vid) {
+    }
+
     private record Push(LongPredicate neighbor, LongPredicate rank, Expr residual) {
     }
 
@@ -615,6 +716,7 @@ final class MatchExecutor {
         private final boolean edge;
         private final boolean source;
         private final boolean target;
+        private final boolean edgeValue;
 
         private Needs(
                 Stmt.Match match,
@@ -652,6 +754,7 @@ final class MatchExecutor {
             this.edge = edge || walker.edge;
             this.source = source || walker.source;
             this.target = target || walker.target;
+            this.edgeValue = walker.edge;
         }
 
         private static void checkProps(List<Stmt.Prop> props, List<PropDef> schema, boolean allowId, String where) {

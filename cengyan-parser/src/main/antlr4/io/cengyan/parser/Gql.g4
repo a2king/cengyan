@@ -30,11 +30,12 @@ valueType: BOOL | BOOLEAN | INT | INTEGER | INT64 | DOUBLE | STRING | DATETIME;
 
 node: '(' variable=IDENT? (':' typeName=IDENT)? props? ')';
 edge
-    : '-' '[' edgeBody ']' '->'   #edgeOut
-    | '<-' '[' edgeBody ']' '-'   #edgeIn
-    | '-' '[' edgeBody ']' '-'    #edgeAny
+    : '-' '[' edgeBody ']' '->' quantifier?   #edgeOut
+    | '<-' '[' edgeBody ']' '-' quantifier?   #edgeIn
+    | '-' '[' edgeBody ']' '-' quantifier?    #edgeAny
     ;
 edgeBody: variable=IDENT? ':' typeName=IDENT ('@' rank=INTEGER_LIT)? props?;
+quantifier: '{' min=INTEGER_LIT (',' max=INTEGER_LIT)? '}';
 props: '{' (prop (',' prop)*)? '}';
 prop: name=IDENT ':' expr;
 

@@ -39,6 +39,10 @@ class GqlSyntaxTest {
     void 入边无向和插入() {
         assertTrue(Gql.tree("MATCH (a:Company {id:1})<-[:holder]-(b) RETURN b.id").contains("(edge IN:holder)"));
         assertTrue(Gql.tree("MATCH (a:Company {id:1})-[:holder]-(b) RETURN b.id").contains("(edge ANY:holder)"));
+        assertTrue(Gql.tree("MATCH (a:Company {id:1})-[e:holder]->{1,10}(b) RETURN b.id")
+                .contains("(edge OUT e:holder{1,10})"));
+        assertTrue(Gql.tree("MATCH (a:Company {id:1})-[:holder]->{3}(b) RETURN b.id")
+                .contains("(edge OUT:holder{3})"));
         assertEquals("(insert (node a:Company id=1 name='root') (edge OUT:holder@3 ratio=0.5) (node b id=2))",
                 Gql.tree("INSERT (a:Company {id:1, name:'root'})-[:holder@3 {ratio:0.5}]->(b {id:2})"));
         assertEquals("(createType node Company (name:STRING capital:INT64?))",
