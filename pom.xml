@@ -17,6 +17,7 @@
         <module>cengyan-query</module>
         <module>cengyan-server</module>
         <module>cengyan-cli</module>
+        <module>cengyan-studio</module>
     </modules>
 
     <properties>
