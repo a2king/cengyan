@@ -408,11 +408,28 @@ final class ExprEval {
         }
 
         static Slot edge(String typeName, long rank, long src, long dst, Map<String, Object> props) {
+            return edge(typeName, rank, src, dst, props, null, null);
+        }
+
+        static Slot edge(
+                String typeName,
+                long rank,
+                long src,
+                long dst,
+                Map<String, Object> props,
+                String srcType,
+                String dstType) {
             Map<String, Object> body = new java.util.LinkedHashMap<>();
             body.put("type", typeName);
             body.put("rank", rank);
             body.put("src", src);
             body.put("dst", dst);
+            if (srcType != null && !srcType.isBlank()) {
+                body.put("srcType", srcType);
+            }
+            if (dstType != null && !dstType.isBlank()) {
+                body.put("dstType", dstType);
+            }
             body.put("properties", props == null ? Map.of() : props);
             return new Slot(true, 0L, typeName, rank, src, dst, props, body);
         }

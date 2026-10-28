@@ -14,6 +14,7 @@ import org.rocksdb.Slice;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -43,6 +44,7 @@ final class RocksReadSession implements ReadSession {
                 store.handle(Cf.EDGE),
                 snapshot,
                 graphId,
+                store.partOf(graphId, vid),
                 vid,
                 edgeTypeId,
                 direction,
@@ -69,9 +71,42 @@ final class RocksReadSession implements ReadSession {
                 store.handle(Cf.EDGE),
                 snapshot,
                 graphId,
+                store.partOf(graphId, vid),
                 vid,
                 edgeTypeId,
                 direction,
+                queryLimit,
+                maxEdgesPerVertex,
+                cancel,
+                predicate,
+                store::addEdgeExamined);
+    }
+
+    @Override
+    public EdgeCursor scanEdges(
+            int graphId,
+            long vid,
+            Set<Integer> edgeTypeIds,
+            List<Direction> directions,
+            int queryLimit,
+            int maxEdgesPerVertex,
+            Predicate<EdgeRef> predicate,
+            CancelToken cancel) {
+        ensureOpen();
+        if (edgeTypeIds != null && edgeTypeIds.size() == 1 && directions != null && directions.size() == 1) {
+            return scanEdges(
+                    graphId, vid, edgeTypeIds.iterator().next(), directions.get(0),
+                    queryLimit, maxEdgesPerVertex, predicate, cancel);
+        }
+        return EdgeScanner.openMany(
+                store.db(),
+                store.handle(Cf.EDGE),
+                snapshot,
+                graphId,
+                store.partOf(graphId, vid),
+                vid,
+                edgeTypeIds,
+                directions,
                 queryLimit,
                 maxEdgesPerVertex,
                 cancel,

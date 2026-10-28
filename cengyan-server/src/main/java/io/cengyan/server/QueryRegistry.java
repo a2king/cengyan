@@ -2,6 +2,9 @@ package io.cengyan.server;
 
 import io.cengyan.query.QueryHandle;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -24,6 +27,24 @@ final class QueryRegistry {
         }
         handle.cancel(reason);
         return true;
+    }
+
+    /** 只返回带语句的执行。耗时按调用这一刻计算，长的排在前面。 */
+    List<RunningQuery> list() {
+        long now = System.currentTimeMillis();
+        List<RunningQuery> rows = new ArrayList<>();
+        for (QueryHandle handle : running.values()) {
+            if (handle.statement().isBlank()) {
+                continue;
+            }
+            rows.add(new RunningQuery(
+                    handle.id(),
+                    handle.user(),
+                    Math.max(0, now - handle.startedMillis()),
+                    handle.statement()));
+        }
+        rows.sort(Comparator.comparingLong(RunningQuery::elapsedMs).reversed());
+        return rows;
     }
 
     void sweep() {

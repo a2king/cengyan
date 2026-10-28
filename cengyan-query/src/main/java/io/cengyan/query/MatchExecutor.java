@@ -27,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.LongPredicate;
 
 /**
@@ -48,10 +49,15 @@ final class MatchExecutor {
         String[] aggregates = aggregateKinds(match);
         int maxEdges = limits.maxEdgesPerVertex();
         Names names = names(match);
-        RelType relType = catalog.relType(graphId, match.edge().typeName());
+        if (match.edge() == null) {
+            return nodes(match, graphId, params, limits, cancel, aggregates, names);
+        }
+        boolean openTypes = match.edge().typeNames().isEmpty();
+        List<RelType> rels = openTypes ? catalog.relTypes(graphId) : namedRels(graphId, match.edge().typeNames());
+        RelType relType = !openTypes && rels.size() == 1 ? rels.get(0) : null;
         NodeType sourceType = match.source().typeName() == null ? null : catalog.nodeType(graphId, match.source().typeName());
         NodeType targetType = match.target().typeName() == null ? null : catalog.nodeType(graphId, match.target().typeName());
-        Needs needs = new Needs(match, names, sourceType, targetType, relType, sorts(match, names));
+        Needs needs = new Needs(match, names, sourceType, targetType, openTypes ? null : rels, sorts(match, names));
         ExprEval eval = new ExprEval(params, false);
         Long startId = constantId(match.source().properties(), eval);
         int window = window(match);
@@ -64,8 +70,14 @@ final class MatchExecutor {
         LongPredicate rankOnly = rankFilter;
         LongPredicate neighborOnly = push.neighbor;
         if (match.edge().minHop() != null) {
-            return multi(match, graphId, limits, cancel, names, relType, sourceType, targetType, needs, eval,
+            return multi(match, graphId, limits, cancel, names, relType, openTypes, rels, sourceType, targetType, needs, eval,
                     rankOnly, neighborOnly, aggregates);
+        }
+        Map<Integer, String> typeNames = new HashMap<>();
+        if (relType == null) {
+            for (RelType type : rels) {
+                typeNames.put(type.id(), type.name());
+            }
         }
         List<Hop> hops = new ArrayList<>();
         try (ReadSession session = store.read()) {
@@ -106,6 +118,7 @@ final class MatchExecutor {
                         indexedStarts != null
                                 ? indexedStarts
                                 : starts(session, graphId, match.source(), sourceType, startId, maxEdges, cancel));
+                if (relType != null) {
                 for (Direction direction : directions(match.edge().direction())) {
                     for (long start : starts) {
                         if (window >= 0 && hops.size() >= window) {
@@ -128,8 +141,31 @@ final class MatchExecutor {
                         }
                     }
                 }
+                } else {
+                Set<Integer> typeIds = openTypes ? null : typeIds(rels);
+                List<Direction> wideDirections = directions(match.edge().direction());
+                for (long start : starts) {
+                    if (window >= 0 && hops.size() >= window) {
+                        break;
+                    }
+                    cancelled(cancel);
+                    int remaining = window < 0 ? -1 : window - hops.size();
+                    try (EdgeCursor cursor = session.scanEdges(
+                            graphId, start, typeIds, wideDirections, remaining, maxEdges,
+                            edge -> rankOk(rankOnly, edge.rank()) && neighborOk(neighborOnly, endpoint(edge, start)),
+                            cancel)) {
+                        while (cursor.hasNext()) {
+                            EdgeRef edge = cursor.next();
+                            if (match.edge().direction() == Stmt.EdgePat.Direction.ANY && !names.seen.add(edge)) {
+                                continue;
+                            }
+                            hops.add(new Hop(start, endpoint(edge, start), edge));
+                        }
+                    }
+                }
+                }
             }
-            List<Map<String, Object>> edgeProps = needs.edge ? edgeProps(session, graphId, relType, hops) : null;
+            List<Map<String, Object>> edgeProps = needs.edge ? edgeProps(session, graphId, relType, rels, hops) : null;
             Map<Long, Map<String, Object>> sourceProps = needs.source
                     ? vertexProps(session, graphId, sourceType, hops, true) : Map.of();
             Map<Long, Map<String, Object>> targetProps = needs.target
@@ -144,6 +180,7 @@ final class MatchExecutor {
                 }
                 if (push.residual != null) {
                     eval.slots(slots(names, match, hop, sourceType, targetType,
+                            edgeTypeName(relType, typeNames, hop.edge()),
                             edgeProps == null ? null : edgeProps.get(i),
                             sourceProps.get(hop.start()), targetProps.get(hop.neighbor())));
                     if (!eval.isTrue(push.residual)) {
@@ -155,8 +192,52 @@ final class MatchExecutor {
                     matchedEdgeProps.add(edgeProps.get(i));
                 }
             }
-            return project(match, names, sourceType, targetType, eval, matched, matchedEdgeProps,
-                    sourceProps, targetProps, aggregates, false, cancel);
+            return project(match, names, sourceType, targetType, relType, typeNames, eval, matched, matchedEdgeProps,
+                    sourceProps, targetProps, session, graphId, aggregates, false, cancel);
+        }
+    }
+
+    private QueryResult nodes(
+            Stmt.Match match,
+            int graphId,
+            Map<String, Object> params,
+            QueryLimits limits,
+            CancelToken cancel,
+            String[] aggregates,
+            Names names) {
+        NodeType sourceType = match.source().typeName() == null
+                ? null : catalog.nodeType(graphId, match.source().typeName());
+        Needs needs = new Needs(match, names, sourceType, null, null, sorts(match, names));
+        ExprEval eval = new ExprEval(params, false);
+        Long startId = constantId(match.source().properties(), eval);
+        int window = window(match);
+        Push push = push(match.where(), names, eval);
+        try (ReadSession session = store.read()) {
+            List<Long> starts = filterStarts(
+                    session, graphId, sourceType, eval, match.source(),
+                    starts(session, graphId, match.source(), sourceType, startId, limits.maxEdgesPerVertex(), cancel));
+            List<Hop> hops = new ArrayList<>();
+            for (long vid : starts) {
+                if (window >= 0 && hops.size() >= window) {
+                    break;
+                }
+                hops.add(new Hop(vid, vid, null));
+            }
+            Map<Long, Map<String, Object>> sourceProps = needs.source
+                    ? vertexProps(session, graphId, sourceType, hops, true) : Map.of();
+            List<Hop> matched = new ArrayList<>();
+            for (Hop hop : hops) {
+                if (push.residual != null) {
+                    eval.slots(slots(names, match, hop, sourceType, null, null, null,
+                            sourceProps.get(hop.start()), null));
+                    if (!eval.isTrue(push.residual)) {
+                        continue;
+                    }
+                }
+                matched.add(hop);
+            }
+            return project(match, names, sourceType, null, null, Map.of(), eval, matched, null,
+                    sourceProps, Map.of(), session, graphId, aggregates, false, cancel);
         }
     }
 
@@ -167,6 +248,8 @@ final class MatchExecutor {
             CancelToken cancel,
             Names names,
             RelType relType,
+            boolean openTypes,
+            List<RelType> rels,
             NodeType sourceType,
             NodeType targetType,
             Needs needs,
@@ -185,10 +268,16 @@ final class MatchExecutor {
                     starts(session, graphId, match.source(), sourceType, startId, limits.maxEdgesPerVertex(), cancel));
             for (long start : starts) {
                 cancelled(cancel);
-                java.util.Set<Long> vids = HopLoop.expandRange(
-                        session, graphId, relType.id(), directions(match.edge().direction()), start,
-                        minHop, maxHop, limits.maxHops(), limits.maxEdgesPerVertex(), limits.maxFrontierPerHop(),
-                        rank, neighbor, cancel);
+                java.util.Set<Long> vids = relType != null
+                        ? HopLoop.expandRange(
+                                session, graphId, relType.id(), directions(match.edge().direction()), start,
+                                minHop, maxHop, limits.maxHops(), limits.maxEdgesPerVertex(),
+                                limits.maxFrontierPerHop(), rank, neighbor, cancel)
+                        : HopLoop.expandTypes(
+                                session, graphId, openTypes ? null : typeIds(rels),
+                                directions(match.edge().direction()), start,
+                                minHop, maxHop, limits.maxHops(), limits.maxEdgesPerVertex(),
+                                limits.maxFrontierPerHop(), rank, neighbor, cancel);
                 for (long vid : vids) {
                     if (seen.add(vid)) {
                         reached.add(new Reach(start, vid));
@@ -210,7 +299,8 @@ final class MatchExecutor {
             for (Reach hop : reached) {
                 hops.add(new Hop(hop.start(), hop.vid(), null));
             }
-            return project(match, names, sourceType, targetType, eval, hops, null, sourceProps, targetProps, aggregates, true, cancel);
+            return project(match, names, sourceType, targetType, relType, Map.of(), eval, hops, null,
+                    sourceProps, targetProps, session, graphId, aggregates, true, cancel);
         }
     }
 
@@ -227,7 +317,7 @@ final class MatchExecutor {
         return hops;
     }
 
-    private static List<Long> starts(
+    private List<Long> starts(
             ReadSession session,
             int graphId,
             Stmt.NodePat source,
@@ -238,7 +328,7 @@ final class MatchExecutor {
         if (startId != null) {
             if (sourceType != null) {
                 byte[] raw = session.get(
-                        Cf.VERTEX, KeyCodec.vertexKey(graphId, KeyCodec.partOf(startId), startId, sourceType.id()));
+                        Cf.VERTEX, KeyCodec.vertexKey(graphId, catalog.partOf(graphId, startId), startId, sourceType.id()));
                 if (raw == null) {
                     return List.of();
                 }
@@ -257,16 +347,22 @@ final class MatchExecutor {
         return ids;
     }
 
-    private List<Map<String, Object>> edgeProps(ReadSession session, int graphId, RelType type, List<Hop> hops) {
+    private List<Map<String, Object>> edgeProps(
+            ReadSession session, int graphId, RelType type, List<RelType> rels, List<Hop> hops) {
+        List<RelType> types = new ArrayList<>(hops.size());
         List<byte[]> keys = new ArrayList<>(hops.size());
         for (Hop hop : hops) {
             EdgeRef edge = hop.edge();
-            keys.add(KeyCodec.propKey(graphId, type.id(), edge.rank(), edge.outSrc(), edge.outDst()));
+            RelType rel = type != null ? type : relOf(rels, edge.edgeTypeId());
+            types.add(rel);
+            keys.add(KeyCodec.propKey(graphId, rel.id(), edge.rank(), edge.outSrc(), edge.outDst()));
         }
         List<byte[]> values = session.multiGet(Cf.PROP, keys);
         List<Map<String, Object>> props = new ArrayList<>(values.size());
-        for (byte[] value : values) {
-            props.add(value == null ? Map.of() : typed(type.properties(), PropCodec.decode(type.properties(), type.schemaVersion(), value)));
+        for (int i = 0; i < values.size(); i++) {
+            byte[] value = values.get(i);
+            RelType rel = types.get(i);
+            props.add(value == null ? Map.of() : typed(rel.properties(), PropCodec.decode(rel.properties(), rel.schemaVersion(), value)));
         }
         return props;
     }
@@ -282,7 +378,7 @@ final class MatchExecutor {
             if (loaded.containsKey(vid)) {
                 continue;
             }
-            byte[] raw = session.get(Cf.VERTEX, KeyCodec.vertexKey(graphId, KeyCodec.partOf(vid), vid, type.id()));
+            byte[] raw = session.get(Cf.VERTEX, KeyCodec.vertexKey(graphId, catalog.partOf(graphId, vid), vid, type.id()));
             loaded.put(vid, raw == null ? Map.of()
                     : typed(type.properties(), PropCodec.decode(type.properties(), type.schemaVersion(), raw)));
         }
@@ -347,7 +443,7 @@ final class MatchExecutor {
         }
         List<Long> kept = new ArrayList<>();
         for (long vid : starts) {
-            byte[] raw = session.get(Cf.VERTEX, KeyCodec.vertexKey(graphId, KeyCodec.partOf(vid), vid, sourceType.id()));
+            byte[] raw = session.get(Cf.VERTEX, KeyCodec.vertexKey(graphId, catalog.partOf(graphId, vid), vid, sourceType.id()));
             Map<String, Object> props = raw == null
                     ? Map.of()
                     : typed(sourceType.properties(), PropCodec.decode(sourceType.properties(), sourceType.schemaVersion(), raw));
@@ -374,6 +470,7 @@ final class MatchExecutor {
             Hop hop,
             NodeType sourceType,
             NodeType targetType,
+            String edgeType,
             Map<String, Object> edgeProps,
             Map<String, Object> sourceProps,
             Map<String, Object> targetProps) {
@@ -386,9 +483,80 @@ final class MatchExecutor {
         }
         if (names.edge != null && hop.edge() != null) {
             slots.put(names.edge, ExprEval.Slot.edge(
-                    match.edge().typeName(), hop.edge().rank(), hop.edge().outSrc(), hop.edge().outDst(), edgeProps));
+                    edgeType, hop.edge().rank(), hop.edge().outSrc(), hop.edge().outDst(), edgeProps));
         }
         return slots;
+    }
+
+    private static Map<String, ExprEval.Slot> slots(
+            Names names,
+            Stmt.Match match,
+            Hop hop,
+            NodeType sourceType,
+            NodeType targetType,
+            String edgeType,
+            Map<String, Object> edgeProps,
+            Map<String, Object> sourceProps,
+            Map<String, Object> targetProps,
+            EndpointTypes ends) {
+        Map<String, ExprEval.Slot> slots = new HashMap<>();
+        String sourceName = ends.source != null ? ends.source : typeName(sourceType);
+        String targetName = ends.target != null ? ends.target : typeName(targetType);
+        if (names.source != null) {
+            slots.put(names.source, ExprEval.Slot.node(hop.start(), sourceName, sourceProps));
+        }
+        if (names.target != null) {
+            slots.put(names.target, ExprEval.Slot.node(hop.neighbor(), targetName, targetProps));
+        }
+        if (names.edge != null && hop.edge() != null) {
+            slots.put(names.edge, ExprEval.Slot.edge(
+                    edgeType, hop.edge().rank(), hop.edge().outSrc(), hop.edge().outDst(), edgeProps,
+                    ends.edgeSrc, ends.edgeDst));
+        }
+        return slots;
+    }
+
+    private String vertexType(ReadSession session, int graphId, long vid, Map<Long, String> cache) {
+        String cached = cache.get(vid);
+        if (cached != null) {
+            return cached.isEmpty() ? null : cached;
+        }
+        byte[] prefix = KeyCodec.vertexPrefix(graphId, catalog.partOf(graphId, vid), vid);
+        List<String> names = new ArrayList<>();
+        for (byte[] key : session.keysWithPrefix(Cf.VERTEX, prefix)) {
+            if (key.length != KeyCodec.VERTEX_KEY_LENGTH) {
+                continue;
+            }
+            int tagId = KeyCodec.tagIdOf(key);
+            for (NodeType type : catalog.nodeTypes(graphId)) {
+                if (type.id() == tagId) {
+                    names.add(type.name());
+                }
+            }
+        }
+        String name = String.join(", ", names);
+        cache.put(vid, name);
+        return name.isEmpty() ? null : name;
+    }
+
+    private String endpointType(
+            long vid,
+            Hop hop,
+            String sourceName,
+            String targetName,
+            ReadSession session,
+            int graphId,
+            Map<Long, String> cache) {
+        if (vid == hop.start() && sourceName != null) {
+            return sourceName;
+        }
+        if (vid == hop.neighbor() && targetName != null) {
+            return targetName;
+        }
+        return vertexType(session, graphId, vid, cache);
+    }
+
+    private record EndpointTypes(String source, String target, String edgeSrc, String edgeDst) {
     }
 
     private static String typeName(NodeType type) {
@@ -400,11 +568,15 @@ final class MatchExecutor {
             Names names,
             NodeType sourceType,
             NodeType targetType,
+            RelType relType,
+            Map<Integer, String> typeNames,
             ExprEval eval,
             List<Hop> matched,
             List<Map<String, Object>> edgeProps,
             Map<Long, Map<String, Object>> sourceProps,
             Map<Long, Map<String, Object>> targetProps,
+            ReadSession session,
+            int graphId,
             String[] aggregates,
             boolean limitAfter,
             CancelToken cancel) {
@@ -415,11 +587,22 @@ final class MatchExecutor {
         List<Stmt.Sort> sorts = aggregates == null ? sorts(match, names) : List.of();
         List<List<Object>> rows = new ArrayList<>();
         List<List<Object>> sortKeys = new ArrayList<>();
+        Map<Long, String> typeCache = new HashMap<>();
         for (int i = 0; i < matched.size(); i++) {
             Hop hop = matched.get(i);
+            String sourceName = sourceType != null
+                    ? sourceType.name() : vertexType(session, graphId, hop.start(), typeCache);
+            String targetName = targetType != null
+                    ? targetType.name() : vertexType(session, graphId, hop.neighbor(), typeCache);
+            String edgeSrc = hop.edge() == null ? null : endpointType(
+                    hop.edge().outSrc(), hop, sourceName, targetName, session, graphId, typeCache);
+            String edgeDst = hop.edge() == null ? null : endpointType(
+                    hop.edge().outDst(), hop, sourceName, targetName, session, graphId, typeCache);
             eval.slots(slots(names, match, hop, sourceType, targetType,
+                    edgeTypeName(relType, typeNames, hop.edge()),
                     edgeProps == null ? null : edgeProps.get(i),
-                    sourceProps.get(hop.start()), targetProps.get(hop.neighbor())));
+                    sourceProps.get(hop.start()), targetProps.get(hop.neighbor()),
+                    new EndpointTypes(sourceName, targetName, edgeSrc, edgeDst)));
             List<Object> row = new ArrayList<>();
             for (int column = 0; column < match.items().size(); column++) {
                 row.add(cell(eval, match.items().get(column), aggregates == null ? null : aggregates[column]));
@@ -791,9 +974,54 @@ final class MatchExecutor {
     private static Names names(Stmt.Match match) {
         Names names = new Names();
         names.source = unique(names, match.source().variable());
-        names.edge = unique(names, match.edge().variable());
-        names.target = unique(names, match.target().variable());
+        if (match.edge() != null) {
+            names.edge = unique(names, match.edge().variable());
+            names.target = unique(names, match.target().variable());
+        }
         return names;
+    }
+
+    private List<RelType> namedRels(int graphId, List<String> typeNames) {
+        List<RelType> rels = new ArrayList<>(typeNames.size());
+        for (String typeName : typeNames) {
+            rels.add(catalog.relType(graphId, typeName));
+        }
+        return rels;
+    }
+
+    private static Set<Integer> typeIds(List<RelType> rels) {
+        LinkedHashSet<Integer> ids = new LinkedHashSet<>();
+        for (RelType type : rels) {
+            ids.add(type.id());
+        }
+        return ids;
+    }
+
+    private static RelType relOf(List<RelType> rels, int edgeTypeId) {
+        for (RelType type : rels) {
+            if (type.id() == edgeTypeId) {
+                return type;
+            }
+        }
+        throw new CengyanException(ErrorCode.INTERNAL, "边类型丢失");
+    }
+
+    private static String edgeTypeName(RelType only, Map<Integer, String> typeNames, EdgeRef edge) {
+        if (edge == null) {
+            return null;
+        }
+        if (only != null) {
+            return only.name();
+        }
+        String name = typeNames.get(edge.edgeTypeId());
+        if (name == null) {
+            throw new CengyanException(ErrorCode.INTERNAL, "边类型丢失");
+        }
+        return name;
+    }
+
+    private static long endpoint(EdgeRef edge, long start) {
+        return edge.outSrc() == start ? edge.outDst() : edge.outSrc();
     }
 
     private static String unique(Names names, String variable) {
@@ -841,25 +1069,29 @@ final class MatchExecutor {
                 Names names,
                 NodeType sourceType,
                 NodeType targetType,
-                RelType relType,
+                List<RelType> edgeTypes,
                 List<Stmt.Sort> orderBy) {
-            checkProps(match.edge().properties(), relType.properties(), false, "边");
+            if (match.edge() != null && edgeTypes != null) {
+                for (RelType type : edgeTypes) {
+                    checkProps(match.edge().properties(), type.properties(), false, "边");
+                }
+            }
             if (!withoutId(match.source().properties()).isEmpty() && sourceType == null) {
                 throw new CengyanException(ErrorCode.SYNTAX, "起点属性需要节点类型");
             }
             if (sourceType != null) {
                 checkProps(match.source().properties(), sourceType.properties(), true, "起点");
             }
-            if (!withoutId(match.target().properties()).isEmpty() && targetType == null) {
+            if (match.target() != null && !withoutId(match.target().properties()).isEmpty() && targetType == null) {
                 throw new CengyanException(ErrorCode.SYNTAX, "不知道终点的节点类型");
             }
             if (targetType != null) {
                 checkProps(match.target().properties(), targetType.properties(), true, "终点");
             }
-            boolean edge = !match.edge().properties().isEmpty();
+            boolean edge = match.edge() != null && !match.edge().properties().isEmpty();
             boolean source = !withoutId(match.source().properties()).isEmpty();
-            boolean target = !withoutId(match.target().properties()).isEmpty();
-            Walker walker = new Walker(names, sourceType, targetType, relType);
+            boolean target = match.target() != null && !withoutId(match.target().properties()).isEmpty();
+            Walker walker = new Walker(names, sourceType, targetType, edgeTypes);
             walker.place = 0;
             if (match.where() != null) {
                 walker.walk(match.where());
@@ -894,17 +1126,17 @@ final class MatchExecutor {
         private final Names names;
         private final NodeType sourceType;
         private final NodeType targetType;
-        private final RelType relType;
+        private final List<RelType> edgeTypes;
         private boolean edge;
         private boolean source;
         private boolean target;
         private int place;
 
-        private Walker(Names names, NodeType sourceType, NodeType targetType, RelType relType) {
+        private Walker(Names names, NodeType sourceType, NodeType targetType, List<RelType> edgeTypes) {
             this.names = names;
             this.sourceType = sourceType;
             this.targetType = targetType;
-            this.relType = relType;
+            this.edgeTypes = edgeTypes;
         }
 
         private void walk(Expr expr) {
@@ -955,11 +1187,15 @@ final class MatchExecutor {
         }
 
         private void property(Expr.Prop prop) {
-            if (prop.variable().equals(names.edge)) {
-                if (!"rank".equals(prop.field()) && !has(relType.properties(), prop.field())) {
-                    throw new CengyanException(ErrorCode.TYPE_MISMATCH, "未知属性 " + prop.field());
-                }
+            if (names.edge != null && prop.variable().equals(names.edge)) {
                 if (!"rank".equals(prop.field())) {
+                    if (edgeTypes != null) {
+                        for (RelType type : edgeTypes) {
+                            if (!has(type.properties(), prop.field())) {
+                                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "未知属性 " + prop.field());
+                            }
+                        }
+                    }
                     edge = true;
                 }
                 return;

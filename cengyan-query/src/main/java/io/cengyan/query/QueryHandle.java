@@ -17,13 +17,17 @@ public final class QueryHandle implements CancelToken {
 
     private final String id;
     private final long deadlineNanos;
+    private final long startedMillis;
     private final AtomicBoolean canceled = new AtomicBoolean();
     private final CopyOnWriteArrayList<Runnable> hooks = new CopyOnWriteArrayList<>();
     private volatile String reason = "";
+    private volatile String user = "";
+    private volatile String statement = "";
 
     private QueryHandle(String id, long deadlineNanos) {
         this.id = id;
         this.deadlineNanos = deadlineNanos;
+        this.startedMillis = System.currentTimeMillis();
     }
 
     /** 从现在起 {@code timeoutMs} 毫秒后到期。 */
@@ -41,6 +45,24 @@ public final class QueryHandle implements CancelToken {
 
     public long deadlineNanos() {
         return deadlineNanos;
+    }
+
+    public long startedMillis() {
+        return startedMillis;
+    }
+
+    public String user() {
+        return user;
+    }
+
+    public String statement() {
+        return statement;
+    }
+
+    /** 在登记到运行列表之前写上提交人和语句。登录和内部任务不写语句，列表里不会出现。 */
+    public void describe(String user, String statement) {
+        this.user = user == null ? "" : user;
+        this.statement = statement == null ? "" : statement;
     }
 
     public String reason() {

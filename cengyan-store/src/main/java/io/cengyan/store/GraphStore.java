@@ -1,6 +1,7 @@
 package io.cengyan.store;
 
 import java.nio.file.Path;
+import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
 /**
@@ -54,11 +55,37 @@ public interface GraphStore extends AutoCloseable {
     /** 按类型扫描起点时检查过的点键数。走索引时应当保持不变。 */
     long verticesExamined();
 
+    /** 当前存储目录中的文件总字节数。无法读取时返回 -1。 */
+    default long storageSizeBytes() {
+        return -1L;
+    }
+
     /** 把内存表刷到磁盘。进行中的快照读可以继续。 */
     void flush();
 
     /** 压缩全部列族。进行中的快照读可以继续。 */
     void compact();
+
+    /** 数据目录。副本的提交日志写在这个目录下。 */
+    Path directory();
+
+    /**
+     * 做检查点。调用前应先 {@link #flush()}。目标目录必须还不存在。
+     * 查询模块不引用 RocksDB 的检查点类。
+     */
+    void checkpoint(Path directory);
+
+    /** 只写这一份库，不再转发给副本。 */
+    void applyLocal(StoreBatch batch);
+
+    /**
+     * 有 3 个投票成员以后，写入先记提交日志，多数派确认后再写各副本。
+     * 不足 3 个时仍只保证本机这一份。
+     */
+    void setWriteGate(WriteGate gate);
+
+    /** 按图计算边和点的分片号。没设置时分片数是 1，分片号是 0。 */
+    void setPartResolver(BiFunction<Integer, Long, Integer> resolver);
 
     @Override
     void close();

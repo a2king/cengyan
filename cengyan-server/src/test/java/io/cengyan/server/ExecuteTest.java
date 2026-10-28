@@ -3,6 +3,7 @@ package io.cengyan.server;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.cengyan.query.QueryHandle;
 import org.junit.jupiter.api.Test;
 
 import java.io.BufferedReader;
@@ -108,6 +109,79 @@ class ExecuteTest {
         } finally {
             deleteTree(dir);
         }
+    }
+
+    @Test
+    void 读写用户能看到并终止正在执行的语句() throws Exception {
+        Path dir = Files.createTempDirectory("cengyan-running-");
+        ServerConfig config = ServerConfig.defaults().forTest(dir);
+        try (GraphDbServer server = GraphDbServer.start(config)) {
+            try (Socket socket = new Socket("127.0.0.1", server.port())) {
+                socket.setSoTimeout(10000);
+                BufferedWriter writer = new BufferedWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+                BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                JsonNode anonymous = call(writer, reader, request("queries", "", ""));
+                assertEquals("FORBIDDEN", anonymous.get("code").asText(), anonymous.toString());
+                String session = login(writer, reader, "", "root", "cengyan");
+                JsonNode empty = call(writer, reader, request("queries", session, ""));
+                assertEquals("OK", empty.get("code").asText(), empty.toString());
+                assertEquals(0, empty.get("rows").size());
+                JsonNode created = adminUser(writer, reader, session, "createUser", "reader", "secret", "read");
+                assertEquals("OK", created.get("code").asText(), created.toString());
+                String readerSession = login(writer, reader, "", "reader", "secret");
+                QueryHandle handle = QueryHandle.start(30_000);
+                handle.describe("root", "MATCH (a:Person) RETURN a");
+                server.queries().register(handle);
+                try {
+                    JsonNode denied = call(writer, reader, request("queries", readerSession, ""));
+                    assertEquals("FORBIDDEN", denied.get("code").asText(), denied.toString());
+                    assertTrue(denied.get("message").asText().contains("只读"));
+                    JsonNode deniedCancel = call(writer, reader, request("cancel", readerSession, handle.id()));
+                    assertEquals("FORBIDDEN", deniedCancel.get("code").asText(), deniedCancel.toString());
+                    assertFalse(handle.cancelled());
+                    JsonNode listed = call(writer, reader, request("queries", session, ""));
+                    assertEquals("OK", listed.get("code").asText(), listed.toString());
+                    assertEquals(handle.id(), listed.get("rows").get(0).get(0).asText());
+                    assertEquals("root", listed.get("rows").get(0).get(1).asText());
+                    assertTrue(listed.get("rows").get(0).get(2).asLong() >= 0);
+                    assertEquals("MATCH (a:Person) RETURN a", listed.get("rows").get(0).get(3).asText());
+                    JsonNode killed = call(writer, reader, request("cancel", session, handle.id()));
+                    assertEquals("OK", killed.get("code").asText(), killed.toString());
+                    assertEquals("已终止", killed.get("message").asText());
+                    assertTrue(handle.cancelled());
+                    assertEquals("被终止", handle.reason());
+                    server.queries().unregister(handle.id());
+                    JsonNode missing = call(writer, reader, request("cancel", session, handle.id()));
+                    assertEquals("QUERY_CANCELED", missing.get("code").asText(), missing.toString());
+                    assertTrue(missing.get("message").asText().contains("没有找到该查询"));
+                    JsonNode blank = call(writer, reader, request("cancel", session, ""));
+                    assertEquals("SYNTAX", blank.get("code").asText(), blank.toString());
+                } finally {
+                    server.queries().unregister(handle.id());
+                }
+            }
+        } finally {
+            deleteTree(dir);
+        }
+    }
+
+    private static ObjectNode request(String op, String session, String queryId) {
+        ObjectNode node = MAPPER.createObjectNode();
+        node.put("op", op);
+        node.put("session", session);
+        if (!queryId.isEmpty()) {
+            node.put("queryId", queryId);
+        }
+        return node;
+    }
+
+    private static JsonNode call(BufferedWriter writer, BufferedReader reader, ObjectNode request) throws Exception {
+        writer.write(MAPPER.writeValueAsString(request));
+        writer.write('\n');
+        writer.flush();
+        return MAPPER.readTree(reader.readLine());
     }
 
     private static String ok(BufferedWriter writer, BufferedReader reader, String session, String query) throws Exception {

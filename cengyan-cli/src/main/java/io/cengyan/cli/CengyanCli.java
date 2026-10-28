@@ -115,6 +115,18 @@ public final class CengyanCli {
                         node.put("role", part(parts, 2));
                     }
                     case "dropUser" -> node.put("user", part(parts, 1));
+                    case "addStorage", "addCompute" -> node.put("address", part(parts, 1));
+                    case "drainStorage", "removeStorage", "drainCompute", "removeCompute" ->
+                            node.put("nodeId", parseInt(part(parts, 1)));
+                    case "addReplica" -> {
+                        node.put("graph", part(parts, 1));
+                        node.put("replicas", parseInt(part(parts, 2)));
+                    }
+                    case "setPartCount" -> {
+                        node.put("graph", part(parts, 1));
+                        node.put("parts", parseInt(part(parts, 2)));
+                    }
+                    case "showMembers" -> node.put("graph", part(parts, 1));
                     default -> {
                     }
                 }
@@ -130,6 +142,13 @@ public final class CengyanCli {
 
     private static String part(String[] parts, int index) {
         return parts.length > index ? parts[index] : "";
+    }
+
+    private static int parseInt(String text) {
+        if (text == null || text.isBlank()) {
+            return 0;
+        }
+        return Integer.parseInt(text);
     }
 
     private void print(String response) throws IOException {

@@ -190,6 +190,28 @@ class StudioServerTest {
     }
 
     @Test
+    void 副本管理可以转发() throws Exception {
+        try (ServerSocket db = new ServerSocket(0)) {
+            AtomicReference<String> seen = new AtomicReference<>();
+            Thread worker = new Thread(() -> reply(db, seen, """
+                    {"code":"OK","session":"s1","columns":["nodeId"],"rows":[[2]],"rowsAffected":1}
+                    """));
+            worker.start();
+            try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", db.getLocalPort()))) {
+                HttpResponse<String> response = post(studio.port(), "/api/admin",
+                        "{\"command\":\"addReplica\",\"graph\":\"demo\",\"replicas\":2}", "s1");
+                assertEquals(200, response.statusCode());
+            }
+            worker.join(3000);
+            JsonNode sent = MAPPER.readTree(seen.get());
+            assertEquals("addReplica", sent.get("command").asText());
+            assertEquals("demo", sent.get("graph").asText());
+            assertEquals(2, sent.get("replicas").asInt());
+            assertEquals(StudioServer.REBUILD_TIMEOUT_MS, sent.get("timeoutMs").asInt());
+        }
+    }
+
+    @Test
     void 超时计算压到硬顶() {
         ObjectNode huge = MAPPER.createObjectNode().put("timeoutMs", 9_999_999);
         assertEquals(30_000, StudioServer.clampTimeout(huge, 10_000, 30_000));
@@ -197,6 +219,49 @@ class StudioServerTest {
         ObjectNode low = MAPPER.createObjectNode().put("timeoutMs", 1500);
         assertEquals(1500, StudioServer.clampTimeout(low, 10_000, 30_000));
         assertEquals(-1, StudioServer.clampTimeout(MAPPER.createObjectNode().put("timeoutMs", 0), 10_000, 30_000));
+    }
+
+    @Test
+    void 运行查询和终止会带上会话() throws Exception {
+        try (ServerSocket db = new ServerSocket(0)) {
+            AtomicReference<String> seen = new AtomicReference<>();
+            Thread worker = new Thread(() -> reply(db, seen, """
+                    {"code":"OK","session":"s1","columns":["queryId","user","elapsedMs","query"],"rows":[],"rowsAffected":0}
+                    """));
+            worker.start();
+            try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", db.getLocalPort()))) {
+                HttpResponse<String> response = post(studio.port(), "/api/queries", "{}", "s1");
+                assertEquals(200, response.statusCode());
+                assertEquals("OK", MAPPER.readTree(response.body()).get("code").asText());
+            }
+            worker.join(3000);
+            JsonNode sent = MAPPER.readTree(seen.get());
+            assertEquals("queries", sent.get("op").asText());
+            assertEquals("s1", sent.get("session").asText());
+        }
+    }
+
+    @Test
+    void 终止查询会转发queryId() throws Exception {
+        try (ServerSocket db = new ServerSocket(0)) {
+            AtomicReference<String> seen = new AtomicReference<>();
+            Thread worker = new Thread(() -> reply(db, seen, """
+                    {"code":"OK","session":"s1","queryId":"q1","message":"已终止"}
+                    """));
+            worker.start();
+            try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", db.getLocalPort()))) {
+                HttpResponse<String> missing = post(studio.port(), "/api/cancel", "{}", "s1");
+                assertEquals(400, missing.statusCode());
+                assertTrue(MAPPER.readTree(missing.body()).get("message").asText().contains("queryId"));
+                HttpResponse<String> response = post(studio.port(), "/api/cancel", "{\"queryId\":\"q1\"}", "s1");
+                assertEquals(200, response.statusCode());
+            }
+            worker.join(3000);
+            JsonNode sent = MAPPER.readTree(seen.get());
+            assertEquals("cancel", sent.get("op").asText());
+            assertEquals("q1", sent.get("queryId").asText());
+            assertEquals("s1", sent.get("session").asText());
+        }
     }
 
     @Test

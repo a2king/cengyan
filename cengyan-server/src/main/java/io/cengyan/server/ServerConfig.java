@@ -12,6 +12,7 @@ import java.util.Properties;
 
 /** 启动时读完的配置。运行中不热更新。 */
 public record ServerConfig(
+        String host,
         int port,
         Path dataDir,
         int queryThreads,
@@ -29,6 +30,9 @@ public record ServerConfig(
         String rootPassword) {
 
     public ServerConfig {
+        if (host == null || host.isBlank()) {
+            throw new IllegalArgumentException("host 不能为空");
+        }
         if (port < 0 || port > 65535) {
             throw new IllegalArgumentException("port 超出范围");
         }
@@ -77,6 +81,7 @@ public record ServerConfig(
     /** 测试用：随机端口、独立数据目录、小块缓存。 */
     public ServerConfig forTest(Path dataDir) {
         return new ServerConfig(
+                host,
                 0,
                 dataDir,
                 2,
@@ -97,6 +102,7 @@ public record ServerConfig(
     private static ServerConfig from(Properties properties) {
         int threads = integer(properties, "query_threads", Runtime.getRuntime().availableProcessors());
         return new ServerConfig(
+                text(properties, "host", "0.0.0.0"),
                 integer(properties, "port", 19669),
                 Path.of(properties.getProperty("data_dir", "data")),
                 Math.max(threads, 1),
@@ -112,6 +118,20 @@ public record ServerConfig(
                 doubleValue(properties, "min_edge_ratio", 0.01),
                 doubleValue(properties, "min_accum_ratio", 0.001),
                 properties.getProperty("root_password", "cengyan"));
+    }
+
+    private static String text(Properties properties, String key, String fallback) {
+        String raw = properties.getProperty(key);
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        String value = raw.trim();
+        if (value.length() >= 2
+                && ((value.startsWith("'") && value.endsWith("'"))
+                || (value.startsWith("\"") && value.endsWith("\"")))) {
+            value = value.substring(1, value.length() - 1).trim();
+        }
+        return value.isEmpty() ? fallback : value;
     }
 
     private static int integer(Properties properties, String key, int fallback) {

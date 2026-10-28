@@ -8,8 +8,9 @@ import io.cengyan.catalog.GraphName;
 /** 一个连接上的当前图和登录用户。进程退出后消失。 */
 public final class SessionState {
     private GraphName current;
-    private String user;
-    private int role;
+    private volatile String user;
+    private volatile int role;
+    private int computeNode;
 
     public void use(GraphName graph) {
         if (graph == null) {
@@ -32,8 +33,8 @@ public final class SessionState {
         if (role != Auth.ROLE_READ && role != Auth.ROLE_WRITE) {
             throw new IllegalArgumentException("角色无效");
         }
-        this.user = name;
         this.role = role;
+        this.user = name;
     }
 
     /** 进程内测试没有登录用户，服务协议必须先登录。 */
@@ -51,5 +52,16 @@ public final class SessionState {
 
     public int role() {
         return role;
+    }
+
+    public int computeNode() {
+        return computeNode;
+    }
+
+    /** 第一次 execute 绑上计算节点后，后面的语句还在这台。 */
+    public void pinCompute(int nodeId) {
+        if (computeNode == 0 && nodeId != 0) {
+            computeNode = nodeId;
+        }
     }
 }

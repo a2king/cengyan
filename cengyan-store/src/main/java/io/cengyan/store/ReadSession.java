@@ -3,6 +3,7 @@ package io.cengyan.store;
 import io.cengyan.CancelToken;
 
 import java.util.List;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
@@ -26,6 +27,20 @@ public interface ReadSession extends AutoCloseable {
             long vid,
             int edgeTypeId,
             Direction direction,
+            int queryLimit,
+            int maxEdgesPerVertex,
+            Predicate<EdgeRef> predicate,
+            CancelToken cancel);
+
+    /**
+     * 一次扫过这个点上的多种边。{@code edgeTypeIds} 为空表示不限类型。
+     * 方向可以多于一个。检查过的键都计入每点上限，包含没选中的类型。
+     */
+    EdgeCursor scanEdges(
+            int graphId,
+            long vid,
+            Set<Integer> edgeTypeIds,
+            List<Direction> directions,
             int queryLimit,
             int maxEdgesPerVertex,
             Predicate<EdgeRef> predicate,

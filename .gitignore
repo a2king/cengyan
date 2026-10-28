@@ -1,4 +1,5 @@
 target/
+dev-scripts/
 gql-rewrite-plan.md
 .idea/
 *.iml
@@ -11,3 +12,6 @@ tmp/
 *.log
 *.sst
 .DS_Store
+cengyan-studio-web/node_modules/
+cengyan-studio-web/.npm-cache/
+cengyan-studio-web/dist/

@@ -28,7 +28,10 @@ final class TreeText {
                     + (insert.edge() == null ? "" : " " + edge(insert.edge()) + " " + node(insert.target())) + ")";
             case Stmt.Match match -> {
                 StringBuilder text = new StringBuilder("(match ");
-                text.append(node(match.source())).append(' ').append(edge(match.edge())).append(' ').append(node(match.target()));
+                text.append(node(match.source()));
+                if (match.edge() != null) {
+                    text.append(' ').append(edge(match.edge())).append(' ').append(node(match.target()));
+                }
                 if (match.where() != null) {
                     text.append(" (where ").append(expr(match.where())).append(')');
                 }
@@ -136,7 +139,9 @@ final class TreeText {
         if (edge.variable() != null) {
             text.append(' ').append(edge.variable());
         }
-        text.append(':').append(edge.typeName());
+        if (!edge.typeNames().isEmpty()) {
+            text.append(':').append(String.join("|", edge.typeNames()));
+        }
         if (edge.rank() != null) {
             text.append('@').append(edge.rank());
         }

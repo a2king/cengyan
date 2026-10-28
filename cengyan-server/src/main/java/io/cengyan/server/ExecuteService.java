@@ -3,9 +3,11 @@ package io.cengyan.server;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
+import io.cengyan.query.AdminCall;
 import io.cengyan.query.QueryEngine;
 import io.cengyan.query.QueryHandle;
 import io.cengyan.query.QueryLimits;
@@ -126,12 +128,17 @@ final class ExecuteService {
             return;
         }
         try {
-            queryPool.execute(() -> runAdmin(
-                    ctx, session, command, index,
+            queryPool.execute(() -> runAdmin(ctx, session, new AdminCall(
+                    command,
+                    index,
                     node.path("user").asText(""),
                     node.path("password").asText(""),
                     node.path("role").asText(""),
-                    timeoutMs));
+                    node.path("address").asText(""),
+                    node.path("nodeId").asInt(0),
+                    node.path("graph").asText(""),
+                    node.path("replicas").asInt(0),
+                    node.path("parts").asInt(0)), timeoutMs));
         } catch (RejectedExecutionException ex) {
             permits.release();
             error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
@@ -191,11 +198,7 @@ final class ExecuteService {
     private void runAdmin(
             ChannelHandlerContext ctx,
             String sessionId,
-            String command,
-            String index,
-            String user,
-            String password,
-            String role,
+            AdminCall call,
             long timeoutMs) {
         QueryHandle handle = QueryHandle.start(timeoutMs);
         queries.register(handle);
@@ -205,7 +208,7 @@ final class ExecuteService {
             if (!session.authenticated()) {
                 throw new CengyanException(ErrorCode.FORBIDDEN, "请先登录");
             }
-            QueryResult result = engine.admin(session, command, index, user, password, role, handle);
+            QueryResult result = engine.admin(session, call, handle);
             ObjectNode node = MAPPER.createObjectNode();
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);
@@ -224,6 +227,73 @@ final class ExecuteService {
         }
     }
 
+    void queries(ChannelHandlerContext ctx, JsonNode node) {
+        if (requireWrite(ctx, node) == null) {
+            return;
+        }
+        ArrayNode columns = MAPPER.createArrayNode();
+        columns.add("queryId");
+        columns.add("user");
+        columns.add("elapsedMs");
+        columns.add("query");
+        ArrayNode rows = MAPPER.createArrayNode();
+        for (RunningQuery running : queries.list()) {
+            ArrayNode row = rows.addArray();
+            row.add(running.queryId());
+            row.add(running.user());
+            row.add(running.elapsedMs());
+            row.add(running.statement());
+        }
+        ObjectNode response = MAPPER.createObjectNode();
+        response.put("code", "OK");
+        response.put("session", node.path("session").asText(""));
+        response.set("columns", columns);
+        response.set("rows", rows);
+        response.put("rowsAffected", rows.size());
+        write(ctx, response);
+    }
+
+    void cancel(ChannelHandlerContext ctx, JsonNode node) {
+        if (requireWrite(ctx, node) == null) {
+            return;
+        }
+        String queryId = node.path("queryId").asText("");
+        String sessionId = node.path("session").asText("");
+        if (queryId.isBlank()) {
+            error(ctx, sessionId, null, ErrorCode.SYNTAX, "缺少 queryId");
+            return;
+        }
+        if (queries.cancel(queryId, "被终止")) {
+            ObjectNode response = MAPPER.createObjectNode();
+            response.put("code", "OK");
+            response.put("session", sessionId);
+            response.put("queryId", queryId);
+            response.put("message", "已终止");
+            write(ctx, response);
+            return;
+        }
+        error(ctx, sessionId, queryId, ErrorCode.QUERY_CANCELED, "没有找到该查询");
+    }
+
+    private SessionState requireWrite(ChannelHandlerContext ctx, JsonNode node) {
+        String sessionId = node.path("session").asText("");
+        if (sessionId.isBlank()) {
+            error(ctx, "", null, ErrorCode.FORBIDDEN, "请先登录");
+            return null;
+        }
+        SessionState session = sessions.open(sessionId);
+        // 不占用会话锁。正在执行的语句会一直握着这把锁，管理请求要能在它运行期间列出并终止。
+        if (!session.authenticated()) {
+            error(ctx, sessionId, null, ErrorCode.FORBIDDEN, "请先登录");
+            return null;
+        }
+        if (session.readOnly()) {
+            error(ctx, sessionId, null, ErrorCode.FORBIDDEN, "只读用户不能管理正在执行的查询");
+            return null;
+        }
+        return session;
+    }
+
     void onInactive(ChannelHandlerContext ctx) {
         Set<String> ids = byChannel.remove(ctx.channel().id());
         if (ids == null) {
@@ -236,13 +306,18 @@ final class ExecuteService {
 
     private void run(ChannelHandlerContext ctx, String sessionId, String query, Map<String, Object> params, long timeoutMs) {
         QueryHandle handle = QueryHandle.start(timeoutMs);
-        queries.register(handle);
-        byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
+        boolean registered = false;
         try {
             SessionState session = sessions.open(sessionId);
-            if (!session.authenticated()) {
-                throw new CengyanException(ErrorCode.FORBIDDEN, "请先登录");
+            synchronized (session) {
+                if (!session.authenticated()) {
+                    throw new CengyanException(ErrorCode.FORBIDDEN, "请先登录");
+                }
+                handle.describe(session.user(), query);
             }
+            queries.register(handle);
+            registered = true;
+            byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
             QueryResult result = engine.execute(
                     session, query, params, new QueryLimits(
                             config.maxEdgesPerVertex(),
@@ -264,7 +339,11 @@ final class ExecuteService {
             log.warn("执行查询失败：{}", ex.toString());
             error(ctx, sessionId, handle.id(), ErrorCode.INTERNAL, "执行查询失败");
         } finally {
-            finish(ctx, handle);
+            if (registered) {
+                finish(ctx, handle);
+            } else {
+                permits.release();
+            }
         }
     }
 

@@ -4,6 +4,7 @@ import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
 import io.cengyan.catalog.Auth;
 import io.cengyan.catalog.Catalog;
+import io.cengyan.catalog.Membership;
 import io.cengyan.query.QueryEngine;
 import io.cengyan.store.GraphStore;
 import io.cengyan.store.StoreOptions;
@@ -41,8 +42,10 @@ public final class GraphDbServer implements AutoCloseable {
     private final ServerConfig config;
     private final GraphStore store;
     private final Catalog catalog;
+    private final Membership membership;
     private final QueryRegistry queries;
     private final ScheduledExecutorService timeoutThread;
+    private final ScheduledExecutorService compensateThread;
     private final ExecutorService queryPool;
     private final EventLoopGroup boss;
     private final EventLoopGroup worker;
@@ -53,8 +56,10 @@ public final class GraphDbServer implements AutoCloseable {
             ServerConfig config,
             GraphStore store,
             Catalog catalog,
+            Membership membership,
             QueryRegistry queries,
             ScheduledExecutorService timeoutThread,
+            ScheduledExecutorService compensateThread,
             ExecutorService queryPool,
             EventLoopGroup boss,
             EventLoopGroup worker,
@@ -62,8 +67,10 @@ public final class GraphDbServer implements AutoCloseable {
         this.config = config;
         this.store = store;
         this.catalog = catalog;
+        this.membership = membership;
         this.queries = queries;
         this.timeoutThread = timeoutThread;
+        this.compensateThread = compensateThread;
         this.queryPool = queryPool;
         this.boss = boss;
         this.worker = worker;
@@ -75,13 +82,15 @@ public final class GraphDbServer implements AutoCloseable {
         ServerConfig config = ServerConfig.load(configPath);
         GraphDbServer server = start(config);
         Runtime.getRuntime().addShutdownHook(new Thread(server::close, "cengyan-shutdown"));
-        log.info("层岩图数据库已监听端口 {}", server.port());
+        log.info("层岩图数据库已监听 {}:{}", config.host(), server.port());
         server.channel.closeFuture().sync();
     }
 
     public static GraphDbServer start(ServerConfig config) {
         GraphStore store = null;
+        Membership membership = null;
         ScheduledExecutorService timeoutThread = null;
+        ScheduledExecutorService compensateThread = null;
         ExecutorService queryPool = null;
         EventLoopGroup boss = null;
         EventLoopGroup worker = null;
@@ -91,6 +100,8 @@ public final class GraphDbServer implements AutoCloseable {
             log.info("已加载目录，共 {} 张图", catalog.graphs().size());
             Auth auth = new Auth(store);
             auth.ensureRoot(config.rootPassword());
+            membership = Membership.open(
+                    catalog, store, config.host() + ":" + config.port(), StoreOptions.server(config.blockCacheBytes()));
             QueryRegistry queries = new QueryRegistry();
             Sessions sessions = new Sessions();
             timeoutThread = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -107,6 +118,18 @@ public final class GraphDbServer implements AutoCloseable {
                     log.warn("超时扫描失败：{}", ex.toString());
                 }
             }, 100, 100, TimeUnit.MILLISECONDS);
+            compensateThread = Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "cengyan-compensate");
+                thread.setDaemon(true);
+                return thread;
+            });
+            compensateThread.scheduleAtFixedRate(() -> {
+                try {
+                    catalog.recoverTxn();
+                } catch (RuntimeException ex) {
+                    log.warn("补偿扫描失败：{}", ex.toString());
+                }
+            }, 10, 10, TimeUnit.SECONDS);
             queryPool = Executors.newFixedThreadPool(config.queryThreads(), runnable -> {
                 Thread thread = new Thread(runnable, "cengyan-query");
                 thread.setDaemon(false);
@@ -117,8 +140,9 @@ public final class GraphDbServer implements AutoCloseable {
             QueryEngine engine = new QueryEngine(
                     catalog, store, config.duckdbMemory(), config.duckdbTempDirectory(),
                     config.minEdgeRatio(), config.minAccumRatio(), auth);
+            engine.bind(membership);
             ExecuteService execute = new ExecuteService(engine, config, queries, queryPool, sessions);
-            LineServer lineServer = new LineServer(queries, execute);
+            LineServer lineServer = new LineServer(execute);
             ServerBootstrap bootstrap = new ServerBootstrap();
             bootstrap.group(boss, worker)
                     .channel(NioServerSocketChannel.class)
@@ -134,8 +158,10 @@ public final class GraphDbServer implements AutoCloseable {
                             ch.pipeline().addLast(lineServer);
                         }
                     });
-            Channel channel = bootstrap.bind(config.port()).sync().channel();
-            return new GraphDbServer(config, store, catalog, queries, timeoutThread, queryPool, boss, worker, channel);
+            Channel channel = bootstrap.bind(new InetSocketAddress(config.host(), config.port())).sync().channel();
+            return new GraphDbServer(
+                    config, store, catalog, membership, queries, timeoutThread, compensateThread,
+                    queryPool, boss, worker, channel);
         } catch (Exception ex) {
             if (worker != null) {
                 worker.shutdownGracefully();
@@ -146,8 +172,14 @@ public final class GraphDbServer implements AutoCloseable {
             if (queryPool != null) {
                 queryPool.shutdownNow();
             }
+            if (compensateThread != null) {
+                compensateThread.shutdownNow();
+            }
             if (timeoutThread != null) {
                 timeoutThread.shutdownNow();
+            }
+            if (membership != null) {
+                membership.close();
             }
             if (store != null) {
                 store.close();
@@ -192,7 +224,9 @@ public final class GraphDbServer implements AutoCloseable {
             worker.shutdownGracefully().syncUninterruptibly();
             boss.shutdownGracefully().syncUninterruptibly();
             queryPool.shutdownNow();
+            compensateThread.shutdownNow();
             timeoutThread.shutdownNow();
+            membership.close();
             store.close();
             log.info("层岩图数据库已停止");
         } catch (RuntimeException ex) {

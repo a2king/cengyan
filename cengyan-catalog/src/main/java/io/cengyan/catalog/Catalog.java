@@ -46,6 +46,8 @@ public final class Catalog {
     private final ConcurrentHashMap<Integer, ConcurrentHashMap<String, NodeType>> nodeTypes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, ConcurrentHashMap<String, RelType>> relTypes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, ConcurrentHashMap<String, IndexDef>> indexes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, Space> spaces = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, Set<Integer>> moving = new ConcurrentHashMap<>();
 
     private Catalog(GraphStore store) {
         this.store = store;
@@ -57,7 +59,23 @@ public final class Catalog {
         }
         Catalog catalog = new Catalog(store);
         catalog.reload();
+        catalog.healIncomplete();
+        catalog.recoverTxn();
+        store.setPartResolver(catalog::partOf);
         return catalog;
+    }
+
+    /** 分片数为 1 时结果是 0，已有数据不用改键。 */
+    public int partOf(int graphId, long vid) {
+        return KeyCodec.partOf(vid, partCount(graphId));
+    }
+
+    public int partCount(int graphId) {
+        Space space = spaces.get(graphId);
+        if (space == null || space.parts <= 0) {
+            return 1;
+        }
+        return space.parts;
     }
 
     /** 只查一次名字主键。图名和别名都返回同一个 graphId，再读规范名。 */
@@ -109,10 +127,12 @@ public final class Catalog {
                 StoreBatch batch = new StoreBatch();
                 batch.put(Cf.CATALOG, KeyCodec.nameKey(name), CatalogCodec.nameValue(GraphName.GRAPH, graphId));
                 batch.put(Cf.CATALOG, KeyCodec.graphRecordKey(graphId), CatalogCodec.graphRecord(name));
+                batch.put(Cf.CATALOG, KeyCodec.spaceKey(graphId), ClusterCodec.space(ClusterCodec.MODE_NORMAL, 1, 1));
                 batch.put(Cf.CATALOG, KeyCodec.nextGraphIdKey(), counterAfter(graphId, false));
                 store.mutate(batch);
                 names.put(name, new NameEntry(GraphName.GRAPH, graphId, name));
                 canonicals.put(graphId, name);
+                spaces.put(graphId, new Space(ClusterCodec.MODE_NORMAL, 1, 1));
                 log.info("已创建图 {}，编号 {}", name, graphId);
                 return graphId;
             }
@@ -140,6 +160,7 @@ public final class Catalog {
                     throw new CengyanException(ErrorCode.INTERNAL, "图记录丢失：" + graphId);
                 }
                 String canonical = CatalogCodec.graphRecordName(record);
+                requireWritable(graphId);
                 StoreBatch batch = new StoreBatch();
                 batch.put(Cf.CATALOG, KeyCodec.nameKey(alias), CatalogCodec.nameValue(GraphName.ALIAS, graphId));
                 batch.put(Cf.CATALOG, KeyCodec.aliasRecordKey(graphId, alias), EMPTY);
@@ -163,6 +184,7 @@ public final class Catalog {
                     throw new CengyanException(ErrorCode.NAME_CONFLICT, "这个名字是图，不是别名");
                 }
                 int graphId = CatalogCodec.nameGraphId(value);
+                requireWritable(graphId);
                 StoreBatch batch = new StoreBatch();
                 batch.delete(Cf.CATALOG, KeyCodec.nameKey(alias));
                 batch.delete(Cf.CATALOG, KeyCodec.aliasRecordKey(graphId, alias));
@@ -186,6 +208,7 @@ public final class Catalog {
                     throw new CengyanException(ErrorCode.DROP_ALIAS_AS_GRAPH, "不能用别名删除图");
                 }
                 int graphId = CatalogCodec.nameGraphId(value);
+                requireWritable(graphId);
                 StoreBatch batch = new StoreBatch();
                 List<String> aliasNames = new ArrayList<>();
                 for (byte[] key : session.keysWithPrefix(Cf.CATALOG, KeyCodec.aliasPrefix(graphId))) {
@@ -204,6 +227,9 @@ public final class Catalog {
                 batch.delete(Cf.CATALOG, KeyCodec.graphRecordKey(graphId));
                 batch.delete(Cf.CATALOG, KeyCodec.nextNodeTypeKey(graphId));
                 batch.delete(Cf.CATALOG, KeyCodec.nextRelTypeKey(graphId));
+                deletePrefix(batch, session, Cf.CATALOG, KeyCodec.partVotePrefix(graphId));
+                deletePrefix(batch, session, Cf.CATALOG, KeyCodec.movePrefix(graphId));
+                batch.delete(Cf.CATALOG, KeyCodec.spaceKey(graphId));
                 byte[] dataPrefix = KeyCodec.graphIdPrefix(graphId);
                 deletePrefix(batch, session, Cf.VERTEX, dataPrefix);
                 deletePrefix(batch, session, Cf.EDGE, dataPrefix);
@@ -215,6 +241,8 @@ public final class Catalog {
                 nodeTypes.remove(graphId);
                 relTypes.remove(graphId);
                 indexes.remove(graphId);
+                spaces.remove(graphId);
+                moving.remove(graphId);
                 log.info("已删除图 {}，编号 {}", name, graphId);
                 return null;
             }
@@ -282,9 +310,11 @@ public final class Catalog {
         checkIdentifier(typeName);
         return store.withWriteLock(() -> {
             requireGraph(graphId);
+            requireWritable(graphId);
+            requirePart(graphId, partOf(graphId, vid));
             NodeType type = nodeType(graphId, typeName);
             byte[] encoded = PropCodec.encode(type.schemaVersion(), type.properties(), properties);
-            int part = KeyCodec.partOf(vid);
+            int part = partOf(graphId, vid);
             byte[] key = KeyCodec.vertexKey(graphId, part, vid, type.id());
             try (ReadSession session = store.read()) {
                 byte[] existing = session.get(Cf.VERTEX, key);
@@ -308,6 +338,11 @@ public final class Catalog {
         });
     }
 
+    /**
+     * 插入一条边。两端在同一分片时一次提交。
+     * 跨分片时先提交出边、属性和补偿标记，再提交入边，最后删掉标记。
+     * 补偿未完成时查询可能只看见出边。
+     */
     public boolean insertRel(
             int graphId,
             String relType,
@@ -320,13 +355,13 @@ public final class Catalog {
             throw new IllegalArgumentException("边的两端不能为空");
         }
         checkIdentifier(relType);
-        int outPart = KeyCodec.partOf(source.vid());
-        int inPart = KeyCodec.partOf(target.vid());
-        if (outPart != inPart) {
-            throw new CengyanException(ErrorCode.CROSS_PART_UNSUPPORTED, "边的两端落在不同分片");
-        }
         return store.withWriteLock(() -> {
             requireGraph(graphId);
+            requireWritable(graphId);
+            int outPart = partOf(graphId, source.vid());
+            int inPart = partOf(graphId, target.vid());
+            requirePart(graphId, outPart);
+            requirePart(graphId, inPart);
             RelType type = relType(graphId, relType);
             byte[] encoded = PropCodec.encode(type.schemaVersion(), type.properties(), properties);
             byte[] propKey = KeyCodec.propKey(graphId, type.id(), rank, source.vid(), target.vid());
@@ -339,6 +374,10 @@ public final class Catalog {
                     if (ifNotExists && existingProp != null) {
                         return false;
                     }
+                }
+                if (outPart != inPart) {
+                    return insertAcross(session, graphId, type, rank, source, target, encoded, propKey,
+                            outPart, inPart, vertices, edgeIndexes, existingProp);
                 }
                 StoreBatch batch = new StoreBatch();
                 batch.put(Cf.EDGE, KeyCodec.edgeKey(
@@ -359,7 +398,7 @@ public final class Catalog {
                 }
                 for (VertexPut vertex : vertices) {
                     byte[] vertexKey = KeyCodec.vertexKey(
-                            graphId, KeyCodec.partOf(vertex.vid()), vertex.vid(), vertex.tagId());
+                            graphId, partOf(graphId, vertex.vid()), vertex.vid(), vertex.tagId());
                     batch.put(Cf.VERTEX, vertexKey, vertex.value());
                     List<IndexDef> nodeIndexes = indexesFor(graphId, true, vertex.tagId());
                     if (nodeIndexes.isEmpty()) {
@@ -387,7 +426,7 @@ public final class Catalog {
 
     public Map<String, Object> readVertex(int graphId, String typeName, long vid) {
         NodeType type = nodeType(graphId, typeName);
-        byte[] key = KeyCodec.vertexKey(graphId, KeyCodec.partOf(vid), vid, type.id());
+        byte[] key = KeyCodec.vertexKey(graphId, partOf(graphId, vid), vid, type.id());
         try (ReadSession session = store.read()) {
             byte[] value = session.get(Cf.VERTEX, key);
             if (value == null) {
@@ -452,6 +491,7 @@ public final class Catalog {
 
     private int applyLocked(int graphId, List<Mutation> mutations, int maxEdgesPerVertex) {
         requireGraph(graphId);
+        requireWritable(graphId);
         StoreBatch batch = new StoreBatch();
         boolean edgeKeys = false;
         int affected = 0;
@@ -492,7 +532,7 @@ public final class Catalog {
     private int writeVertex(ReadSession session, StoreBatch batch, int graphId, Mutation.SetVertex set) {
         NodeType type = nodeType(graphId, set.typeName());
         Map<String, Object> updates = checkedUpdates(type.properties(), set.updates());
-        byte[] key = KeyCodec.vertexKey(graphId, KeyCodec.partOf(set.vid()), set.vid(), type.id());
+        byte[] key = KeyCodec.vertexKey(graphId, partOf(graphId, set.vid()), set.vid(), type.id());
         byte[] raw = session.get(Cf.VERTEX, key);
         if (raw == null) {
             return 0;
@@ -514,7 +554,7 @@ public final class Catalog {
     }
 
     private int writeEdge(ReadSession session, StoreBatch batch, int graphId, Mutation.SetEdge set) {
-        samePart(set.outSrc(), set.outDst());
+        ensureParts(graphId, set.outSrc(), set.outDst());
         RelType type = relType(graphId, set.typeName());
         Map<String, Object> updates = checkedUpdates(type.properties(), set.updates());
         byte[] key = KeyCodec.propKey(graphId, type.id(), set.rank(), set.outSrc(), set.outDst());
@@ -539,7 +579,7 @@ public final class Catalog {
     }
 
     private boolean removeEdge(ReadSession session, StoreBatch batch, int graphId, Mutation.DeleteEdge delete) {
-        samePart(delete.outSrc(), delete.outDst());
+        ensureParts(graphId, delete.outSrc(), delete.outDst());
         RelType type = relType(graphId, delete.typeName());
         byte[] prop = KeyCodec.propKey(graphId, type.id(), delete.rank(), delete.outSrc(), delete.outDst());
         byte[] out = edgeKey(graphId, type.id(), Direction.OUT, delete.outSrc(), delete.rank(), delete.outDst());
@@ -568,7 +608,7 @@ public final class Catalog {
     /** @return 0 没有这个点，1 只删了点，2 还删了边 */
     private int removeVertex(
             ReadSession session, StoreBatch batch, int graphId, long vid, int maxEdgesPerVertex) {
-        int part = KeyCodec.partOf(vid);
+        int part = partOf(graphId, vid);
         byte[] prefix = KeyCodec.vertexPrefix(graphId, part, vid);
         LinkedHashSet<EdgeRef> edges = new LinkedHashSet<>();
         for (byte[] key : session.keysWithPrefix(Cf.EDGE, prefix)) {
@@ -586,7 +626,7 @@ public final class Catalog {
             return 0;
         }
         for (EdgeRef edge : edges) {
-            samePart(edge.outSrc(), edge.outDst());
+            ensureParts(graphId, edge.outSrc(), edge.outDst());
             dropEdgeIndex(session, batch, graphId, edge);
             batch.delete(Cf.EDGE, edgeKey(graphId, edge.edgeTypeId(), Direction.OUT, edge.outSrc(), edge.rank(), edge.outDst()));
             batch.delete(Cf.EDGE, edgeKey(graphId, edge.edgeTypeId(), Direction.IN, edge.outDst(), edge.rank(), edge.outSrc()));
@@ -613,6 +653,7 @@ public final class Catalog {
             throw new CengyanException(ErrorCode.SYNTAX, "索引至少要有一列");
         }
         return store.withWriteLock(() -> {
+            requireWritable(graphId);
             try (ReadSession session = store.read()) {
                 requireGraphRecord(session, graphId);
                 if (indexes.getOrDefault(graphId, new ConcurrentHashMap<>()).containsKey(name)) {
@@ -654,6 +695,7 @@ public final class Catalog {
     public void dropIndex(int graphId, String name) {
         checkIdentifier(name);
         store.withWriteLock(() -> {
+            requireWritable(graphId);
             IndexDef index = requireIndex(graphId, name);
             try (ReadSession session = store.read()) {
                 StoreBatch batch = new StoreBatch();
@@ -676,6 +718,7 @@ public final class Catalog {
     public int rebuildIndex(int graphId, String name, CancelToken cancel) {
         checkIdentifier(name);
         return store.withWriteLock(() -> {
+            requireWritable(graphId);
             IndexDef index = requireIndex(graphId, name);
             storeReady(graphId, index, false);
             try (ReadSession session = store.read()) {
@@ -828,14 +871,13 @@ public final class Catalog {
         return false;
     }
 
-    private static void samePart(long left, long right) {
-        if (KeyCodec.partOf(left) != KeyCodec.partOf(right)) {
-            throw new CengyanException(ErrorCode.CROSS_PART_UNSUPPORTED, "边的两端落在不同分片");
-        }
+    private void ensureParts(int graphId, long left, long right) {
+        requirePart(graphId, partOf(graphId, left));
+        requirePart(graphId, partOf(graphId, right));
     }
 
-    private static byte[] edgeKey(int graphId, int edgeTypeId, Direction direction, long src, long rank, long dst) {
-        return KeyCodec.edgeKey(graphId, KeyCodec.partOf(src), src, edgeTypeId, direction.code(), rank, dst);
+    private byte[] edgeKey(int graphId, int edgeTypeId, Direction direction, long src, long rank, long dst) {
+        return KeyCodec.edgeKey(graphId, partOf(graphId, src), src, edgeTypeId, direction.code(), rank, dst);
     }
 
     private void reload() {
@@ -844,6 +886,8 @@ public final class Catalog {
         nodeTypes.clear();
         relTypes.clear();
         indexes.clear();
+        spaces.clear();
+        moving.clear();
         try (ReadSession session = store.read()) {
             Map<Integer, String> loaded = new HashMap<>();
             for (byte[] key : session.keysWithPrefix(Cf.CATALOG, KeyCodec.graphRecordPrefix())) {
@@ -882,6 +926,28 @@ public final class Catalog {
                         decoded.unique(),
                         decoded.ready());
             }
+            for (byte[] key : session.keysWithPrefix(Cf.CATALOG, KeyCodec.spacePrefix())) {
+                if (key.length != 3) {
+                    continue;
+                }
+                int graphId = KeyCodec.graphIdFromMarked(key);
+                byte[] value = session.get(Cf.CATALOG, key);
+                spaces.put(graphId, new Space(
+                        ClusterCodec.spaceMode(value),
+                        ClusterCodec.spaceReplicas(value),
+                        ClusterCodec.spaceParts(value)));
+            }
+            for (byte[] key : session.keysWithPrefix(Cf.CATALOG, new byte[] {0x53})) {
+                if (key.length != 5) {
+                    continue;
+                }
+                byte[] value = session.get(Cf.CATALOG, key);
+                if (value != null && ClusterCodec.moveState(value) == ClusterCodec.MOVE_MOVING) {
+                    int graphId = KeyCodec.graphIdFromMarked(key);
+                    moving.computeIfAbsent(graphId, ignored -> ConcurrentHashMap.newKeySet())
+                            .add(KeyCodec.movePartId(key));
+                }
+            }
         }
     }
 
@@ -889,6 +955,7 @@ public final class Catalog {
         checkIdentifier(name);
         List<PropDef> copied = copyProperties(properties);
         return store.withWriteLock(() -> {
+            requireWritable(graphId);
             try (ReadSession session = store.read()) {
                 requireGraphRecord(session, graphId);
                 if (typeNameTaken(session, graphId, name)) {
@@ -925,6 +992,7 @@ public final class Catalog {
             throw new CengyanException(ErrorCode.TYPE_MISMATCH, "只能在末尾增加可空列");
         }
         return store.withWriteLock(() -> {
+            requireWritable(graphId);
             try (ReadSession session = store.read()) {
                 requireGraphRecord(session, graphId);
                 KeyCodec.TypeKey typeKey = findTypeKey(session, graphId, kind, typeName);
@@ -1242,6 +1310,420 @@ public final class Catalog {
     }
 
     private record NameEntry(int kind, int graphId, String canonical) {
+    }
+
+    /**
+     * 把已有键按新的分片数重写。只改计算函数会让旧键读不到。
+     * 分片数仍是 1 时键的分片号保持 0。
+     */
+    public void setPartCount(int graphId, int partCount) {
+        if (partCount < 1 || partCount > 65535) {
+            throw new CengyanException(ErrorCode.SYNTAX, "分片数必须在 1 和 65535 之间");
+        }
+        store.withWriteLock(() -> {
+            requireGraph(graphId);
+            requireWritable(graphId);
+            if (!movingParts(graphId).isEmpty()) {
+                throw new CengyanException(ErrorCode.PART_READONLY, "分片正在搬迁");
+            }
+            Space space = spaceOf(graphId);
+            if (space.parts == partCount) {
+                return null;
+            }
+            try (ReadSession session = store.read()) {
+                StoreBatch batch = new StoreBatch();
+                byte[] prefix = KeyCodec.graphIdPrefix(graphId);
+                for (byte[] key : session.keysWithPrefix(Cf.VERTEX, prefix)) {
+                    if (key.length != KeyCodec.VERTEX_KEY_LENGTH) {
+                        continue;
+                    }
+                    int desired = KeyCodec.partOf(KeyCodec.vidOf(key), partCount);
+                    if (desired == KeyCodec.partIdOfVertex(key)) {
+                        continue;
+                    }
+                    byte[] value = session.get(Cf.VERTEX, key);
+                    batch.delete(Cf.VERTEX, key);
+                    if (value != null) {
+                        batch.put(Cf.VERTEX, KeyCodec.vertexKey(
+                                graphId, desired, KeyCodec.vidOf(key), KeyCodec.tagIdOf(key)), value);
+                    }
+                }
+                for (byte[] key : session.keysWithPrefix(Cf.EDGE, prefix)) {
+                    if (key.length != KeyCodec.EDGE_KEY_LENGTH) {
+                        continue;
+                    }
+                    KeyCodec.DecodedEdge decoded = KeyCodec.decodeEdge(key);
+                    int desired = KeyCodec.partOf(decoded.src(), partCount);
+                    if (desired == decoded.partId()) {
+                        continue;
+                    }
+                    batch.delete(Cf.EDGE, key);
+                    batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                            graphId, desired, decoded.src(), decoded.edgeTypeId(), decoded.direction(),
+                            decoded.rank(), decoded.dst()), EMPTY);
+                }
+                for (byte[] key : session.keysWithPrefix(Cf.TXN, prefix)) {
+                    if (key.length != 32) {
+                        continue;
+                    }
+                    int desired = KeyCodec.partOf(KeyCodec.txnSrc(key), partCount);
+                    if (desired == KeyCodec.txnPartId(key)) {
+                        continue;
+                    }
+                    byte[] value = session.get(Cf.TXN, key);
+                    batch.delete(Cf.TXN, key);
+                    if (value != null) {
+                        batch.put(Cf.TXN, KeyCodec.txnKey(
+                                graphId, desired, KeyCodec.txnEdgeTypeId(key), KeyCodec.txnRank(key),
+                                KeyCodec.txnSrc(key), KeyCodec.txnDst(key)), value);
+                    }
+                }
+                List<Integer> holders = new ArrayList<>();
+                for (byte[] key : session.keysWithPrefix(Cf.CATALOG, KeyCodec.partVotePrefix(graphId, 0))) {
+                    if (key.length != 7) {
+                        continue;
+                    }
+                    byte[] value = session.get(Cf.CATALOG, key);
+                    if (value != null && ClusterCodec.voteKind(value) == ClusterCodec.VOTE_VOTER) {
+                        holders.add(KeyCodec.voteNodeId(key));
+                    }
+                }
+                for (int part = 0; part < partCount; part++) {
+                    if (!session.keysWithPrefix(Cf.CATALOG, KeyCodec.partVotePrefix(graphId, part)).isEmpty()) {
+                        continue;
+                    }
+                    for (int nodeId : holders) {
+                        batch.put(Cf.CATALOG, KeyCodec.partVoteKey(graphId, part, nodeId),
+                                ClusterCodec.vote(ClusterCodec.VOTE_VOTER));
+                    }
+                }
+                batch.put(Cf.CATALOG, KeyCodec.spaceKey(graphId),
+                        ClusterCodec.space(space.mode, space.replicas, partCount));
+                if (!batch.isEmpty()) {
+                    store.mutate(batch);
+                }
+            }
+            spaces.put(graphId, new Space(space.mode, space.replicas, partCount));
+            log.info("图 {} 的分片数已改为 {}", graphId, partCount);
+            return null;
+        });
+    }
+
+    public void markReplicaSync(int graphId) {
+        store.withWriteLock(() -> {
+            requireGraph(graphId);
+            Space space = spaceOf(graphId);
+            if (space.mode == ClusterCodec.MODE_SYNC) {
+                throw new CengyanException(ErrorCode.SPACE_READONLY, "空间正在同步副本");
+            }
+            store.mutate(spaceBatch(graphId, ClusterCodec.MODE_SYNC, space.replicas, space.parts));
+            spaces.put(graphId, new Space(ClusterCodec.MODE_SYNC, space.replicas, space.parts));
+            log.info("图 {} 进入副本同步，写入暂时拒绝", graphId);
+            return null;
+        });
+    }
+
+    public void finishReplica(int graphId, int replicas) {
+        store.withWriteLock(() -> {
+            requireGraph(graphId);
+            Space space = spaceOf(graphId);
+            store.mutate(spaceBatch(graphId, ClusterCodec.MODE_NORMAL, replicas, space.parts));
+            spaces.put(graphId, new Space(ClusterCodec.MODE_NORMAL, replicas, space.parts));
+            return null;
+        });
+    }
+
+    public void markMoving(int graphId, int partId) {
+        store.withWriteLock(() -> {
+            requireGraph(graphId);
+            requireWritable(graphId);
+            if (movingParts(graphId).contains(partId)) {
+                throw new CengyanException(ErrorCode.PART_READONLY, "分片 " + partId + " 正在搬迁");
+            }
+            StoreBatch batch = new StoreBatch();
+            batch.put(Cf.CATALOG, KeyCodec.moveKey(graphId, partId), ClusterCodec.move(ClusterCodec.MOVE_MOVING));
+            store.mutate(batch);
+            movingParts(graphId).add(partId);
+            log.info("图 {} 的分片 {} 开始搬迁", graphId, partId);
+            return null;
+        });
+    }
+
+    public void clearMoving(int graphId, int partId) {
+        store.withWriteLock(() -> {
+            StoreBatch batch = new StoreBatch();
+            batch.delete(Cf.CATALOG, KeyCodec.moveKey(graphId, partId));
+            store.mutate(batch);
+            movingParts(graphId).remove(partId);
+            return null;
+        });
+    }
+
+    public void finishMove(int graphId, int partId, int sourceNode, int targetNode) {
+        store.withWriteLock(() -> {
+            StoreBatch batch = new StoreBatch();
+            batch.put(Cf.CATALOG, KeyCodec.partVoteKey(graphId, partId, targetNode),
+                    ClusterCodec.vote(ClusterCodec.VOTE_VOTER));
+            if (sourceNode != targetNode) {
+                batch.delete(Cf.CATALOG, KeyCodec.partVoteKey(graphId, partId, sourceNode));
+            }
+            batch.delete(Cf.CATALOG, KeyCodec.moveKey(graphId, partId));
+            store.mutate(batch);
+            movingParts(graphId).remove(partId);
+            log.info("图 {} 的分片 {} 已搬到节点 {}", graphId, partId, targetNode);
+            return null;
+        });
+    }
+
+    /** 每 10 秒以及打开库时调用。state 1 补入边，state 2 删掉两侧。 */
+    public void recoverTxn() {
+        store.withWriteLock(() -> {
+            List<byte[]> keys = new ArrayList<>();
+            try (ReadSession session = store.read()) {
+                for (int graphId : List.copyOf(canonicals.keySet())) {
+                    keys.addAll(session.keysWithPrefix(Cf.TXN, KeyCodec.graphIdPrefix(graphId)));
+                }
+                for (byte[] key : keys) {
+                    if (key.length != 32) {
+                        continue;
+                    }
+                    byte[] value = session.get(Cf.TXN, key);
+                    if (value == null || value.length < 1) {
+                        continue;
+                    }
+                    int state = ClusterCodec.txnState(value);
+                    if (state == ClusterCodec.TXN_OUT) {
+                        redoInEdge(key);
+                    } else if (state == ClusterCodec.TXN_ROLLBACK) {
+                        eraseTxn(key, ClusterCodec.txnProperties(value));
+                    }
+                }
+            }
+            return null;
+        });
+    }
+
+    private boolean insertAcross(
+            ReadSession session,
+            int graphId,
+            RelType type,
+            long rank,
+            VertexWrite source,
+            VertexWrite target,
+            byte[] encoded,
+            byte[] propKey,
+            int outPart,
+            int inPart,
+            List<VertexPut> vertices,
+            List<IndexDef> edgeIndexes,
+            byte[] existingProp) {
+        byte[] txnKey = KeyCodec.txnKey(graphId, outPart, type.id(), rank, source.vid(), target.vid());
+        StoreBatch outBatch = new StoreBatch();
+        outBatch.put(Cf.EDGE, KeyCodec.edgeKey(
+                graphId, outPart, source.vid(), type.id(), Direction.OUT.code(), rank, target.vid()), EMPTY);
+        outBatch.put(Cf.PROP, propKey, encoded);
+        outBatch.put(Cf.TXN, txnKey, ClusterCodec.txn(ClusterCodec.TXN_OUT, encoded));
+        if (!edgeIndexes.isEmpty()) {
+            IndexMaintenance.sync(
+                    session,
+                    outBatch,
+                    edgeIndexes,
+                    type.properties(),
+                    existingProp == null ? null : PropCodec.decode(type.properties(), type.schemaVersion(), existingProp),
+                    PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
+                    graphId,
+                    KeyCodec.edgeIdentity(type.id(), rank, source.vid(), target.vid()));
+        }
+        putVertices(session, outBatch, graphId, vertices, outPart);
+        store.mutate(outBatch);
+        try {
+            StoreBatch inBatch = new StoreBatch();
+            inBatch.put(Cf.EDGE, KeyCodec.edgeKey(
+                    graphId, inPart, target.vid(), type.id(), Direction.IN.code(), rank, source.vid()), EMPTY);
+            putVertices(session, inBatch, graphId, vertices, inPart);
+            store.mutate(inBatch);
+        } catch (Exception ex) {
+            rollbackTxn(graphId, type, rank, source.vid(), target.vid(), outPart, encoded, propKey, txnKey, edgeIndexes);
+            throw new CengyanException(ErrorCode.INTERNAL, "入边写入失败：" + ex.getMessage(), ex);
+        }
+        StoreBatch done = new StoreBatch();
+        done.delete(Cf.TXN, txnKey);
+        store.mutate(done);
+        return true;
+    }
+
+    private void rollbackTxn(
+            int graphId,
+            RelType type,
+            long rank,
+            long outSrc,
+            long outDst,
+            int outPart,
+            byte[] encoded,
+            byte[] propKey,
+            byte[] txnKey,
+            List<IndexDef> edgeIndexes) {
+        StoreBatch mark = new StoreBatch();
+        mark.put(Cf.TXN, txnKey, ClusterCodec.txn(ClusterCodec.TXN_ROLLBACK, encoded));
+        store.mutate(mark);
+        eraseTxn(KeyCodec.txnKey(graphId, outPart, type.id(), rank, outSrc, outDst), encoded);
+        if (!edgeIndexes.isEmpty()) {
+            try (ReadSession session = store.read()) {
+                StoreBatch indexes = new StoreBatch();
+                IndexMaintenance.sync(
+                        session,
+                        indexes,
+                        edgeIndexes,
+                        type.properties(),
+                        PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
+                        null,
+                        graphId,
+                        KeyCodec.edgeIdentity(type.id(), rank, outSrc, outDst));
+                if (!indexes.isEmpty()) {
+                    store.mutate(indexes);
+                }
+            }
+        }
+    }
+
+    private void redoInEdge(byte[] txnKey) {
+        int graphId = KeyCodec.txnGraphId(txnKey);
+        int edgeTypeId = KeyCodec.txnEdgeTypeId(txnKey);
+        long rank = KeyCodec.txnRank(txnKey);
+        long outSrc = KeyCodec.txnSrc(txnKey);
+        long outDst = KeyCodec.txnDst(txnKey);
+        int inPart = partOf(graphId, outDst);
+        byte[] inKey = KeyCodec.edgeKey(
+                graphId, inPart, outDst, edgeTypeId, Direction.IN.code(), rank, outSrc);
+        try (ReadSession session = store.read()) {
+            if (session.get(Cf.EDGE, inKey) == null) {
+                StoreBatch batch = new StoreBatch();
+                batch.put(Cf.EDGE, inKey, EMPTY);
+                store.mutate(batch);
+            }
+        }
+        StoreBatch done = new StoreBatch();
+        done.delete(Cf.TXN, txnKey);
+        store.mutate(done);
+    }
+
+    private void eraseTxn(byte[] txnKey, byte[] encoded) {
+        int graphId = KeyCodec.txnGraphId(txnKey);
+        int edgeTypeId = KeyCodec.txnEdgeTypeId(txnKey);
+        long rank = KeyCodec.txnRank(txnKey);
+        long outSrc = KeyCodec.txnSrc(txnKey);
+        long outDst = KeyCodec.txnDst(txnKey);
+        int outPart = partOf(graphId, outSrc);
+        int inPart = partOf(graphId, outDst);
+        StoreBatch batch = new StoreBatch();
+        batch.delete(Cf.EDGE, KeyCodec.edgeKey(
+                graphId, outPart, outSrc, edgeTypeId, Direction.OUT.code(), rank, outDst));
+        batch.delete(Cf.EDGE, KeyCodec.edgeKey(
+                graphId, inPart, outDst, edgeTypeId, Direction.IN.code(), rank, outSrc));
+        batch.delete(Cf.PROP, KeyCodec.propKey(graphId, edgeTypeId, rank, outSrc, outDst));
+        batch.delete(Cf.TXN, txnKey);
+        store.mutate(batch);
+        if (encoded != null && encoded.length > 0) {
+            RelType type = relTypeById(graphId, edgeTypeId);
+            List<IndexDef> edgeIndexes = indexesFor(graphId, false, edgeTypeId);
+            if (!edgeIndexes.isEmpty()) {
+                    try (ReadSession session = store.read()) {
+                        StoreBatch indexes = new StoreBatch();
+                        IndexMaintenance.sync(
+                                session,
+                                indexes,
+                                edgeIndexes,
+                                type.properties(),
+                                PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
+                                null,
+                                graphId,
+                                KeyCodec.edgeIdentity(edgeTypeId, rank, outSrc, outDst));
+                        if (!indexes.isEmpty()) {
+                            store.mutate(indexes);
+                        }
+                    }
+                }
+        }
+    }
+
+    private void putVertices(ReadSession session, StoreBatch batch, int graphId, List<VertexPut> vertices, int part) {
+        for (VertexPut vertex : vertices) {
+            if (partOf(graphId, vertex.vid()) != part) {
+                continue;
+            }
+            byte[] vertexKey = KeyCodec.vertexKey(graphId, part, vertex.vid(), vertex.tagId());
+            batch.put(Cf.VERTEX, vertexKey, vertex.value());
+            List<IndexDef> nodeIndexes = indexesFor(graphId, true, vertex.tagId());
+            if (nodeIndexes.isEmpty()) {
+                continue;
+            }
+            NodeType node = nodeTypeById(graphId, vertex.tagId());
+            byte[] existingVertex = session.get(Cf.VERTEX, vertexKey);
+            IndexMaintenance.sync(
+                    session,
+                    batch,
+                    nodeIndexes,
+                    node.properties(),
+                    existingVertex == null
+                            ? null
+                            : PropCodec.decode(node.properties(), node.schemaVersion(), existingVertex),
+                    PropCodec.decode(node.properties(), node.schemaVersion(), vertex.value()),
+                    graphId,
+                    KeyCodec.vertexIdentity(vertex.tagId(), vertex.vid()));
+        }
+    }
+
+    private void healIncomplete() {
+        store.withWriteLock(() -> {
+            for (var entry : List.copyOf(spaces.entrySet())) {
+                if (entry.getValue().mode != ClusterCodec.MODE_SYNC) {
+                    continue;
+                }
+                Space space = entry.getValue();
+                store.mutate(spaceBatch(entry.getKey(), ClusterCodec.MODE_NORMAL, space.replicas, space.parts));
+                spaces.put(entry.getKey(), new Space(ClusterCodec.MODE_NORMAL, space.replicas, space.parts));
+                log.warn("副本同步未完成，图 {} 恢复为可写，投票成员保持不变", entry.getKey());
+            }
+            for (var entry : List.copyOf(moving.entrySet())) {
+                for (int partId : List.copyOf(entry.getValue())) {
+                    StoreBatch batch = new StoreBatch();
+                    batch.delete(Cf.CATALOG, KeyCodec.moveKey(entry.getKey(), partId));
+                    store.mutate(batch);
+                }
+            }
+            moving.clear();
+            return null;
+        });
+    }
+
+    private Space spaceOf(int graphId) {
+        return spaces.getOrDefault(graphId, new Space(ClusterCodec.MODE_NORMAL, 1, 1));
+    }
+
+    private static StoreBatch spaceBatch(int graphId, int mode, int replicas, int parts) {
+        StoreBatch batch = new StoreBatch();
+        batch.put(Cf.CATALOG, KeyCodec.spaceKey(graphId), ClusterCodec.space(mode, replicas, parts));
+        return batch;
+    }
+
+    private Set<Integer> movingParts(int graphId) {
+        return moving.computeIfAbsent(graphId, ignored -> ConcurrentHashMap.newKeySet());
+    }
+
+    private void requireWritable(int graphId) {
+        Space space = spaces.get(graphId);
+        if (space != null && space.mode == ClusterCodec.MODE_SYNC) {
+            throw new CengyanException(ErrorCode.SPACE_READONLY, "空间正在同步副本");
+        }
+    }
+
+    private void requirePart(int graphId, int partId) {
+        if (movingParts(graphId).contains(partId)) {
+            throw new CengyanException(ErrorCode.PART_READONLY, "分片 " + partId + " 正在搬迁");
+        }
+    }
+
+    private record Space(int mode, int replicas, int parts) {
     }
 
     private record VertexPut(int tagId, long vid, byte[] value) {

@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** SET 和 DELETE。匹配和条件都在写锁里完成，整句只提交一次。 */
 final class MutateExecutor {
@@ -132,60 +133,92 @@ final class MutateExecutor {
         LinkedHashSet<Long> deletedVertices = new LinkedHashSet<>();
         LinkedHashSet<EdgeRef> deletedEdges = new LinkedHashSet<>();
         LinkedHashSet<EdgeRef> seen = new LinkedHashSet<>();
-        for (Direction direction : directions(bound.edge.direction())) {
+        java.util.function.Predicate<EdgeRef> rank = bound.edge.rank() == null
+                ? null
+                : edge -> edge.rank() == bound.edge.rank();
+        if (bound.relType != null) {
+            for (Direction direction : directions(bound.edge.direction())) {
+                for (long start : starts) {
+                    cancelled(cancel);
+                    try (EdgeCursor cursor = session.scanEdges(
+                            graphId, start, bound.relType.id(), direction, -1, maxEdges, rank, cancel)) {
+                        take(session, graphId, bound, where, assignments, variables, eval, cursor, start, targetId,
+                                vertices, edges, deletedVertices, deletedEdges, seen);
+                    }
+                }
+            }
+        } else {
+            Set<Integer> typeIds = bound.openTypes ? null : typeIds(bound.rels);
             for (long start : starts) {
                 cancelled(cancel);
-                java.util.function.Predicate<EdgeRef> rank = bound.edge.rank() == null
-                        ? null
-                        : edge -> edge.rank() == bound.edge.rank();
                 try (EdgeCursor cursor = session.scanEdges(
-                        graphId, start, bound.relType.id(), direction, -1, maxEdges, rank, cancel)) {
-                    while (cursor.hasNext()) {
-                        EdgeRef edge = cursor.next();
-                        if (!seen.add(edge)) {
-                            continue;
-                        }
-                        long neighbor = edge.outSrc() == start ? edge.outDst() : edge.outSrc();
-                        if (targetId != null && neighbor != targetId) {
-                            continue;
-                        }
-                        Map<String, Object> edgeProps = edgeProps(session, graphId, bound.relType, edge);
-                        Map<String, Object> sourceProps = bound.sourceType == null
-                                ? Map.of()
-                                : vertexProps(session, graphId, bound.sourceType, start);
-                        Map<String, Object> targetProps = bound.targetType == null
-                                ? Map.of()
-                                : vertexProps(session, graphId, bound.targetType, neighbor);
-                        if (bound.sourceType != null && sourceProps == null) {
-                            continue;
-                        }
-                        if (bound.targetType != null && targetProps == null && !withoutId(bound.target.properties()).isEmpty()) {
-                            continue;
-                        }
-                        eval.slots(Map.of());
-                        if (!same(eval, bound.edge.properties(), edgeProps)) {
-                            continue;
-                        }
-                        if (!same(eval, withoutId(bound.source.properties()), sourceProps)) {
-                            continue;
-                        }
-                        if (!same(eval, withoutId(bound.target.properties()), targetProps == null ? Map.of() : targetProps)) {
-                            continue;
-                        }
-                        slots(eval, bound, start, neighbor, edge, sourceProps, targetProps, edgeProps);
-                        if (where != null && !eval.isTrue(where)) {
-                            continue;
-                        }
-                        if (assignments != null) {
-                            assign(eval, bound, assignments, start, neighbor, edge, vertices, edges);
-                        } else {
-                            deleteNames(bound, variables, start, neighbor, edge, deletedVertices, deletedEdges);
-                        }
-                    }
+                        graphId, start, typeIds, directions(bound.edge.direction()), -1, maxEdges, rank, cancel)) {
+                    take(session, graphId, bound, where, assignments, variables, eval, cursor, start, targetId,
+                            vertices, edges, deletedVertices, deletedEdges, seen);
                 }
             }
         }
         return mutations(vertices, edges, deletedVertices, deletedEdges, bound);
+    }
+
+    private void take(
+            ReadSession session,
+            int graphId,
+            Bound bound,
+            Expr where,
+            List<Stmt.Assign> assignments,
+            List<String> variables,
+            ExprEval eval,
+            EdgeCursor cursor,
+            long start,
+            Long targetId,
+            Map<Long, VertexUpdate> vertices,
+            Map<EdgeRef, EdgeUpdate> edges,
+            LinkedHashSet<Long> deletedVertices,
+            LinkedHashSet<EdgeRef> deletedEdges,
+            LinkedHashSet<EdgeRef> seen) {
+        while (cursor.hasNext()) {
+            EdgeRef edge = cursor.next();
+            if (!seen.add(edge)) {
+                continue;
+            }
+            long neighbor = edge.outSrc() == start ? edge.outDst() : edge.outSrc();
+            if (targetId != null && neighbor != targetId) {
+                continue;
+            }
+            Map<String, Object> edgeProps = edgeProps(session, graphId, typeOf(bound, edge), edge);
+            Map<String, Object> sourceProps = bound.sourceType == null
+                    ? Map.of()
+                    : vertexProps(session, graphId, bound.sourceType, start);
+            Map<String, Object> targetProps = bound.targetType == null
+                    ? Map.of()
+                    : vertexProps(session, graphId, bound.targetType, neighbor);
+            if (bound.sourceType != null && sourceProps == null) {
+                continue;
+            }
+            if (bound.targetType != null && targetProps == null && !withoutId(bound.target.properties()).isEmpty()) {
+                continue;
+            }
+            eval.slots(Map.of());
+            if (!same(eval, bound.edge.properties(), edgeProps)) {
+                continue;
+            }
+            if (!same(eval, withoutId(bound.source.properties()), sourceProps)) {
+                continue;
+            }
+            if (!same(eval, withoutId(bound.target.properties()), targetProps == null ? Map.of() : targetProps)) {
+                continue;
+            }
+            slots(eval, bound, start, neighbor, edge, sourceProps, targetProps, edgeProps);
+            if (where != null && !eval.isTrue(where)) {
+                continue;
+            }
+            if (assignments != null) {
+                assign(eval, bound, assignments, start, neighbor, edge, vertices, edges);
+            } else {
+                deleteNames(bound, variables, start, neighbor, edge, deletedVertices, deletedEdges);
+            }
+        }
     }
 
     private void assign(
@@ -200,7 +233,11 @@ final class MutateExecutor {
         for (Stmt.Assign assignment : assignments) {
             Object value = stored(eval.eval(assignment.value()));
             if (bound.edge != null && assignment.variable().equals(bound.edge.variable())) {
-                EdgeUpdate update = edges.computeIfAbsent(edge, ignored -> new EdgeUpdate(bound.relType.name(), edge));
+                RelType type = typeOf(bound, edge);
+                if (!has(type.properties(), assignment.field())) {
+                    throw new CengyanException(ErrorCode.TYPE_MISMATCH, "未知属性 " + assignment.field());
+                }
+                EdgeUpdate update = edges.computeIfAbsent(edge, ignored -> new EdgeUpdate(type.name(), edge));
                 put(update.values, assignment.field(), value);
             } else if (assignment.variable().equals(bound.source.variable())) {
                 VertexUpdate update = vertices.computeIfAbsent(start, ignored -> new VertexUpdate(bound.sourceType.name(), start));
@@ -251,7 +288,7 @@ final class MutateExecutor {
             } else {
                 for (EdgeRef edge : deletedEdges) {
                     mutations.add(new Mutation.DeleteEdge(
-                            bound.relType.name(), edge.rank(), edge.outSrc(), edge.outDst()));
+                            typeOf(bound, edge).name(), edge.rank(), edge.outSrc(), edge.outDst()));
                 }
             }
             return mutations;
@@ -297,21 +334,42 @@ final class MutateExecutor {
             List<String> variables) {
         NodeType sourceType = source.typeName() == null ? null : catalog.nodeType(graphId, source.typeName());
         NodeType targetType = target == null || target.typeName() == null ? null : catalog.nodeType(graphId, target.typeName());
-        RelType relType = edge == null ? null : catalog.relType(graphId, edge.typeName());
+        List<RelType> rels = List.of();
+        boolean openTypes = false;
+        RelType relType = null;
+        if (edge != null) {
+            if (edge.typeNames().isEmpty()) {
+                openTypes = true;
+                rels = List.copyOf(catalog.relTypes(graphId));
+            } else {
+                List<RelType> named = new ArrayList<>();
+                for (String typeName : edge.typeNames()) {
+                    named.add(catalog.relType(graphId, typeName));
+                }
+                rels = List.copyOf(named);
+                if (rels.size() == 1) {
+                    relType = rels.get(0);
+                }
+            }
+        }
         if (sourceType != null) {
             checkProps(source.properties(), sourceType.properties(), "起点");
         } else if (!withoutId(source.properties()).isEmpty()) {
             throw new CengyanException(ErrorCode.SYNTAX, "起点属性需要节点类型");
         }
         if (edge != null) {
-            checkProps(edge.properties(), relType.properties(), "边");
+            if (!openTypes) {
+                for (RelType type : rels) {
+                    checkProps(edge.properties(), type.properties(), "边");
+                }
+            }
             if (targetType != null) {
                 checkProps(target.properties(), targetType.properties(), "终点");
             } else if (!withoutId(target.properties()).isEmpty()) {
                 throw new CengyanException(ErrorCode.SYNTAX, "不知道终点的节点类型");
             }
         }
-        Bound bound = new Bound(source, edge, target, sourceType, targetType, relType);
+        Bound bound = new Bound(source, edge, target, sourceType, targetType, relType, rels, openTypes);
         if (assignments != null) {
             for (Stmt.Assign assignment : assignments) {
                 requireField(bound, assignment.variable(), assignment.field());
@@ -332,7 +390,7 @@ final class MutateExecutor {
 
     private static void requireField(Bound bound, String variable, String field) {
         if (bound.edge != null && variable.equals(bound.edge.variable())) {
-            if ("rank".equals(field) || !has(bound.relType.properties(), field)) {
+            if ("rank".equals(field) || !edgeField(bound, field)) {
                 throw new CengyanException(ErrorCode.TYPE_MISMATCH, "未知属性 " + field);
             }
             return;
@@ -409,7 +467,7 @@ final class MutateExecutor {
 
     private static void checkProperty(Bound bound, String variable, String field) {
         if (bound.edge != null && variable.equals(bound.edge.variable())) {
-            if (!"rank".equals(field) && !has(bound.relType.properties(), field)) {
+            if (!"rank".equals(field) && !edgeField(bound, field)) {
                 throw new CengyanException(ErrorCode.TYPE_MISMATCH, "未知属性 " + field);
             }
             return;
@@ -449,13 +507,13 @@ final class MutateExecutor {
         }
         if (bound.edge != null && bound.edge.variable() != null && edge != null) {
             slots.put(bound.edge.variable(), ExprEval.Slot.edge(
-                    bound.relType.name(), edge.rank(), edge.outSrc(), edge.outDst(), edgeProps));
+                    typeOf(bound, edge).name(), edge.rank(), edge.outSrc(), edge.outDst(), edgeProps));
         }
         eval.slots(slots);
     }
 
     private Map<String, Object> vertexProps(ReadSession session, int graphId, NodeType type, long vid) {
-        byte[] raw = session.get(Cf.VERTEX, KeyCodec.vertexKey(graphId, KeyCodec.partOf(vid), vid, type.id()));
+        byte[] raw = session.get(Cf.VERTEX, KeyCodec.vertexKey(graphId, catalog.partOf(graphId, vid), vid, type.id()));
         if (raw == null) {
             return null;
         }
@@ -590,7 +648,44 @@ final class MutateExecutor {
             Stmt.NodePat target,
             NodeType sourceType,
             NodeType targetType,
-            RelType relType) {
+            RelType relType,
+            List<RelType> rels,
+            boolean openTypes) {
+    }
+
+    private static boolean edgeField(Bound bound, String field) {
+        if (bound.openTypes) {
+            return true;
+        }
+        if (bound.rels.isEmpty()) {
+            return false;
+        }
+        for (RelType type : bound.rels) {
+            if (!has(type.properties(), field)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static RelType typeOf(Bound bound, EdgeRef edge) {
+        if (bound.relType != null && bound.relType.id() == edge.edgeTypeId()) {
+            return bound.relType;
+        }
+        for (RelType type : bound.rels) {
+            if (type.id() == edge.edgeTypeId()) {
+                return type;
+            }
+        }
+        throw new CengyanException(ErrorCode.INTERNAL, "边类型丢失");
+    }
+
+    private static Set<Integer> typeIds(List<RelType> rels) {
+        LinkedHashSet<Integer> ids = new LinkedHashSet<>();
+        for (RelType type : rels) {
+            ids.add(type.id());
+        }
+        return ids;
     }
 
     private static final class VertexUpdate {

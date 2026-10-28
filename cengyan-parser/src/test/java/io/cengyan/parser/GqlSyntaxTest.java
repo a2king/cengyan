@@ -87,4 +87,20 @@ class GqlSyntaxTest {
         assertTrue(empty.getMessage().contains("不能为空"));
         assertInstanceOf(Stmt.Match.class, Gql.parse("match (a:Company {id:1})-[:holder]->(b) return b.id;"));
     }
+
+    @Test
+    void 多种边和不写边() {
+        assertEquals("(match (node a:Company id=1) (edge OUT e) (node b) (return b.id))",
+                Gql.tree("MATCH (a:Company {id:1})-[e]->(b) RETURN b.id"));
+        assertEquals("(match (node a id=1) (edge OUT e:holder|works) (node b) (return b.id))",
+                Gql.tree("MATCH (a {id:1})-[e:holder|:works]->(b) RETURN b.id"));
+        assertEquals("(match (node a id=1) (edge OUT:holder|works) (node b) (return b.id))",
+                Gql.tree("MATCH (a {id:1})-[:holder|works]->(b) RETURN b.id"));
+        assertEquals("(match (node p:org id=100) (return p))",
+                Gql.tree("MATCH (p:org {id: 100}) RETURN p"));
+        ParseException duplicated = assertThrows(ParseException.class,
+                () -> Gql.parse("MATCH (a {id:1})-[:holder|:holder]->(b) RETURN a"));
+        assertTrue(duplicated.getMessage().contains("边类型重复"));
+        assertInstanceOf(Stmt.Insert.class, Gql.parse("INSERT (a {id:1})-[e]->(b {id:2})"));
+    }
 }

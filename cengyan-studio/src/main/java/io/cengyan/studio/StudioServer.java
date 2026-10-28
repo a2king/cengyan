@@ -61,6 +61,8 @@ public final class StudioServer implements AutoCloseable {
         http.createContext("/api/ping", server::ping);
         http.createContext("/api/login", server::login);
         http.createContext("/api/query", server::query);
+        http.createContext("/api/queries", server::queries);
+        http.createContext("/api/cancel", server::cancel);
         http.createContext("/api/admin", server::admin);
         http.createContext("/", server::page);
         http.start();
@@ -129,14 +131,43 @@ public final class StudioServer implements AutoCloseable {
         forward(exchange, request, timeoutMs);
     }
 
+    private void queries(HttpExchange exchange) {
+        JsonNode body = read(exchange);
+        if (body == null) {
+            return;
+        }
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("op", "queries");
+        request.put("session", session(exchange, body));
+        forward(exchange, request, 10000);
+    }
+
+    private void cancel(HttpExchange exchange) {
+        JsonNode body = read(exchange);
+        if (body == null) {
+            return;
+        }
+        String queryId = text(body, "queryId");
+        if (queryId.isBlank()) {
+            send(exchange, 400, error("SYNTAX", "缺少 queryId"));
+            return;
+        }
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("op", "cancel");
+        request.put("session", session(exchange, body));
+        request.put("queryId", queryId);
+        forward(exchange, request, 10000);
+    }
+
     private void admin(HttpExchange exchange) {
         JsonNode body = read(exchange);
         if (body == null) {
             return;
         }
         String command = text(body, "command");
-        if (!command.equals("stats") && !command.equals("rebuildIndex")) {
-            send(exchange, 400, error("SYNTAX", "控制台只转发 stats 和 rebuildIndex"));
+        if (!command.equals("stats") && !command.equals("storage") && !command.equals("rebuildIndex")
+                && !command.equals("showMembers") && !command.equals("addReplica")) {
+            send(exchange, 400, error("SYNTAX", "控制台只转发 stats、rebuildIndex、showMembers 和 addReplica"));
             return;
         }
         ObjectNode request = MAPPER.createObjectNode();
@@ -144,7 +175,13 @@ public final class StudioServer implements AutoCloseable {
         request.put("session", session(exchange, body));
         request.put("command", command);
         request.put("index", text(body, "index"));
-        int cap = command.equals("rebuildIndex") ? REBUILD_TIMEOUT_MS : STATS_TIMEOUT_MS;
+        request.put("graph", text(body, "graph"));
+        JsonNode replicas = body.get("replicas");
+        if (replicas != null && replicas.isNumber()) {
+            request.put("replicas", replicas.asInt());
+        }
+        int cap = command.equals("rebuildIndex") || command.equals("addReplica")
+                ? REBUILD_TIMEOUT_MS : STATS_TIMEOUT_MS;
         int timeoutMs = clampTimeout(body, cap, cap);
         if (timeoutMs <= 0) {
             send(exchange, 400, error("SYNTAX", "超时时间必须为正"));
@@ -166,6 +203,9 @@ public final class StudioServer implements AutoCloseable {
             case "/app.css" -> "studio/app.css";
             default -> null;
         };
+        if (resource == null && path.startsWith("/assets/") && !path.contains("..")) {
+            resource = "studio" + path;
+        }
         if (resource == null) {
             send(exchange, 404, error("SYNTAX", "没有这个页面"));
             return;
@@ -177,7 +217,9 @@ public final class StudioServer implements AutoCloseable {
             }
             byte[] bytes = input.readAllBytes();
             exchange.getResponseHeaders().set("Content-Type", contentType(resource));
-            exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+            exchange.getResponseHeaders().set("Cache-Control", path.startsWith("/assets/")
+                    ? "public, max-age=31536000, immutable"
+                    : "no-cache");
             exchange.sendResponseHeaders(200, bytes.length);
             exchange.getResponseBody().write(bytes);
             exchange.close();
@@ -276,6 +318,15 @@ public final class StudioServer implements AutoCloseable {
         }
         if (resource.endsWith(".css")) {
             return "text/css; charset=utf-8";
+        }
+        if (resource.endsWith(".svg")) {
+            return "image/svg+xml";
+        }
+        if (resource.endsWith(".woff2")) {
+            return "font/woff2";
+        }
+        if (resource.endsWith(".ttf")) {
+            return "font/ttf";
         }
         return "text/html; charset=utf-8";
     }

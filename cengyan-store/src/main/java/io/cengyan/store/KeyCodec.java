@@ -130,9 +130,23 @@ public final class KeyCodec {
         return Arrays.compareUnsigned(left, right);
     }
 
-    /** 阶段 9 之前恒为 0。阶段 9 起改为按 vid 取模，不能只改这个函数。 */
+    /**
+     * 没有图的分片数时按 1 个分片，结果是 0。存储层自己插边仍走这里。
+     * 目录和查询要带上这张图的分片数，见 {@link #partOf(long, int)}。
+     */
     public static int partOf(long vid) {
-        return 0;
+        return partOf(vid, 1);
+    }
+
+    /** 分片号。分片数为 1 时固定是 0，和已有数据的键一致。 */
+    public static int partOf(long vid, int partCount) {
+        if (partCount <= 1) {
+            return 0;
+        }
+        if (partCount > 65535) {
+            throw new IllegalArgumentException("分片数超出范围");
+        }
+        return (int) Math.floorMod(vid, partCount);
     }
 
     public static byte[] nextGraphIdKey() {
@@ -355,6 +369,148 @@ public final class KeyCodec {
         return new byte[] {0x40};
     }
 
+    public static byte[] nodeKey(int nodeId) {
+        checkUint16(nodeId, "nodeId");
+        byte[] key = new byte[3];
+        key[0] = 0x50;
+        putUint16(key, 1, nodeId);
+        return key;
+    }
+
+    public static byte[] nodePrefix() {
+        return new byte[] {0x50};
+    }
+
+    public static int nodeIdOf(byte[] key) {
+        if (key == null || key.length != 3 || (key[0] & 0xFF) != 0x50) {
+            throw new IllegalArgumentException("不是节点键");
+        }
+        return getUint16(key, 1);
+    }
+
+    public static byte[] partVoteKey(int graphId, int partId, int nodeId) {
+        checkUint16(graphId, "graphId");
+        checkUint16(partId, "partId");
+        checkUint16(nodeId, "nodeId");
+        byte[] key = new byte[7];
+        key[0] = 0x51;
+        putUint16(key, 1, graphId);
+        putUint16(key, 3, partId);
+        putUint16(key, 5, nodeId);
+        return key;
+    }
+
+    public static byte[] partVotePrefix(int graphId) {
+        checkUint16(graphId, "graphId");
+        byte[] key = new byte[3];
+        key[0] = 0x51;
+        putUint16(key, 1, graphId);
+        return key;
+    }
+
+    public static byte[] partVotePrefix(int graphId, int partId) {
+        checkUint16(graphId, "graphId");
+        checkUint16(partId, "partId");
+        byte[] key = new byte[5];
+        key[0] = 0x51;
+        putUint16(key, 1, graphId);
+        putUint16(key, 3, partId);
+        return key;
+    }
+
+    public static int votePartId(byte[] key) {
+        requireVoteKey(key);
+        return getUint16(key, 3);
+    }
+
+    public static int voteNodeId(byte[] key) {
+        requireVoteKey(key);
+        return getUint16(key, 5);
+    }
+
+    public static byte[] spaceKey(int graphId) {
+        return markedGraphKey(0x52, graphId);
+    }
+
+    public static byte[] spacePrefix() {
+        return new byte[] {0x52};
+    }
+
+    public static byte[] moveKey(int graphId, int partId) {
+        checkUint16(graphId, "graphId");
+        checkUint16(partId, "partId");
+        byte[] key = new byte[5];
+        key[0] = 0x53;
+        putUint16(key, 1, graphId);
+        putUint16(key, 3, partId);
+        return key;
+    }
+
+    public static byte[] movePrefix(int graphId) {
+        checkUint16(graphId, "graphId");
+        byte[] key = new byte[3];
+        key[0] = 0x53;
+        putUint16(key, 1, graphId);
+        return key;
+    }
+
+    public static int movePartId(byte[] key) {
+        if (key == null || key.length != 5 || (key[0] & 0xFF) != 0x53) {
+            throw new IllegalArgumentException("不是搬迁键");
+        }
+        return getUint16(key, 3);
+    }
+
+    /** 跨分片补偿标记。列族是 txn。相同分片的边不要写这个键。 */
+    public static byte[] txnKey(int graphId, int outPartId, int edgeTypeId, long rank, long outSrc, long outDst) {
+        checkUint16(graphId, "graphId");
+        checkUint16(outPartId, "partId");
+        checkUint32(edgeTypeId, "edgeTypeId");
+        byte[] key = new byte[32];
+        putUint16(key, 0, graphId);
+        putUint16(key, 2, outPartId);
+        putUint32(key, 4, edgeTypeId);
+        putInt64(key, 8, rank);
+        putInt64(key, 16, outSrc);
+        putInt64(key, 24, outDst);
+        return key;
+    }
+
+    public static int txnGraphId(byte[] key) {
+        requireTxnKey(key);
+        return getUint16(key, 0);
+    }
+
+    public static int txnPartId(byte[] key) {
+        requireTxnKey(key);
+        return getUint16(key, 2);
+    }
+
+    public static int txnEdgeTypeId(byte[] key) {
+        requireTxnKey(key);
+        return getUint32(key, 4);
+    }
+
+    public static long txnRank(byte[] key) {
+        requireTxnKey(key);
+        return getInt64(key, 8);
+    }
+
+    public static long txnSrc(byte[] key) {
+        requireTxnKey(key);
+        return getInt64(key, 16);
+    }
+
+    public static long txnDst(byte[] key) {
+        requireTxnKey(key);
+        return getInt64(key, 24);
+    }
+
+    public static int partIdOfVertex(byte[] vertexKey) {
+        requireVertexKey(vertexKey);
+        return getUint16(vertexKey, 2);
+    }
+
     public record TypeKey(int graphId, int kind, int typeId) {
     }
 
@@ -385,6 +541,18 @@ public final class KeyCodec {
 
     public static String nameFromKey(byte[] key, int offset) {
         return new String(key, offset, key.length - offset, StandardCharsets.UTF_8);
+    }
+
+    private static void requireVoteKey(byte[] key) {
+        if (key == null || key.length != 7 || (key[0] & 0xFF) != 0x51) {
+            throw new IllegalArgumentException("不是分片成员键");
+        }
+    }
+
+    private static void requireTxnKey(byte[] key) {
+        if (key == null || key.length != 32) {
+            throw new IllegalArgumentException("不是补偿键");
+        }
     }
 
     private static void requireVertexKey(byte[] key) {

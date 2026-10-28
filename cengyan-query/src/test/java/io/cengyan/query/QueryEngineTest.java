@@ -311,6 +311,54 @@ class QueryEngineTest {
         }
     }
 
+    @Test
+    void 多种边和只有点() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH Company",
+                    "USE Company",
+                    "CREATE NODE TYPE Company ()",
+                    "CREATE REL TYPE holder (ratio DOUBLE NULL)",
+                    "CREATE REL TYPE works (ratio DOUBLE NULL)",
+                    "INSERT (a:Company {id:1})-[:holder {ratio:0.5}]->(b:Company {id:2})",
+                    "INSERT (a:Company {id:1})-[:works {ratio:0.2}]->(b:Company {id:3})",
+                    "INSERT (a:Company {id:2})-[:holder {ratio:0.1}]->(b:Company {id:4})");
+            assertEquals(List.of(2L, 3L), column(run(db, "MATCH (a {id:1})-[e]->(b) RETURN b.id"), 0));
+            List<Object> types = new ArrayList<>();
+            for (Object cell : column(run(db, "MATCH (a {id:1})-[e]->(b) RETURN e"), 0)) {
+                Map<?, ?> edge = (Map<?, ?>) cell;
+                types.add(edge.get("type"));
+                assertEquals("Company", edge.get("srcType"));
+                assertEquals("Company", edge.get("dstType"));
+            }
+            assertEquals(List.of("holder", "works"), types);
+            assertEquals(List.of(2L, 3L), column(run(db, "MATCH (a {id:1})-[e:holder|:works]->(b) RETURN b.id"), 0));
+            assertEquals(List.of(3L), column(run(db, "MATCH (a {id:1})-[:works]->(b) RETURN b.id"), 0));
+            assertEquals(List.of(2L), column(run(db, "MATCH (a {id:1})-[e]->(b) RETURN b.id LIMIT 1"), 0));
+            QueryResult hops = run(db, "MATCH (a {id:1})-[:holder|:works]->{1,2}(b) RETURN b.id");
+            assertEquals(List.of(2L, 3L, 4L), column(hops, 0));
+            Map<?, ?> node = (Map<?, ?>) run(db, "MATCH (a:Company {id:1}) RETURN a").rows().get(0).get(0);
+            assertEquals(1L, node.get("id"));
+            assertEquals("Company", node.get("type"));
+            assertEquals(List.of(1L), column(run(db, "MATCH (a:Company) WHERE a.id = 1 RETURN a.id"), 0));
+            CengyanException missing = assertThrows(CengyanException.class,
+                    () -> run(db, "MATCH (a {id:1})-[:holder|:missing]->(b) RETURN b.id"));
+            assertEquals(ErrorCode.TYPE_NOT_FOUND, missing.code());
+            CengyanException bare = assertThrows(CengyanException.class,
+                    () -> run(db, "INSERT (a {id:1})-[e]->(b {id:9})"));
+            assertEquals(ErrorCode.SYNTAX, bare.code());
+            assertTrue(bare.getMessage().contains("一个类型"));
+            CengyanException many = assertThrows(CengyanException.class,
+                    () -> run(db, "INSERT (a {id:1})-[:holder|:works]->(b {id:9})"));
+            assertEquals(ErrorCode.SYNTAX, many.code());
+            CengyanException truncated = assertThrows(CengyanException.class,
+                    () -> run(db, "MATCH (a {id:1})-[e]->(b) RETURN b.id", new QueryLimits(1)));
+            assertEquals(ErrorCode.TRUNCATED, truncated.code());
+            run(db, "MATCH (a {id:1})-[e:holder|:works]->(b) SET e.ratio = 0.9");
+            assertEquals(List.of(0.9d, 0.9d), column(run(db, "MATCH (a {id:1})-[e]->(b) RETURN e.ratio"), 0));
+        }
+    }
+
     private static QueryResult run(Db db, String gql) {
         return run(db, gql, limits());
     }

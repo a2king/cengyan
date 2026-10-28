@@ -5,6 +5,7 @@ import io.cengyan.ErrorCode;
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.BloomFilter;
 import org.rocksdb.Cache;
+import org.rocksdb.Checkpoint;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
@@ -29,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
 /**
@@ -56,6 +58,8 @@ public final class RocksGraphStore implements GraphStore {
     private final AtomicLong indexReads = new AtomicLong();
     private final AtomicLong verticesExamined = new AtomicLong();
     private volatile Runnable beforeWrite;
+    private volatile WriteGate writeGate;
+    private volatile BiFunction<Integer, Long, Integer> partResolver = (graphId, vid) -> 0;
     private static final byte[] EMPTY = new byte[0];
 
     private RocksGraphStore(
@@ -167,10 +171,6 @@ public final class RocksGraphStore implements GraphStore {
         return cfOptions;
     }
 
-    Path directory() {
-        return directory;
-    }
-
     ColumnFamilyHandle handle(Cf cf) {
         ColumnFamilyHandle handle = byFamily.get(cf);
         if (handle == null) {
@@ -195,6 +195,38 @@ public final class RocksGraphStore implements GraphStore {
             return;
         }
         writeLock.lock();
+        try {
+            WriteGate gate = writeGate;
+            if (gate != null) {
+                gate.replicate(this, batch);
+                return;
+            }
+            writeUnlocked(batch);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    @Override
+    public void applyLocal(StoreBatch batch) {
+        if (batch == null) {
+            throw new IllegalArgumentException("批次不能为空");
+        }
+        if (closed.get()) {
+            throw new CengyanException(ErrorCode.INTERNAL, "数据库已关闭");
+        }
+        if (batch.isEmpty()) {
+            return;
+        }
+        writeLock.lock();
+        try {
+            writeUnlocked(batch);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    private void writeUnlocked(StoreBatch batch) {
         try (WriteBatch writeBatch = new WriteBatch(); WriteOptions options = new WriteOptions()) {
             options.setDisableWAL(false);
             for (StoreBatch.Op op : batch.operations()) {
@@ -213,8 +245,6 @@ public final class RocksGraphStore implements GraphStore {
             db.write(options, writeBatch);
         } catch (RocksDBException ex) {
             throw new CengyanException(ErrorCode.INTERNAL, "写入失败：" + ex.getMessage(), ex);
-        } finally {
-            writeLock.unlock();
         }
     }
 
@@ -285,6 +315,23 @@ public final class RocksGraphStore implements GraphStore {
         return verticesExamined.get();
     }
 
+    @Override
+    public long storageSizeBytes() {
+        try (var files = Files.walk(directory)) {
+            return files.filter(Files::isRegularFile)
+                    .mapToLong(path -> {
+                        try {
+                            return Files.size(path);
+                        } catch (IOException ignored) {
+                            return 0L;
+                        }
+                    })
+                    .sum();
+        } catch (IOException ignored) {
+            return -1L;
+        }
+    }
+
     void addPropReads(int count) {
         if (count > 0) {
             propReads.addAndGet(count);
@@ -334,7 +381,42 @@ public final class RocksGraphStore implements GraphStore {
         log.info("已压缩");
     }
 
-    /** 阶段 1 的分片号恒为 0。阶段 9 再按 vid 计算。 */
+    @Override
+    public Path directory() {
+        return directory;
+    }
+
+    @Override
+    public void checkpoint(Path target) {
+        if (target == null) {
+            throw new IllegalArgumentException("检查点目录不能为空");
+        }
+        if (closed.get()) {
+            throw new CengyanException(ErrorCode.INTERNAL, "数据库已关闭");
+        }
+        try (Checkpoint checkpoint = Checkpoint.create(db)) {
+            checkpoint.createCheckpoint(target.toAbsolutePath().toString());
+        } catch (RocksDBException ex) {
+            throw new CengyanException(ErrorCode.INTERNAL, "检查点失败：" + ex.getMessage(), ex);
+        }
+        log.info("已创建检查点 {}", target);
+    }
+
+    @Override
+    public void setWriteGate(WriteGate gate) {
+        this.writeGate = gate;
+    }
+
+    @Override
+    public void setPartResolver(BiFunction<Integer, Long, Integer> resolver) {
+        this.partResolver = resolver == null ? (graphId, vid) -> 0 : resolver;
+    }
+
+    int partOf(int graphId, long vid) {
+        return partResolver.apply(graphId, vid);
+    }
+
+    /** 不带图时按 1 个分片。扫描要走 {@link #partOf(int, long)}。 */
     public static int partOf(long vid) {
         return KeyCodec.partOf(vid);
     }

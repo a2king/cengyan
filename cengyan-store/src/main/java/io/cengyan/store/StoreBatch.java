@@ -27,7 +27,7 @@ public final class StoreBatch {
         return operations.isEmpty();
     }
 
-    List<Op> operations() {
+    public List<Op> operations() {
         return Collections.unmodifiableList(operations);
     }
 
@@ -53,6 +53,6 @@ public final class StoreBatch {
         return false;
     }
 
-    record Op(Cf family, byte[] key, byte[] value, boolean delete) {
+    public record Op(Cf family, byte[] key, byte[] value, boolean delete) {
     }
 }

@@ -19,11 +19,9 @@ final class LineServer extends SimpleChannelInboundHandler<String> {
     private static final Logger log = LoggerFactory.getLogger(LineServer.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private final QueryRegistry queries;
     private final ExecuteService execute;
 
-    LineServer(QueryRegistry queries, ExecuteService execute) {
-        this.queries = queries;
+    LineServer(ExecuteService execute) {
         this.execute = execute;
     }
 
@@ -53,22 +51,10 @@ final class LineServer extends SimpleChannelInboundHandler<String> {
             case "ping" -> ok(ctx);
             case "execute" -> execute.execute(ctx, node);
             case "login" -> execute.login(ctx, node);
-            case "cancel" -> cancel(ctx, node);
+            case "cancel" -> execute.cancel(ctx, node);
+            case "queries" -> execute.queries(ctx, node);
             case "admin" -> execute.admin(ctx, node);
             default -> error(ctx, ErrorCode.SYNTAX, "无法识别的操作");
-        }
-    }
-
-    private void cancel(ChannelHandlerContext ctx, JsonNode node) {
-        String queryId = node.path("queryId").asText("");
-        if (queryId.isEmpty()) {
-            error(ctx, ErrorCode.SYNTAX, "缺少 queryId");
-            return;
-        }
-        if (queries.cancel(queryId, "被终止")) {
-            ok(ctx);
-        } else {
-            error(ctx, ErrorCode.QUERY_CANCELED, "没有找到该查询");
         }
     }
 

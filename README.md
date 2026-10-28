@@ -2,7 +2,9 @@
 
 单机图数据库。数据在本机 RocksDB 里，客户端用一行一条 JSON 连到默认端口 `19669`。
 
-当前做到第 8 期：建图、插入、单跳和有界多跳、`SET` / `DELETE`、排序聚合、最短路、穿透持股、属性索引、登录和只读角色。分片、副本、计算节点还没做。语法是手写解析，不是完整的 ISO GQL。
+当前做到第 9 期：建图、插入、单跳和有界多跳、`SET` / `DELETE`、排序聚合、最短路、穿透持股、属性索引、登录和只读角色，以及分片、副本、计算节点。语法是手写解析，不是完整的 ISO GQL。新建的图默认 1 个分片、1 个副本，已有数据的分片号仍是 0。
+
+每一类语句怎么写、和标准相比缺了什么，在 `docs/gql/`。先看 `docs/gql/00-和标准相比.md`。
 
 ## 先跑起来
 
@@ -21,7 +23,7 @@ mvn "-DskipTests" package
 java -jar cengyan-server\target\cengyan-server-1.0.0-SNAPSHOT.jar cengyan.properties
 ```
 
-看到日志里的端口 `19669` 就可以连。数据写在 `data\`，日志打在这个终端。`Ctrl+C` 会关库。
+看到日志里的 `0.0.0.0:19669` 就可以连。内网另一台机器用这台电脑的局域网 IP，不要写 `0.0.0.0`。数据写在 `data\`，日志打在这个终端。`Ctrl+C` 会关库。Windows 防火墙若拦截入站，需要放行这个端口。
 
 再开一个终端启动客户端：
 
@@ -38,6 +40,23 @@ java -jar cengyan-studio\target\cengyan-studio-1.0.0-SNAPSHOT.jar
 ```
 
 打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--port`、`--db-host`、`--db-port` 可改。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
+
+Studio 前端源码在 `cengyan-studio-web`，和 Java 转发服务分开维护。开发前端时：
+
+```powershell
+cd cengyan-studio-web
+npm install
+npm run dev
+```
+
+生产构建会把静态资源写回 `cengyan-studio/src/main/resources/studio`，随后重新打包 `cengyan-studio` 即可随 Java Studio 一起部署：
+
+```powershell
+npm run typecheck
+npm run build
+```
+
+页面使用 Ant Design 组织工作台控件，Monaco Editor 承载 GQL 编辑器，React Flow 承载查询结果的点边关系图。图模式先进入图空间列表，打开空间后再切换点类型、边类型、索引和统计信息；GQL 页右上角可以独立切换当前图空间。
 
 ## 第一段查询
 
@@ -83,7 +102,15 @@ MATCH (a {id:3}) DELETE a
 
 `RETURN b` 返回整个点，形如 `{"id":2,"type":"Company","properties":{...}}`。`RETURN e` 返回整条边，形如 `{"type":"holder","rank":0,"src":1,"dst":2,"properties":{...}}`。
 
-当前的 `MATCH ... RETURN` 必须带一条边。只插入、没有边的点，这条语句读不回来。
+可以只查点，不写边。边上不写类型表示任何关系；用 `|` 列出几种类型，每个名字前面的冒号可以省略：
+
+```text
+MATCH (a:Company {id:1}) RETURN a
+MATCH (a:Company {id:1})-[e]->(b) RETURN e
+MATCH (a:Company {id:1})-[e:holder|:works]->(b) RETURN b.id
+```
+
+不写类型或一次写多种类型时，这个点上没被选中的边也算进每点上限。插入边仍然只能写一个类型。
 
 属性类型是 `BOOL`、`INT64`、`DOUBLE`、`STRING`、`DATETIME`。建类型后只能在末尾加可空列：
 
@@ -168,6 +195,17 @@ DROP INDEX by_name
 | `:setPassword 用户 密码` | 改密码 |
 | `:setRole 用户 read\|write` | 改角色 |
 | `:dropUser 用户` | 删用户 |
+| `:setPartCount 图 分片数` | 按新的分片数重写已有键。1 个分片时分片号仍是 0 |
+| `:addStorage 主机:端口` | 加入空的存储节点，并开始搬分片号最小的那一个 |
+| `:drainStorage 节点号` | 存储节点开始下线。它若是某个分片的唯一投票成员，返回 `NODE_NOT_DRAINED` |
+| `:removeStorage 节点号` | 已经下线且不再持有分片时移除 |
+| `:addReplica 图 副本数` | 把图加到这么多投票副本。同步期间写入返回 `SPACE_READONLY`，查询继续 |
+| `:addCompute 主机:端口` | 健康检查通过后加入计算节点。计算节点不存点和边 |
+| `:drainCompute 节点号` | 不再把新会话分到这台 |
+| `:removeCompute 节点号` | 没有绑定会话、也没有正在执行的查询时才能移除 |
+| `:showMembers 图` | 只列出投票成员。学习者不显示 |
+
+创建图时副本数只能是 1。先把数据灌完，再 `:addReplica`。跨分片的边会先写出边再写入边；补偿还没做完时，查询可能只看见出边。有 3 个投票成员以后，写入要多数派确认才返回成功，一台机器坏掉仍然可以写。计算节点只负责承接会话：新会话去正在执行的查询更少的那台，同一会话的下一条语句还留在那里。
 
 ## 自己写客户端
 
@@ -198,6 +236,7 @@ TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`
 
 | 项 | 仓库里的值 | 含义 |
 |---|---|---|
+| `host` | `0.0.0.0` | 监听地址。`0.0.0.0` 是所有网卡，`127.0.0.1` 只本机 |
 | `port` | `19669` | 监听端口 |
 | `data_dir` | `data` | 数据目录，相对启动时的工作目录 |
 | `root_password` | `cengyan` | 只在还没有任何用户时，用来创建 `root` |
@@ -222,4 +261,4 @@ TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`
 mvn test
 ```
 
-性能测试记在 `docs/perf-report.md`。分片、副本和计算节点还没做。
+性能测试记在 `docs/perf-report.md`。

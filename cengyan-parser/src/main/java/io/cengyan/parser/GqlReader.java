@@ -224,9 +224,6 @@ final class GqlReader {
         if (take(Kind.DELETE)) {
             return new Stmt.Delete(source, edge, target, where, variables());
         }
-        if (edge == null) {
-            return fail("这里要写边、SET 或 DELETE");
-        }
         expect(Kind.RETURN, "缺少 RETURN");
         boolean distinct = take(Kind.DISTINCT);
         List<Stmt.Item> items = items();
@@ -374,7 +371,7 @@ final class GqlReader {
             return fail("边的方向不完整");
         }
         return hops(new Stmt.EdgePat(
-                direction, undecided.variable(), undecided.typeName(), undecided.rank(), undecided.properties(),
+                direction, undecided.variable(), undecided.typeNames(), undecided.rank(), undecided.properties(),
                 null, null), quantifier());
     }
 
@@ -404,7 +401,7 @@ final class GqlReader {
             return edge;
         }
         return new Stmt.EdgePat(
-                edge.direction(), edge.variable(), edge.typeName(), edge.rank(), edge.properties(),
+                edge.direction(), edge.variable(), edge.typeNames(), edge.rank(), edge.properties(),
                 range[0], range[1]);
     }
 
@@ -413,13 +410,30 @@ final class GqlReader {
         if (peek() == Kind.IDENT) {
             variable = next().text;
         }
-        expect(Kind.COLON, "边缺少类型");
-        String typeName = ident();
+        List<String> typeNames = List.of();
+        if (take(Kind.COLON)) {
+            typeNames = typeNames();
+        }
         Long rank = null;
         if (take(Kind.AT)) {
             rank = integer();
         }
-        return new Stmt.EdgePat(direction, variable, typeName, rank, props(), null, null);
+        return new Stmt.EdgePat(direction, variable, typeNames, rank, props(), null, null);
+    }
+
+    /** {@code :a|:b} 或 {@code :a|b}。冒号可以写在每个类型前面。 */
+    private List<String> typeNames() {
+        java.util.ArrayList<String> names = new java.util.ArrayList<>();
+        names.add(ident());
+        while (take(Kind.PIPE)) {
+            take(Kind.COLON);
+            String name = ident();
+            if (names.contains(name)) {
+                return fail("边类型重复：" + name);
+            }
+            names.add(name);
+        }
+        return List.copyOf(names);
     }
 
     private List<Stmt.Prop> props() {
@@ -890,6 +904,7 @@ final class GqlReader {
             case '.' -> Kind.DOT;
             case '@' -> Kind.AT;
             case '$' -> Kind.DOLLAR;
+            case '|' -> Kind.PIPE;
             default -> null;
         };
         if (kind == null) {
@@ -906,7 +921,7 @@ final class GqlReader {
         SET, DELETE, DISTINCT, CALL, YIELD, INDEX, INDEXES, UNIQUE, ON,
         AND, OR, NOT, IS, IN, AS, ASC, DESC, TRUE, FALSE,
         ARROW, LARROW, LE, GE, NEQ, EQ, LT, GT, PLUS, MINUS, STAR, SLASH,
-        LP, RP, LB, RB, LC, RC, COMMA, COLON, SEMI, DOT, AT, DOLLAR, EOF
+        LP, RP, LB, RB, LC, RC, COMMA, COLON, SEMI, DOT, AT, DOLLAR, PIPE, EOF
     }
 
     private record Tok(Kind kind, String text, int start, int end, int line, int column) {

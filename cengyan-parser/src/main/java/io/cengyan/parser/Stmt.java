@@ -80,11 +80,20 @@ public sealed interface Stmt {
     record EdgePat(
             Direction direction,
             String variable,
-            String typeName,
+            List<String> typeNames,
             Long rank,
             List<Prop> properties,
             Integer minHop,
             Integer maxHop) {
+        public EdgePat {
+            typeNames = typeNames == null ? List.of() : List.copyOf(typeNames);
+        }
+
+        /** 正好一个类型时返回它。不写类型或写了多个类型时返回空。 */
+        public String typeName() {
+            return typeNames.size() == 1 ? typeNames.get(0) : null;
+        }
+
         public enum Direction {
             OUT, IN, ANY
         }
