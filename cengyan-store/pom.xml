@@ -9,7 +9,7 @@
         <version>1.0.0-SNAPSHOT</version>
     </parent>
     <artifactId>cengyan-store</artifactId>
-    <name>层岩存储</name>
+    <name>cengyan-store</name>
 
     <dependencies>
         <dependency>

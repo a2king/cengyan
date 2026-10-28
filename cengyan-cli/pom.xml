@@ -9,7 +9,7 @@
         <version>1.0.0-SNAPSHOT</version>
     </parent>
     <artifactId>cengyan-cli</artifactId>
-    <name>层岩客户端</name>
+    <name>cengyan-cli</name>
 
     <dependencies>
         <dependency>

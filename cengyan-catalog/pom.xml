@@ -9,7 +9,7 @@
         <version>1.0.0-SNAPSHOT</version>
     </parent>
     <artifactId>cengyan-catalog</artifactId>
-    <name>层岩目录</name>
+    <name>cengyan-catalog</name>
 
     <dependencies>
         <dependency>

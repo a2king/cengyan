@@ -9,7 +9,7 @@
         <version>1.0.0-SNAPSHOT</version>
     </parent>
     <artifactId>cengyan-server</artifactId>
-    <name>层岩服务</name>
+    <name>cengyan-server</name>
 
     <dependencies>
         <dependency>

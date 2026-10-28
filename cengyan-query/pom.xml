@@ -9,7 +9,7 @@
         <version>1.0.0-SNAPSHOT</version>
     </parent>
     <artifactId>cengyan-query</artifactId>
-    <name>层岩查询</name>
+    <name>cengyan-query</name>
 
     <dependencies>
         <dependency>
