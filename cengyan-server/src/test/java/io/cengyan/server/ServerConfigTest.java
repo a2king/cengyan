@@ -30,5 +30,17 @@ class ServerConfigTest {
         ServerConfig config = ServerConfig.defaults();
         assertEquals(6, config.rocksdbBackgroundJobs());
         assertEquals(134217728L, config.rocksdbWriteBufferBytes());
+        assertEquals(30, config.cacheCompactIntervalMinutes());
+    }
+
+    @Test
+    void 写缓存压缩间隔可以关掉() throws Exception {
+        Path file = Files.createTempFile("cengyan-compact-", ".properties");
+        try {
+            Files.writeString(file, "cache_compact_interval_minutes=0\n");
+            assertEquals(0, ServerConfig.load(file).cacheCompactIntervalMinutes());
+        } finally {
+            Files.deleteIfExists(file);
+        }
     }
 }

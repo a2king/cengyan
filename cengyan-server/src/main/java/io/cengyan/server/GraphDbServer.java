@@ -49,6 +49,7 @@ public final class GraphDbServer implements AutoCloseable {
     private final QueryRegistry queries;
     private final ScheduledExecutorService timeoutThread;
     private final ScheduledExecutorService compensateThread;
+    private final ScheduledExecutorService cacheCompactThread;
     private final ExecutorService queryPool;
     private final EventLoopGroup boss;
     private final EventLoopGroup worker;
@@ -64,6 +65,7 @@ public final class GraphDbServer implements AutoCloseable {
             QueryRegistry queries,
             ScheduledExecutorService timeoutThread,
             ScheduledExecutorService compensateThread,
+            ScheduledExecutorService cacheCompactThread,
             ExecutorService queryPool,
             EventLoopGroup boss,
             EventLoopGroup worker,
@@ -76,6 +78,7 @@ public final class GraphDbServer implements AutoCloseable {
         this.queries = queries;
         this.timeoutThread = timeoutThread;
         this.compensateThread = compensateThread;
+        this.cacheCompactThread = cacheCompactThread;
         this.queryPool = queryPool;
         this.boss = boss;
         this.worker = worker;
@@ -97,6 +100,7 @@ public final class GraphDbServer implements AutoCloseable {
         Membership membership = null;
         ScheduledExecutorService timeoutThread = null;
         ScheduledExecutorService compensateThread = null;
+        ScheduledExecutorService cacheCompactThread = null;
         ExecutorService queryPool = null;
         EventLoopGroup boss = null;
         EventLoopGroup worker = null;
@@ -143,6 +147,25 @@ public final class GraphDbServer implements AutoCloseable {
                     log.warn("补偿扫描失败：{}", ex.toString());
                 }
             }, 10, 10, TimeUnit.SECONDS);
+            int cacheMinutes = config.cacheCompactIntervalMinutes();
+            if (cacheMinutes > 0) {
+                cacheCompactThread = Executors.newSingleThreadScheduledExecutor(runnable -> {
+                    Thread thread = new Thread(runnable, "cengyan-cache-compact");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+                ScheduledExecutorService cacheCompact = cacheCompactThread;
+                cacheCompact.scheduleWithFixedDelay(() -> {
+                    try {
+                        log.info("开始压缩已打开目录里的写缓存");
+                        opened.flush();
+                        opened.compactOpen();
+                        log.info("写缓存压缩完成");
+                    } catch (RuntimeException ex) {
+                        log.warn("写缓存压缩失败：{}", ex.toString());
+                    }
+                }, cacheMinutes, cacheMinutes, TimeUnit.MINUTES);
+            }
             queryPool = Executors.newFixedThreadPool(config.queryThreads(), runnable -> {
                 Thread thread = new Thread(runnable, "cengyan-query");
                 thread.setDaemon(false);
@@ -179,7 +202,7 @@ public final class GraphDbServer implements AutoCloseable {
                     config.httpTlsEnabled(), config.httpTlsKeystore(), config.httpTlsPassword());
             return new GraphDbServer(
                     config, store, catalog, membership, queries, timeoutThread, compensateThread,
-                    queryPool, boss, worker, channel, httpGateway);
+                    cacheCompactThread, queryPool, boss, worker, channel, httpGateway);
         } catch (Exception ex) {
             if (worker != null) {
                 worker.shutdownGracefully();
@@ -192,6 +215,9 @@ public final class GraphDbServer implements AutoCloseable {
             }
             if (queryPool != null) {
                 queryPool.shutdownNow();
+            }
+            if (cacheCompactThread != null) {
+                cacheCompactThread.shutdownNow();
             }
             if (compensateThread != null) {
                 compensateThread.shutdownNow();
@@ -252,6 +278,9 @@ public final class GraphDbServer implements AutoCloseable {
             worker.shutdownGracefully().syncUninterruptibly();
             boss.shutdownGracefully().syncUninterruptibly();
             queryPool.shutdownNow();
+            if (cacheCompactThread != null) {
+                cacheCompactThread.shutdownNow();
+            }
             compensateThread.shutdownNow();
             timeoutThread.shutdownNow();
             membership.close();

@@ -29,6 +29,7 @@ public record ServerConfig(
         long blockCacheBytes,
         int rocksdbBackgroundJobs,
         long rocksdbWriteBufferBytes,
+        int cacheCompactIntervalMinutes,
         String duckdbMemory,
         Path duckdbTempDirectory,
         String rootPassword) {
@@ -61,6 +62,9 @@ public record ServerConfig(
         if (queryMemoryBytes <= 0 || blockCacheBytes <= 0
                 || rocksdbBackgroundJobs <= 0 || rocksdbWriteBufferBytes <= 0) {
             throw new IllegalArgumentException("内存配置必须为正");
+        }
+        if (cacheCompactIntervalMinutes < 0) {
+            throw new IllegalArgumentException("cacheCompactIntervalMinutes 不能为负，0 表示关闭");
         }
         if (duckdbMemory == null || duckdbMemory.isBlank()) {
             throw new IllegalArgumentException("duckdbMemory 不能为空");
@@ -109,6 +113,7 @@ public record ServerConfig(
                 8L * 1024 * 1024,
                 rocksdbBackgroundJobs,
                 rocksdbWriteBufferBytes,
+                cacheCompactIntervalMinutes,
                 duckdbMemory,
                 duckdbTempDirectory,
                 rootPassword);
@@ -134,6 +139,7 @@ public record ServerConfig(
                 longValue(properties, "block_cache_bytes", 268435456L),
                 integer(properties, "rocksdb_background_jobs", 6),
                 longValue(properties, "rocksdb_write_buffer_bytes", 134217728L),
+                integer(properties, "cache_compact_interval_minutes", 30),
                 properties.getProperty("duckdb_memory", "1GB").trim(),
                 Path.of(properties.getProperty("duckdb_temp_directory", "tmp/duck")),
                 properties.getProperty("root_password", "cengyan"));
