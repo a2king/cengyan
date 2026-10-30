@@ -1,5 +1,9 @@
 target/
-dev-scripts/
+dist/
+dev-scripts/*
+!dev-scripts/cengyan.py
+!dev-scripts/data_init_node.py
+!dev-scripts/data_init_edge.py
 gql-rewrite-plan.md
 .idea/
 *.iml
