@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cengyan"
+version = "0.1.0"
+description = "Official synchronous Python SDK for Cengyan graph database"
+requires-python = ">=3.8"
+dependencies = ["requests>=2.28,<3"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
