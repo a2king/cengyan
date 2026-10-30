@@ -268,8 +268,22 @@ class StudioServerTest {
     void 默认转发到图库端口() {
         StudioConfig config = StudioConfig.defaults();
         assertEquals(19670, config.port());
+        assertEquals("0.0.0.0", config.host());
         assertEquals("127.0.0.1", config.dbHost());
         assertEquals(19669, config.dbPort());
+    }
+
+    @Test
+    void 参数支持配置控制台监听地址() {
+        StudioConfig config = StudioConfig.parse(new String[] {
+                "--host", "192.168.1.20",
+                "--port", "19700",
+                "--db-host", "192.168.1.21",
+                "--db-port", "19669"
+        });
+        assertEquals("192.168.1.20", config.host());
+        assertEquals(19700, config.port());
+        assertEquals("192.168.1.21", config.dbHost());
     }
 
     @Test

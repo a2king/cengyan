@@ -19,18 +19,23 @@ export interface QueryResponse {
 export interface GraphSpace {
   name: string;
   aliases: string[];
+  comment?: string;
 }
 
 export interface TypeRow {
   name: string;
   id: number;
   schemaVersion: number;
+  idType?: string;
+  idLength?: number;
+  comment?: string;
 }
 
 export interface TypeProperty {
   property: string;
   type: string;
   nullable: boolean;
+  comment?: string;
 }
 
 export interface IndexRow {
@@ -46,5 +51,4 @@ export interface StatsRow {
   target: 'NODE' | 'REL';
   name: string;
   count: number;
-  maxDegree: number;
 }

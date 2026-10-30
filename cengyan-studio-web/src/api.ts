@@ -120,6 +120,6 @@ export function escapeIdent(value: string): string {
   return value;
 }
 
-export function graphFromRows(response: QueryResponse): string[] {
-  return (response.rows || []).map((row) => String(row[0]));
+export function graphFromRows(response: QueryResponse): Array<{ name: string; comment?: string }> {
+  return (response.rows || []).map((row) => ({ name: String(row[0]), comment: row[1] == null ? undefined : String(row[1]) }));
 }

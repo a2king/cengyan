@@ -47,14 +47,14 @@ public final class StudioServer implements AutoCloseable {
             server.close();
             stopped.countDown();
         }, "cengyan-studio-shutdown"));
-        System.out.println("层岩控制台已监听 http://127.0.0.1:" + server.port()
+        System.out.println("层岩控制台已监听 http://" + config.host() + ":" + server.port()
                 + " ，图数据库 " + config.dbHost() + ":" + config.dbPort());
         stopped.await();
     }
 
     public static StudioServer start(StudioConfig config) throws IOException {
         DbClient db = new DbClient(config.dbHost(), config.dbPort());
-        HttpServer http = HttpServer.create(new InetSocketAddress("127.0.0.1", config.port()), 0);
+        HttpServer http = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
         http.setExecutor(workers);
         StudioServer server = new StudioServer(db, http, workers, http.getAddress().getPort());
