@@ -25,4 +25,10 @@ class ServerConfigTest {
     void 不写host时监听所有网卡() {
         assertEquals("0.0.0.0", ServerConfig.defaults().host());
     }
+    @Test
+    void rocksDbTuningDefaults() {
+        ServerConfig config = ServerConfig.defaults();
+        assertEquals(6, config.rocksdbBackgroundJobs());
+        assertEquals(134217728L, config.rocksdbWriteBufferBytes());
+    }
 }

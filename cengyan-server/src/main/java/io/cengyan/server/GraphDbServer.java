@@ -7,6 +7,7 @@ import io.cengyan.catalog.Catalog;
 import io.cengyan.catalog.Membership;
 import io.cengyan.query.QueryEngine;
 import io.cengyan.store.GraphStore;
+import io.cengyan.store.ShardedGraphStore;
 import io.cengyan.store.StoreOptions;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
@@ -37,7 +38,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class GraphDbServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(GraphDbServer.class);
-    private static final int MAX_LINE_BYTES = 1024 * 1024;
+    /** 普通 GQL 很小；批量导入请求允许更大的 JSON，但仍由批次行数和内存共同约束。 */
+    private static final int MAX_LINE_BYTES = 16 * 1024 * 1024;
 
     private final ServerConfig config;
     private final GraphStore store;
@@ -50,6 +52,7 @@ public final class GraphDbServer implements AutoCloseable {
     private final EventLoopGroup boss;
     private final EventLoopGroup worker;
     private final Channel channel;
+    private final HttpGateway httpGateway;
     private final AtomicBoolean closed = new AtomicBoolean();
 
     private GraphDbServer(
@@ -63,7 +66,8 @@ public final class GraphDbServer implements AutoCloseable {
             ExecutorService queryPool,
             EventLoopGroup boss,
             EventLoopGroup worker,
-            Channel channel) {
+            Channel channel,
+            HttpGateway httpGateway) {
         this.config = config;
         this.store = store;
         this.catalog = catalog;
@@ -75,6 +79,7 @@ public final class GraphDbServer implements AutoCloseable {
         this.boss = boss;
         this.worker = worker;
         this.channel = channel;
+        this.httpGateway = httpGateway;
     }
 
     public static void main(String[] args) throws Exception {
@@ -94,14 +99,35 @@ public final class GraphDbServer implements AutoCloseable {
         ExecutorService queryPool = null;
         EventLoopGroup boss = null;
         EventLoopGroup worker = null;
+        HttpGateway httpGateway = null;
         try {
-            store = GraphStore.open(config.dataDir(), StoreOptions.server(config.blockCacheBytes()));
+            StoreOptions storeOptions = StoreOptions.server(
+                    config.blockCacheBytes(),
+                    config.rocksdbBackgroundJobs(),
+                    config.rocksdbWriteBufferBytes());
+            store = ShardedGraphStore.open(config.dataDir(), storeOptions);
             Catalog catalog = Catalog.load(store);
+            store.setPartCountResolver(catalog::partCount);
+            store.setPartitionDirectoryResolver((graphId, partId) -> {
+                String graph = catalog.graphs().stream()
+                        .filter(name -> catalog.graph(name).graphId() == graphId)
+                        .findFirst()
+                        .orElse("graph-" + graphId);
+                return config.dataDir().toAbsolutePath().normalize().resolve(graph)
+                        .resolve("part-" + partId)
+                        .resolve("db");
+            });
+            store.preparePartitions(catalog.graphs().stream()
+                    .mapToInt(name -> catalog.graph(name).graphId())
+                    .toArray());
+            store.migrateLegacy(catalog.graphs().stream()
+                    .mapToInt(name -> catalog.graph(name).graphId())
+                    .toArray());
             log.info("已加载目录，共 {} 张图", catalog.graphs().size());
             Auth auth = new Auth(store);
             auth.ensureRoot(config.rootPassword());
             membership = Membership.open(
-                    catalog, store, config.host() + ":" + config.port(), StoreOptions.server(config.blockCacheBytes()));
+                    catalog, store, config.host() + ":" + config.port(), storeOptions);
             QueryRegistry queries = new QueryRegistry();
             Sessions sessions = new Sessions();
             timeoutThread = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -139,7 +165,7 @@ public final class GraphDbServer implements AutoCloseable {
             worker = new NioEventLoopGroup(0, new DefaultThreadFactory("cengyan-io"));
             QueryEngine engine = new QueryEngine(
                     catalog, store, config.duckdbMemory(), config.duckdbTempDirectory(),
-                    config.minEdgeRatio(), config.minAccumRatio(), auth);
+                    auth);
             engine.bind(membership);
             ExecuteService execute = new ExecuteService(engine, config, queries, queryPool, sessions);
             LineServer lineServer = new LineServer(execute);
@@ -159,12 +185,20 @@ public final class GraphDbServer implements AutoCloseable {
                         }
                     });
             Channel channel = bootstrap.bind(new InetSocketAddress(config.host(), config.port())).sync().channel();
+            int tcpPort = ((InetSocketAddress) channel.localAddress()).getPort();
+            int httpPort = config.httpPort() == 0 ? 0 : config.httpPort();
+            httpGateway = HttpGateway.start(
+                    config.host(), httpPort, "127.0.0.1", tcpPort,
+                    config.httpTlsEnabled(), config.httpTlsKeystore(), config.httpTlsPassword());
             return new GraphDbServer(
                     config, store, catalog, membership, queries, timeoutThread, compensateThread,
-                    queryPool, boss, worker, channel);
+                    queryPool, boss, worker, channel, httpGateway);
         } catch (Exception ex) {
             if (worker != null) {
                 worker.shutdownGracefully();
+            }
+            if (httpGateway != null) {
+                httpGateway.close();
             }
             if (boss != null) {
                 boss.shutdownGracefully();
@@ -202,6 +236,10 @@ public final class GraphDbServer implements AutoCloseable {
         return ((InetSocketAddress) channel.localAddress()).getPort();
     }
 
+    public int httpPort() {
+        return httpGateway.port();
+    }
+
     public ServerConfig config() {
         return config;
     }
@@ -220,6 +258,9 @@ public final class GraphDbServer implements AutoCloseable {
             return;
         }
         try {
+            if (httpGateway != null) {
+                httpGateway.close();
+            }
             channel.close().syncUninterruptibly();
             worker.shutdownGracefully().syncUninterruptibly();
             boss.shutdownGracefully().syncUninterruptibly();

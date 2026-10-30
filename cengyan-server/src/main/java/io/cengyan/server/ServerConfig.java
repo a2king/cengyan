@@ -14,6 +14,10 @@ import java.util.Properties;
 public record ServerConfig(
         String host,
         int port,
+        int httpPort,
+        boolean httpTlsEnabled,
+        Path httpTlsKeystore,
+        String httpTlsPassword,
         Path dataDir,
         int queryThreads,
         long maxExecutionTimeMs,
@@ -23,10 +27,10 @@ public record ServerConfig(
         int maxPaths,
         long queryMemoryBytes,
         long blockCacheBytes,
+        int rocksdbBackgroundJobs,
+        long rocksdbWriteBufferBytes,
         String duckdbMemory,
         Path duckdbTempDirectory,
-        double minEdgeRatio,
-        double minAccumRatio,
         String rootPassword) {
 
     public ServerConfig {
@@ -36,19 +40,26 @@ public record ServerConfig(
         if (port < 0 || port > 65535) {
             throw new IllegalArgumentException("port 超出范围");
         }
+        if (httpPort < 0 || httpPort > 65535) {
+            throw new IllegalArgumentException("httpPort 超出范围");
+        }
+        if (httpTlsKeystore == null || httpTlsPassword == null) {
+            throw new IllegalArgumentException("HTTP TLS 配置不能为空");
+        }
         if (dataDir == null) {
             throw new IllegalArgumentException("dataDir 不能为空");
         }
         if (queryThreads <= 0) {
             throw new IllegalArgumentException("queryThreads 必须为正");
         }
-        if (maxExecutionTimeMs <= 0) {
-            throw new IllegalArgumentException("maxExecutionTimeMs 必须为正");
+        if (maxExecutionTimeMs < 0) {
+            throw new IllegalArgumentException("maxExecutionTimeMs 不能为负，0 表示不限");
         }
-        if (maxEdgesPerVertex <= 0 || maxFrontierPerHop <= 0 || maxHops <= 0 || maxPaths <= 0) {
-            throw new IllegalArgumentException("查询上限必须为正");
+        if (maxEdgesPerVertex < 0 || maxFrontierPerHop < 0 || maxHops < 0 || maxPaths < 0) {
+            throw new IllegalArgumentException("查询预算不能为负，0 表示不限");
         }
-        if (queryMemoryBytes <= 0 || blockCacheBytes <= 0) {
+        if (queryMemoryBytes <= 0 || blockCacheBytes <= 0
+                || rocksdbBackgroundJobs <= 0 || rocksdbWriteBufferBytes <= 0) {
             throw new IllegalArgumentException("内存配置必须为正");
         }
         if (duckdbMemory == null || duckdbMemory.isBlank()) {
@@ -83,6 +94,10 @@ public record ServerConfig(
         return new ServerConfig(
                 host,
                 0,
+                0,
+                false,
+                Path.of("config/server.p12"),
+                "",
                 dataDir,
                 2,
                 maxExecutionTimeMs,
@@ -92,10 +107,10 @@ public record ServerConfig(
                 maxPaths,
                 queryMemoryBytes,
                 8L * 1024 * 1024,
+                rocksdbBackgroundJobs,
+                rocksdbWriteBufferBytes,
                 duckdbMemory,
                 duckdbTempDirectory,
-                minEdgeRatio,
-                minAccumRatio,
                 rootPassword);
     }
 
@@ -104,19 +119,23 @@ public record ServerConfig(
         return new ServerConfig(
                 text(properties, "host", "0.0.0.0"),
                 integer(properties, "port", 19669),
+                integer(properties, "http_port", 19671),
+                Boolean.parseBoolean(properties.getProperty("http_tls_enabled", "false").trim()),
+                Path.of(properties.getProperty("http_tls_keystore", "config/server.p12")),
+                properties.getProperty("http_tls_password", ""),
                 Path.of(properties.getProperty("data_dir", "data")),
                 Math.max(threads, 1),
-                Long.parseLong(properties.getProperty("max_execution_time_ms", "1000").trim()),
-                integer(properties, "max_edges_per_vertex", 64),
-                integer(properties, "max_frontier_per_hop", 64),
-                integer(properties, "max_hops", 10),
-                integer(properties, "max_paths", 100),
+                Long.parseLong(properties.getProperty("max_execution_time_ms", "0").trim()),
+                integer(properties, "max_edges_per_vertex", 0),
+                integer(properties, "max_frontier_per_hop", 0),
+                integer(properties, "max_hops", 0),
+                integer(properties, "max_paths", 0),
                 longValue(properties, "query_memory_bytes", 67108864L),
                 longValue(properties, "block_cache_bytes", 268435456L),
+                integer(properties, "rocksdb_background_jobs", 6),
+                longValue(properties, "rocksdb_write_buffer_bytes", 134217728L),
                 properties.getProperty("duckdb_memory", "1GB").trim(),
                 Path.of(properties.getProperty("duckdb_temp_directory", "tmp/duck")),
-                doubleValue(properties, "min_edge_ratio", 0.01),
-                doubleValue(properties, "min_accum_ratio", 0.001),
                 properties.getProperty("root_password", "cengyan"));
     }
 
@@ -158,15 +177,4 @@ public record ServerConfig(
         }
     }
 
-    private static double doubleValue(Properties properties, String key, double fallback) {
-        String raw = properties.getProperty(key);
-        if (raw == null || raw.isBlank()) {
-            return fallback;
-        }
-        try {
-            return Double.parseDouble(raw.trim());
-        } catch (NumberFormatException ex) {
-            throw new CengyanException(ErrorCode.INTERNAL, "配置项 " + key + " 不是数字");
-        }
-    }
 }

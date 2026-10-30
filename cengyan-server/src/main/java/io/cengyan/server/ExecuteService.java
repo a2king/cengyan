@@ -19,6 +19,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -74,8 +76,8 @@ final class ExecuteService {
         }
         Map<String, Object> params = params(paramsNode);
         long timeoutMs = timeout(node);
-        if (timeoutMs <= 0) {
-            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间必须为正");
+        if (timeoutMs < 0) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
         boolean acquired;
@@ -98,6 +100,91 @@ final class ExecuteService {
         }
     }
 
+    void bulkInsert(ChannelHandlerContext ctx, JsonNode node) {
+        String sessionId = node.path("session").asText("");
+        if (sessionId.isBlank()) {
+            sessionId = UUID.randomUUID().toString();
+        }
+        String session = sessionId;
+        String kind = node.path("kind").asText("");
+        String type = node.path("type").asText("");
+        JsonNode rowsNode = node.get("rows");
+        if (kind.isBlank() || type.isBlank() || rowsNode == null || !rowsNode.isArray()) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "bulkInsert 需要 kind、type 和 rows 数组");
+            return;
+        }
+        if (rowsNode.size() == 0) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "bulkInsert 的 rows 不能为空");
+            return;
+        }
+        if (rowsNode.size() > 10_000) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "单批最多 10000 行，请在客户端分块");
+            return;
+        }
+        List<Map<String, Object>> rows = new ArrayList<>(rowsNode.size());
+        for (JsonNode row : rowsNode) {
+            if (!row.isObject()) {
+                error(ctx, session, null, ErrorCode.SYNTAX, "bulkInsert 的每一行必须是 JSON 对象");
+                return;
+            }
+            rows.add(object(row));
+        }
+        long timeoutMs = timeout(node);
+        if (timeoutMs < 0) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
+            return;
+        }
+        if (!acquire(ctx, session)) {
+            return;
+        }
+        boolean ignoreExisting = node.path("ignoreExisting").asBoolean(false);
+        try {
+            queryPool.execute(() -> runBulk(
+                    ctx, session, kind, type, rows, ignoreExisting, timeoutMs));
+        } catch (RejectedExecutionException ex) {
+            permits.release();
+            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
+        }
+    }
+
+    private void runBulk(
+            ChannelHandlerContext ctx,
+            String sessionId,
+            String kind,
+            String type,
+            List<Map<String, Object>> rows,
+            boolean ignoreExisting,
+            long timeoutMs) {
+        QueryHandle handle = QueryHandle.start(timeoutMs);
+        queries.register(handle);
+        byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
+        try {
+            SessionState session = sessions.open(sessionId);
+            synchronized (session) {
+                if (!session.authenticated()) {
+                    throw new CengyanException(ErrorCode.FORBIDDEN, "请先登录");
+                }
+                handle.describe(session.user(), "bulkInsert " + kind + " " + type + " rows=" + rows.size());
+            }
+            QueryResult result = engine.bulkInsert(session, kind, type, rows, ignoreExisting, handle);
+            ObjectNode node = MAPPER.createObjectNode();
+            node.put("code", ErrorCode.OK.name());
+            node.put("session", sessionId);
+            node.put("queryId", handle.id());
+            node.set("columns", MAPPER.valueToTree(result.columns()));
+            node.set("rows", MAPPER.valueToTree(result.rows()));
+            node.put("rowsAffected", result.rowsAffected());
+            write(ctx, node);
+        } catch (CengyanException ex) {
+            error(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
+        } catch (RuntimeException ex) {
+            log.warn("批量写入失败：{}", ex.toString());
+            error(ctx, sessionId, handle.id(), ErrorCode.INTERNAL, "批量写入失败");
+        } finally {
+            finish(ctx, handle);
+        }
+    }
+
     void admin(ChannelHandlerContext ctx, JsonNode node) {
         String sessionId = node.path("session").asText("");
         if (sessionId.isBlank()) {
@@ -111,8 +198,8 @@ final class ExecuteService {
         }
         String index = node.path("index").asText("");
         long timeoutMs = timeout(node);
-        if (timeoutMs <= 0) {
-            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间必须为正");
+        if (timeoutMs < 0) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
         boolean acquired;
@@ -154,8 +241,8 @@ final class ExecuteService {
         String user = node.path("user").asText("");
         String password = node.path("password").asText("");
         long timeoutMs = timeout(node);
-        if (timeoutMs <= 0) {
-            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间必须为正");
+        if (timeoutMs < 0) {
+            error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
         if (!acquire(ctx, session)) {
@@ -296,12 +383,14 @@ final class ExecuteService {
 
     void onInactive(ChannelHandlerContext ctx) {
         Set<String> ids = byChannel.remove(ctx.channel().id());
-        if (ids == null) {
-            return;
+        if (ids != null) {
+            for (String id : ids) {
+                queries.cancel(id, "连接已断开");
+            }
         }
-        for (String id : ids) {
-            queries.cancel(id, "连接已断开");
-        }
+        // 会话按会话号放在内存里，不随这条 TCP 一起删除。
+        // Studio 每个 HTTP 请求都会新开一条连接，读完响应就关掉。
+        // 如果在这里清会话，登录刚成功，紧接着的查询就会拿到一个未登录的新会话。
     }
 
     private void run(ChannelHandlerContext ctx, String sessionId, String query, Map<String, Object> params, long timeoutMs) {
@@ -409,6 +498,42 @@ final class ExecuteService {
             return node.asText();
         }
         return node.toString();
+    }
+
+    void logout(ChannelHandlerContext ctx, JsonNode node) {
+        String sessionId = node.path("session").asText("");
+        if (sessionId.isBlank()) {
+            error(ctx, "", null, ErrorCode.OK, "");
+            return;
+        }
+        sessions.close(sessionId);
+        ObjectNode response = MAPPER.createObjectNode();
+        response.put("code", ErrorCode.OK.name());
+        response.put("session", sessionId);
+        write(ctx, response);
+    }
+
+    private static Map<String, Object> object(JsonNode node) {
+        Map<String, Object> values = new LinkedHashMap<>();
+        node.fields().forEachRemaining(entry -> values.put(entry.getKey(), valueDeep(entry.getValue())));
+        return values;
+    }
+
+    private static Object valueDeep(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (node.isObject()) {
+            return object(node);
+        }
+        if (node.isArray()) {
+            List<Object> values = new ArrayList<>(node.size());
+            for (JsonNode child : node) {
+                values.add(valueDeep(child));
+            }
+            return values;
+        }
+        return value(node);
     }
 
     private void error(ChannelHandlerContext ctx, String session, String queryId, ErrorCode code, String message) {

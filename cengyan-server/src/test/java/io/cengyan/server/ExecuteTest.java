@@ -167,6 +167,35 @@ class ExecuteTest {
         }
     }
 
+    @Test
+    void 断开连接后同一会话号仍然已登录() throws Exception {
+        Path dir = Files.createTempDirectory("cengyan-session-reconnect-");
+        ServerConfig config = ServerConfig.defaults().forTest(dir);
+        try (GraphDbServer server = GraphDbServer.start(config)) {
+            String session;
+            try (Socket socket = new Socket("127.0.0.1", server.port())) {
+                socket.setSoTimeout(10000);
+                BufferedWriter writer = new BufferedWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+                BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                session = login(writer, reader, "", "root", "cengyan");
+            }
+            Thread.sleep(300);
+            try (Socket socket = new Socket("127.0.0.1", server.port())) {
+                socket.setSoTimeout(10000);
+                BufferedWriter writer = new BufferedWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+                BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                JsonNode graphs = send(writer, reader, session, "SHOW GRAPHS");
+                assertEquals("OK", graphs.get("code").asText(), graphs.toString());
+            }
+        } finally {
+            deleteTree(dir);
+        }
+    }
+
     private static ObjectNode request(String op, String session, String queryId) {
         ObjectNode node = MAPPER.createObjectNode();
         node.put("op", op);
