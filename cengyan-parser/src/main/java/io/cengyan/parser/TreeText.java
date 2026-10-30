@@ -9,7 +9,7 @@ final class TreeText {
 
     static String of(Stmt stmt) {
         return switch (stmt) {
-            case Stmt.CreateGraph graph -> "(createGraph " + graph.name() + ")";
+            case Stmt.CreateGraph graph -> "(createGraph " + graph.name() + note(graph.comment()) + ")";
             case Stmt.Use use -> "(use " + use.name() + ")";
             case Stmt.CreateAlias alias -> "(createAlias " + alias.alias() + " " + alias.graph() + ")";
             case Stmt.DropAlias drop -> "(dropAlias " + drop.name() + ")";
@@ -17,13 +17,13 @@ final class TreeText {
             case Stmt.Show show -> "(show " + show.kind() + ")";
             case Stmt.Describe describe -> "(describe " + (describe.node() ? "node " : "rel ") + describe.name() + ")";
             case Stmt.CreateType type -> "(createType " + (type.node() ? "node " : "rel ") + type.name()
-                    + " " + fields(type.fields()) + ")";
+                    + note(type.comment()) + id(type) + " " + fields(type.fields()) + ")";
             case Stmt.CreateIndex index -> "(createIndex " + (index.unique() ? "unique " : "")
                     + index.name() + " " + (index.node() ? "node " : "rel ") + index.typeName()
                     + " " + String.join(",", index.properties()) + ")";
             case Stmt.DropIndex drop -> "(dropIndex " + drop.name() + ")";
             case Stmt.AlterType alter -> "(alter " + (alter.node() ? "node " : "rel ") + alter.typeName()
-                    + " " + alter.property() + " " + alter.valueType() + ")";
+                    + " " + alter.property() + " " + alter.valueType() + note(alter.comment()) + ")";
             case Stmt.Insert insert -> "(insert " + node(insert.source())
                     + (insert.edge() == null ? "" : " " + edge(insert.edge()) + " " + node(insert.target())) + ")";
             case Stmt.Match match -> {
@@ -59,6 +59,7 @@ final class TreeText {
                 text.append(')');
                 yield text.toString();
             }
+            case Stmt.Explain explain -> "(explain " + of(explain.query()) + ")";
             case Stmt.Set set -> assignment(set.source(), set.edge(), set.target(), set.where(), set.assignments(), null);
             case Stmt.Delete delete -> assignment(delete.source(), delete.edge(), delete.target(), delete.where(), null, delete.variables());
             case Stmt.Call call -> {
@@ -113,9 +114,20 @@ final class TreeText {
     private static String fields(java.util.List<Stmt.Field> fields) {
         StringJoiner joiner = new StringJoiner(" ", "(", ")");
         for (Stmt.Field field : fields) {
-            joiner.add(field.name() + ":" + field.valueType() + (field.nullable() ? "?" : ""));
+            joiner.add(field.name() + ":" + field.valueType() + (field.nullable() ? "?" : "") + note(field.comment()));
         }
         return joiner.toString();
+    }
+
+    private static String id(Stmt.CreateType type) {
+        if (!type.node() || ("INT".equalsIgnoreCase(type.idType()) && type.idLength() == 19)) {
+            return "";
+        }
+        return " id=" + type.idType().toUpperCase(java.util.Locale.ROOT) + "(" + type.idLength() + ")";
+    }
+
+    private static String note(String value) {
+        return value == null ? "" : " comment='" + value.replace("'", "''") + "'";
     }
 
     private static String node(Stmt.NodePat node) {

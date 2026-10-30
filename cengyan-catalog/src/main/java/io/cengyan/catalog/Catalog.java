@@ -15,9 +15,13 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -35,6 +39,8 @@ import java.util.regex.Pattern;
 public final class Catalog {
     public static final int NODE_KIND = 1;
     public static final int REL_KIND = 2;
+    /** 查询未注册的字符串 ID 时使用的内部哨兵；字符串映射从 MIN_VALUE + 1 开始。 */
+    public static final long MISSING_VERTEX_ID = Long.MIN_VALUE;
 
     private static final Logger log = LoggerFactory.getLogger(Catalog.class);
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*");
@@ -78,6 +84,151 @@ public final class Catalog {
         return space.parts;
     }
 
+    /** 把 GQL 中的外部 ID 转成存储层使用的 long。字符串 ID 使用图级目录映射。 */
+    public long resolveVertexId(int graphId, NodeType type, Object value) {
+        if (type == null) {
+            return resolveUnqualifiedVertexId(graphId, value);
+        }
+        if (type.idType() == IdType.INT) {
+            return resolveIntegerId(type, value);
+        }
+        if (!(value instanceof String text)) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 必须是字符串");
+        }
+        int bytes = text.getBytes(StandardCharsets.UTF_8).length;
+        if (text.isEmpty() || bytes > type.idLength()) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "字符串节点 ID 长度必须不超过 " + type.idLength());
+        }
+        return resolveStringId(graphId, text);
+    }
+
+    /** 只查找已经存在的 ID，不会在查询、SET 或 DELETE 中写入字符串映射。 */
+    public long findVertexId(int graphId, NodeType type, Object value) {
+        if (type == null) {
+            return findUnqualifiedVertexId(graphId, value);
+        }
+        if (type.idType() == IdType.INT) {
+            return resolveIntegerId(type, value);
+        }
+        if (!(value instanceof String text)) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 必须是字符串");
+        }
+        int bytes = text.getBytes(StandardCharsets.UTF_8).length;
+        if (text.isEmpty() || bytes > type.idLength()) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "字符串节点 ID 长度必须不超过 " + type.idLength());
+        }
+        return findStringId(graphId, text);
+    }
+
+    /** 未指定节点类型时用于边端点。字符串 ID 必须已经在图中注册。 */
+    public long resolveUnqualifiedVertexId(int graphId, Object value) {
+        if (value instanceof Number number) {
+            return resolveIntegerId(null, number);
+        }
+        if (!(value instanceof String text) || text.isEmpty()) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 必须是整数或字符串");
+        }
+        try (ReadSession session = store.read()) {
+            byte[] raw = session.get(Cf.CATALOG, KeyCodec.stringIdForwardKey(graphId, text));
+            if (raw == null) {
+                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "字符串节点 ID 尚未注册：" + text);
+            }
+            return decodeLong(raw);
+        }
+    }
+
+    /** 查询结果中的外部 ID。没有节点类型时也能识别已经注册的字符串 ID。 */
+    public Object externalVertexId(int graphId, NodeType type, long internalId) {
+        if (type != null && type.idType() == IdType.INT) {
+            return internalId;
+        }
+        try (ReadSession session = store.read()) {
+            byte[] raw = session.get(Cf.CATALOG, KeyCodec.stringIdReverseKey(graphId, internalId));
+            if (raw != null) {
+                return new String(raw, StandardCharsets.UTF_8);
+            }
+        }
+        return internalId;
+    }
+
+    private long resolveStringId(int graphId, String text) {
+        return store.withWriteLock(() -> {
+            try (ReadSession session = store.read()) {
+                byte[] forwardKey = KeyCodec.stringIdForwardKey(graphId, text);
+                byte[] existing = session.get(Cf.CATALOG, forwardKey);
+                if (existing != null) {
+                    return decodeLong(existing);
+                }
+                byte[] counterKey = KeyCodec.stringIdCounterKey(graphId);
+                byte[] counter = session.get(Cf.CATALOG, counterKey);
+                long sequence = counter == null ? 0L : decodeLong(counter);
+                if (sequence >= Long.MAX_VALUE - 1L) {
+                    throw new CengyanException(ErrorCode.INTERNAL, "字符串节点 ID 已耗尽");
+                }
+                long internalId = Long.MIN_VALUE + 1L + sequence;
+                StoreBatch batch = new StoreBatch();
+                batch.put(Cf.CATALOG, forwardKey, encodeLong(internalId));
+                batch.put(Cf.CATALOG, KeyCodec.stringIdReverseKey(graphId, internalId),
+                        text.getBytes(StandardCharsets.UTF_8));
+                batch.put(Cf.CATALOG, counterKey, encodeLong(sequence + 1));
+                store.mutate(batch);
+                return internalId;
+            }
+        });
+    }
+
+    private long findUnqualifiedVertexId(int graphId, Object value) {
+        if (value instanceof Number number) {
+            return resolveIntegerId(null, number);
+        }
+        if (!(value instanceof String text) || text.isEmpty()) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 必须是整数或字符串");
+        }
+        return findStringId(graphId, text);
+    }
+
+    private long findStringId(int graphId, String text) {
+        try (ReadSession session = store.read()) {
+            byte[] raw = session.get(Cf.CATALOG, KeyCodec.stringIdForwardKey(graphId, text));
+            return raw == null ? MISSING_VERTEX_ID : decodeLong(raw);
+        }
+    }
+
+    private static long resolveIntegerId(NodeType type, Object value) {
+        if (!(value instanceof Number number)) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 必须是整数");
+        }
+        long id = number.longValue();
+        if (number instanceof Float || number instanceof Double) {
+            double decimal = number.doubleValue();
+            if (!Double.isFinite(decimal) || decimal != id) {
+                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "整数节点 ID 必须是非负整数");
+            }
+        }
+        if (id < 0 || id == MISSING_VERTEX_ID) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "整数节点 ID 必须是非负整数");
+        }
+        if (type != null && decimalLength(id) > type.idLength()) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 超过定义的长度 " + type.idLength());
+        }
+        return id;
+    }
+
+    private static int decimalLength(long value) {
+        return Long.toString(value).length();
+    }
+
+    private static byte[] encodeLong(long value) {
+        return ByteBuffer.allocate(Long.BYTES).putLong(value).array();
+    }
+
+    private static long decodeLong(byte[] raw) {
+        if (raw == null || raw.length != Long.BYTES) {
+            throw new CengyanException(ErrorCode.INTERNAL, "字符串 ID 映射记录损坏");
+        }
+        return ByteBuffer.wrap(raw).getLong();
+    }
+
     /** 只查一次名字主键。图名和别名都返回同一个 graphId，再读规范名。 */
     public GraphName graph(String name) {
         checkIdentifier(name);
@@ -95,7 +246,8 @@ public final class Catalog {
             if (record == null) {
                 throw new CengyanException(ErrorCode.INTERNAL, "图记录丢失：" + graphId);
             }
-            return new GraphName(graphId, CatalogCodec.graphRecordName(record), name, kind);
+            return new GraphName(graphId, CatalogCodec.graphRecordName(record), name, kind,
+                    CatalogCodec.graphRecordComment(record));
         }
     }
 
@@ -117,7 +269,18 @@ public final class Catalog {
     }
 
     public int createGraph(String name) {
+        return createGraph(name, 1, null);
+    }
+
+    public int createGraph(String name, String comment) {
+        return createGraph(name, 32, comment);
+    }
+
+    public int createGraph(String name, int parts, String comment) {
         checkIdentifier(name);
+        if (parts <= 0 || parts > 4096) {
+            throw new CengyanException(ErrorCode.SYNTAX, "分片数量必须在 1 到 4096 之间");
+        }
         return store.withWriteLock(() -> {
             try (ReadSession session = store.read()) {
                 if (session.get(Cf.CATALOG, KeyCodec.nameKey(name)) != null) {
@@ -126,13 +289,13 @@ public final class Catalog {
                 int graphId = allocate(session.get(Cf.CATALOG, KeyCodec.nextGraphIdKey()), false);
                 StoreBatch batch = new StoreBatch();
                 batch.put(Cf.CATALOG, KeyCodec.nameKey(name), CatalogCodec.nameValue(GraphName.GRAPH, graphId));
-                batch.put(Cf.CATALOG, KeyCodec.graphRecordKey(graphId), CatalogCodec.graphRecord(name));
-                batch.put(Cf.CATALOG, KeyCodec.spaceKey(graphId), ClusterCodec.space(ClusterCodec.MODE_NORMAL, 1, 1));
+                batch.put(Cf.CATALOG, KeyCodec.graphRecordKey(graphId), CatalogCodec.graphRecord(name, comment));
+                batch.put(Cf.CATALOG, KeyCodec.spaceKey(graphId), ClusterCodec.space(ClusterCodec.MODE_NORMAL, 1, parts));
                 batch.put(Cf.CATALOG, KeyCodec.nextGraphIdKey(), counterAfter(graphId, false));
                 store.mutate(batch);
                 names.put(name, new NameEntry(GraphName.GRAPH, graphId, name));
                 canonicals.put(graphId, name);
-                spaces.put(graphId, new Space(ClusterCodec.MODE_NORMAL, 1, 1));
+                spaces.put(graphId, new Space(ClusterCodec.MODE_NORMAL, 1, parts));
                 log.info("已创建图 {}，编号 {}", name, graphId);
                 return graphId;
             }
@@ -219,6 +382,9 @@ public final class Catalog {
                 }
                 deletePrefix(batch, session, Cf.CATALOG, KeyCodec.aliasPrefix(graphId));
                 deletePrefix(batch, session, Cf.CATALOG, KeyCodec.typePrefix(graphId));
+                deletePrefix(batch, session, Cf.CATALOG, KeyCodec.stringIdForwardPrefix(graphId));
+                deletePrefix(batch, session, Cf.CATALOG, KeyCodec.stringIdReversePrefix(graphId));
+                batch.delete(Cf.CATALOG, KeyCodec.stringIdCounterKey(graphId));
                 for (byte[] key : session.keysWithPrefix(Cf.CATALOG, KeyCodec.indexRecordPrefix(graphId))) {
                     deletePrefix(batch, session, Cf.INDEX, KeyCodec.indexDataPrefix(KeyCodec.indexIdFromRecord(key)));
                     batch.delete(Cf.CATALOG, key);
@@ -249,26 +415,40 @@ public final class Catalog {
         });
     }
 
+    public NodeType createNodeType(
+            int graphId, String name, IdType idType, int idLength, List<PropDef> properties) {
+        return createType(graphId, NODE_KIND, name, properties, idType, idLength).asNode();
+    }
+
+    public NodeType createNodeType(int graphId, String name, IdType idType, int idLength,
+                                   List<PropDef> properties, String comment) {
+        return createType(graphId, NODE_KIND, name, properties, idType, idLength, comment).asNode();
+    }
+
     public NodeType createNodeType(int graphId, String name, List<PropDef> properties) {
-        return createType(graphId, NODE_KIND, name, properties).asNode();
+        return createNodeType(graphId, name, IdType.INT, 19, properties);
     }
 
     public RelType createRelType(int graphId, String name, List<PropDef> properties) {
-        return createType(graphId, REL_KIND, name, properties).asRel();
+        return createType(graphId, REL_KIND, name, properties, IdType.INT, 19).asRel();
+    }
+
+    public RelType createRelType(int graphId, String name, List<PropDef> properties, String comment) {
+        return createType(graphId, REL_KIND, name, properties, IdType.INT, 19, comment).asRel();
     }
 
     public NodeType addNodeProperty(int graphId, String typeName, PropDef property) {
         if (property == null) {
             throw new CengyanException(ErrorCode.TYPE_MISMATCH, "列类型不能为空");
         }
-        return addProperty(graphId, NODE_KIND, typeName, property.name(), property.type(), property.nullable()).asNode();
+        return addProperty(graphId, NODE_KIND, typeName, property.name(), property.type(), property.nullable(), property.comment()).asNode();
     }
 
     public RelType addRelProperty(int graphId, String typeName, PropDef property) {
         if (property == null) {
             throw new CengyanException(ErrorCode.TYPE_MISMATCH, "列类型不能为空");
         }
-        return addProperty(graphId, REL_KIND, typeName, property.name(), property.type(), property.nullable()).asRel();
+        return addProperty(graphId, REL_KIND, typeName, property.name(), property.type(), property.nullable(), property.comment()).asRel();
     }
 
     public List<NodeType> nodeTypes(int graphId) {
@@ -335,6 +515,234 @@ public final class Catalog {
                 store.mutate(batch);
                 return true;
             }
+        });
+    }
+
+    /** 将一批外部节点 ID 映射为存储层 ID。字符串 ID 的目录映射也只提交一次。 */
+    public List<Long> resolveBulkVertexIds(int graphId, NodeType type, List<?> values) {
+        if (type == null || values == null) {
+            throw new IllegalArgumentException("节点类型和 ID 列表不能为空");
+        }
+        return store.withWriteLock(() -> {
+            List<Long> result = new ArrayList<>(values.size());
+            if (type.idType() == IdType.INT) {
+                for (Object value : values) {
+                    result.add(resolveIntegerId(type, value));
+                }
+                return result;
+            }
+            StoreBatch batch = new StoreBatch();
+            Map<String, Long> pending = new LinkedHashMap<>();
+            try (ReadSession session = store.read()) {
+                byte[] counterKey = KeyCodec.stringIdCounterKey(graphId);
+                byte[] counter = session.get(Cf.CATALOG, counterKey);
+                long sequence = counter == null ? 0L : decodeLong(counter);
+                for (Object value : values) {
+                    if (!(value instanceof String text)) {
+                        throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 必须是字符串");
+                    }
+                    int bytes = text.getBytes(StandardCharsets.UTF_8).length;
+                    if (text.isEmpty() || bytes > type.idLength()) {
+                        throw new CengyanException(ErrorCode.TYPE_MISMATCH,
+                                "字符串节点 ID 长度必须不超过 " + type.idLength());
+                    }
+                    Long existingPending = pending.get(text);
+                    if (existingPending != null) {
+                        result.add(existingPending);
+                        continue;
+                    }
+                    byte[] forwardKey = KeyCodec.stringIdForwardKey(graphId, text);
+                    byte[] raw = session.get(Cf.CATALOG, forwardKey);
+                    long internal;
+                    if (raw != null) {
+                        internal = decodeLong(raw);
+                    } else {
+                        if (sequence >= Long.MAX_VALUE - 1L) {
+                            throw new CengyanException(ErrorCode.INTERNAL, "字符串节点 ID 已耗尽");
+                        }
+                        internal = Long.MIN_VALUE + 1L + sequence++;
+                        batch.put(Cf.CATALOG, forwardKey, encodeLong(internal));
+                        batch.put(Cf.CATALOG, KeyCodec.stringIdReverseKey(graphId, internal),
+                                text.getBytes(StandardCharsets.UTF_8));
+                    }
+                    pending.put(text, internal);
+                    result.add(internal);
+                }
+                long oldSequence = counter == null ? 0L : decodeLong(counter);
+                if (sequence != oldSequence) {
+                    batch.put(Cf.CATALOG, counterKey, encodeLong(sequence));
+                }
+                if (!batch.isEmpty()) {
+                    store.mutate(batch);
+                }
+            }
+            return result;
+        });
+    }
+
+    /** 批量查找无类型端点 ID；不会为字符串 ID 创建新的目录映射。 */
+    public List<Long> findBulkUnqualifiedVertexIds(int graphId, List<?> values) {
+        if (values == null) {
+            throw new IllegalArgumentException("ID 列表不能为空");
+        }
+        List<Long> result = new ArrayList<>(values.size());
+        try (ReadSession session = store.read()) {
+            for (Object value : values) {
+                if (value instanceof Number number) {
+                    result.add(resolveIntegerId(null, number));
+                    continue;
+                }
+                if (!(value instanceof String text) || text.isEmpty()) {
+                    throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 必须是整数或字符串");
+                }
+                byte[] raw = session.get(Cf.CATALOG, KeyCodec.stringIdForwardKey(graphId, text));
+                if (raw == null) {
+                    throw new CengyanException(ErrorCode.TYPE_MISMATCH, "字符串节点 ID 尚未注册：" + text);
+                }
+                result.add(decodeLong(raw));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 批量写入节点。整个列表在一次 RocksDB WriteBatch 中提交；调用方应按网络和内存大小分块。
+     * 同一批内重复的 (type, vid) 按最后一行覆盖，唯一索引冲突或任意一行校验失败时整批失败。
+     */
+    public int bulkInsertVertices(
+            int graphId, String typeName, List<BulkVertex> rows, boolean ifNotExists) {
+        checkIdentifier(typeName);
+        if (rows == null) {
+            throw new IllegalArgumentException("批量节点不能为空");
+        }
+        return store.withWriteLock(() -> {
+            requireGraph(graphId);
+            requireWritable(graphId);
+            NodeType type = nodeType(graphId, typeName);
+            StoreBatch batch = new StoreBatch();
+            Map<Long, byte[]> previous = new LinkedHashMap<>();
+            Map<Long, Map<String, Object>> nextValues = new LinkedHashMap<>();
+            try (ReadSession session = store.read()) {
+                for (BulkVertex row : rows) {
+                    long vid = row.vid();
+                    requirePart(graphId, partOf(graphId, vid));
+                    byte[] key = KeyCodec.vertexKey(graphId, partOf(graphId, vid), vid, type.id());
+                    byte[] old = previous.containsKey(vid) ? previous.get(vid) : session.get(Cf.VERTEX, key);
+                    if (ifNotExists && old != null) {
+                        continue;
+                    }
+                    Map<String, Object> next = normalizeProperties(type.properties(), row.properties());
+                    byte[] encoded = PropCodec.encode(type.schemaVersion(), type.properties(), next);
+                    IndexMaintenance.sync(
+                            session,
+                            batch,
+                            indexesFor(graphId, true, type.id()),
+                            type.properties(),
+                            old == null ? null : PropCodec.decode(type.properties(), type.schemaVersion(), old),
+                            PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
+                            graphId,
+                            KeyCodec.vertexIdentity(type.id(), vid));
+                    batch.put(Cf.VERTEX, key, encoded);
+                    previous.put(vid, encoded);
+                    nextValues.put(vid, next);
+                }
+                if (!batch.isEmpty()) {
+                    store.mutate(batch);
+                }
+            }
+            return nextValues.size();
+        });
+    }
+
+    /**
+     * 批量写入带外部 ID 的节点。字符串 ID 映射、节点属性、索引在同一个 WriteBatch 中提交，
+     * 因此唯一索引冲突或属性校验失败不会留下半批 ID 映射。
+     */
+    public int bulkInsertVerticesExternal(
+            int graphId, String typeName, List<BulkVertexValue> rows, boolean ifNotExists) {
+        checkIdentifier(typeName);
+        if (rows == null) {
+            throw new IllegalArgumentException("批量节点不能为空");
+        }
+        return store.withWriteLock(() -> {
+            requireGraph(graphId);
+            requireWritable(graphId);
+            NodeType type = nodeType(graphId, typeName);
+            StoreBatch batch = new StoreBatch();
+            Map<Long, byte[]> previous = new LinkedHashMap<>();
+            Map<String, Long> pendingIds = new LinkedHashMap<>();
+            long sequence = -1L;
+            long originalSequence = -1L;
+            int written = 0;
+            try (ReadSession session = store.read()) {
+                byte[] counterKey = KeyCodec.stringIdCounterKey(graphId);
+                if (type.idType() == IdType.STRING) {
+                    byte[] counter = session.get(Cf.CATALOG, counterKey);
+                    originalSequence = counter == null ? 0L : decodeLong(counter);
+                    sequence = originalSequence;
+                }
+                for (BulkVertexValue row : rows) {
+                    long vid;
+                    if (type.idType() == IdType.INT) {
+                        vid = resolveIntegerId(type, row.id());
+                    } else {
+                        if (!(row.id() instanceof String text)) {
+                            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "节点 ID 必须是字符串");
+                        }
+                        int bytes = text.getBytes(StandardCharsets.UTF_8).length;
+                        if (text.isEmpty() || bytes > type.idLength()) {
+                            throw new CengyanException(ErrorCode.TYPE_MISMATCH,
+                                    "字符串节点 ID 长度必须不超过 " + type.idLength());
+                        }
+                        Long pending = pendingIds.get(text);
+                        if (pending != null) {
+                            vid = pending;
+                        } else {
+                            byte[] forwardKey = KeyCodec.stringIdForwardKey(graphId, text);
+                            byte[] raw = session.get(Cf.CATALOG, forwardKey);
+                            if (raw != null) {
+                                vid = decodeLong(raw);
+                            } else {
+                                if (sequence >= Long.MAX_VALUE - 1L) {
+                                    throw new CengyanException(ErrorCode.INTERNAL, "字符串节点 ID 已耗尽");
+                                }
+                                vid = Long.MIN_VALUE + 1L + sequence++;
+                                batch.put(Cf.CATALOG, forwardKey, encodeLong(vid));
+                                batch.put(Cf.CATALOG, KeyCodec.stringIdReverseKey(graphId, vid),
+                                        text.getBytes(StandardCharsets.UTF_8));
+                            }
+                            pendingIds.put(text, vid);
+                        }
+                    }
+                    requirePart(graphId, partOf(graphId, vid));
+                    byte[] key = KeyCodec.vertexKey(graphId, partOf(graphId, vid), vid, type.id());
+                    byte[] old = previous.containsKey(vid) ? previous.get(vid) : session.get(Cf.VERTEX, key);
+                    if (ifNotExists && old != null) {
+                        continue;
+                    }
+                    Map<String, Object> next = normalizeProperties(type.properties(), row.properties());
+                    byte[] encoded = PropCodec.encode(type.schemaVersion(), type.properties(), next);
+                    IndexMaintenance.sync(
+                            session,
+                            batch,
+                            indexesFor(graphId, true, type.id()),
+                            type.properties(),
+                            old == null ? null : PropCodec.decode(type.properties(), type.schemaVersion(), old),
+                            PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
+                            graphId,
+                            KeyCodec.vertexIdentity(type.id(), vid));
+                    batch.put(Cf.VERTEX, key, encoded);
+                    previous.put(vid, encoded);
+                    written++;
+                }
+                if (type.idType() == IdType.STRING && sequence != originalSequence) {
+                    batch.put(Cf.CATALOG, counterKey, encodeLong(sequence));
+                }
+                if (!batch.isEmpty()) {
+                    store.mutate(batch);
+                }
+            }
+            return written;
         });
     }
 
@@ -421,6 +829,64 @@ public final class Catalog {
                 store.commitEdges(batch);
                 return true;
             }
+        });
+    }
+
+    /**
+     * 批量写入边。当前要求边两端在同一分片；单机和单分片图可直接使用。
+     * 每个逻辑边的出边、入边、属性和索引都进入同一个 RocksDB WriteBatch。
+     */
+    public int bulkInsertRels(
+            int graphId, String relTypeName, List<BulkEdge> rows, boolean ifNotExists) {
+        checkIdentifier(relTypeName);
+        if (rows == null) {
+            throw new IllegalArgumentException("批量边不能为空");
+        }
+        return store.withWriteLock(() -> {
+            requireGraph(graphId);
+            requireWritable(graphId);
+            RelType type = relType(graphId, relTypeName);
+            StoreBatch batch = new StoreBatch();
+            Map<EdgeIdentity, byte[]> previous = new LinkedHashMap<>();
+            try (ReadSession session = store.read()) {
+                for (BulkEdge row : rows) {
+                    int outPart = partOf(graphId, row.src());
+                    int inPart = partOf(graphId, row.dst());
+                    requirePart(graphId, outPart);
+                    requirePart(graphId, inPart);
+                    if (outPart != inPart) {
+                        throw new CengyanException(ErrorCode.CROSS_PART_UNSUPPORTED,
+                                "批量边的两端必须位于同一分片");
+                    }
+                    EdgeIdentity identity = new EdgeIdentity(row.rank(), row.src(), row.dst());
+                    byte[] propKey = KeyCodec.propKey(graphId, type.id(), row.rank(), row.src(), row.dst());
+                    byte[] old = previous.containsKey(identity) ? previous.get(identity) : session.get(Cf.PROP, propKey);
+                    if (ifNotExists && old != null) {
+                        continue;
+                    }
+                    Map<String, Object> next = normalizeProperties(type.properties(), row.properties());
+                    byte[] encoded = PropCodec.encode(type.schemaVersion(), type.properties(), next);
+                    batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                            graphId, outPart, row.src(), type.id(), Direction.OUT.code(), row.rank(), row.dst()), EMPTY);
+                    batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                            graphId, inPart, row.dst(), type.id(), Direction.IN.code(), row.rank(), row.src()), EMPTY);
+                    batch.put(Cf.PROP, propKey, encoded);
+                    IndexMaintenance.sync(
+                            session,
+                            batch,
+                            indexesFor(graphId, false, type.id()),
+                            type.properties(),
+                            old == null ? null : PropCodec.decode(type.properties(), type.schemaVersion(), old),
+                            PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
+                            graphId,
+                            KeyCodec.edgeIdentity(type.id(), row.rank(), row.src(), row.dst()));
+                    previous.put(identity, encoded);
+                }
+                if (!batch.isEmpty()) {
+                    store.commitEdges(batch);
+                }
+            }
+            return previous.size();
         });
     }
 
@@ -804,9 +1270,7 @@ public final class Catalog {
 
     public List<StatsRow> stats(int graphId, CancelToken cancel) {
         requireGraph(graphId);
-        Map<Long, Integer> incident = new HashMap<>();
         Map<Integer, Long> relCount = new HashMap<>();
-        Map<Integer, Map<Long, Integer>> relDegree = new HashMap<>();
         Map<Integer, Set<Long>> vids = new HashMap<>();
         try (ReadSession session = store.read()) {
             session.visitPrefix(Cf.EDGE, KeyCodec.graphIdPrefix(graphId), cancel, key -> {
@@ -818,12 +1282,6 @@ public final class Catalog {
                     return;
                 }
                 relCount.merge(edge.edgeTypeId(), 1L, Long::sum);
-                bump(incident, edge.src());
-                bump(relDegree.computeIfAbsent(edge.edgeTypeId(), id -> new HashMap<>()), edge.src());
-                if (edge.src() != edge.dst()) {
-                    bump(incident, edge.dst());
-                    bump(relDegree.get(edge.edgeTypeId()), edge.dst());
-                }
             });
             session.visitPrefix(Cf.VERTEX, KeyCodec.graphIdPrefix(graphId), cancel, key -> {
                 if (key.length != KeyCodec.VERTEX_KEY_LENGTH) {
@@ -835,19 +1293,10 @@ public final class Catalog {
         List<StatsRow> rows = new ArrayList<>();
         for (NodeType type : nodeTypes(graphId)) {
             Set<Long> ids = vids.getOrDefault(type.id(), Set.of());
-            long max = 0;
-            for (long vid : ids) {
-                max = Math.max(max, incident.getOrDefault(vid, 0));
-            }
-            rows.add(new StatsRow("NODE", type.name(), ids.size(), max));
+            rows.add(new StatsRow("NODE", type.name(), ids.size()));
         }
         for (RelType type : relTypes(graphId)) {
-            Map<Long, Integer> degrees = relDegree.getOrDefault(type.id(), Map.of());
-            long max = 0;
-            for (int degree : degrees.values()) {
-                max = Math.max(max, degree);
-            }
-            rows.add(new StatsRow("REL", type.name(), relCount.getOrDefault(type.id(), 0L), max));
+            rows.add(new StatsRow("REL", type.name(), relCount.getOrDefault(type.id(), 0L)));
         }
         rows.sort(Comparator.comparing(StatsRow::target).thenComparing(StatsRow::name));
         return rows;
@@ -869,6 +1318,43 @@ public final class Catalog {
             }
         }
         return false;
+    }
+
+    private static Map<String, Object> normalizeProperties(List<PropDef> definitions, Map<String, Object> input) {
+        Map<String, PropDef> byName = new HashMap<>();
+        for (PropDef definition : definitions) {
+            byName.put(definition.name(), definition);
+        }
+        Map<String, Object> values = new LinkedHashMap<>();
+        if (input == null) {
+            return values;
+        }
+        for (Map.Entry<String, Object> entry : input.entrySet()) {
+            PropDef definition = byName.get(entry.getKey());
+            if (definition == null) {
+                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "未知属性 " + entry.getKey());
+            }
+            Object value = entry.getValue();
+            if (value instanceof Number number) {
+                value = switch (definition.type()) {
+                    case INT64 -> number.longValue();
+                    case DOUBLE -> number.doubleValue();
+                    default -> value;
+                };
+            } else if (value instanceof String text && definition.type() == ValueType.DATETIME) {
+                try {
+                    value = Instant.parse(text).toEpochMilli();
+                } catch (java.time.format.DateTimeParseException ex) {
+                    try {
+                        value = LocalDateTime.parse(text).toInstant(ZoneOffset.UTC).toEpochMilli();
+                    } catch (java.time.format.DateTimeParseException nested) {
+                        throw new CengyanException(ErrorCode.TYPE_MISMATCH, "DATETIME 格式不正确：" + text, nested);
+                    }
+                }
+            }
+            values.put(entry.getKey(), value);
+        }
+        return values;
     }
 
     private void ensureParts(int graphId, long left, long right) {
@@ -951,8 +1437,29 @@ public final class Catalog {
         }
     }
 
-    private StoredType createType(int graphId, int kind, String name, List<PropDef> properties) {
+    private StoredType createType(
+            int graphId, int kind, String name, List<PropDef> properties, IdType idType, int idLength) {
+        return createType(graphId, kind, name, properties, idType, idLength, null);
+    }
+
+    private StoredType createType(
+            int graphId, int kind, String name, List<PropDef> properties, IdType idType, int idLength, String comment) {
         checkIdentifier(name);
+        if (idType == null) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "ID 类型不能为空");
+        }
+        if (idLength <= 0 || idLength > 4096) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "ID 长度必须在 1 到 4096 之间");
+        }
+        if (kind == NODE_KIND && idType == IdType.INT && idLength > 19) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "INT ID 长度不能超过 19 位");
+        }
+        if (kind == REL_KIND) {
+            idType = IdType.INT;
+            idLength = 19;
+        }
+        final IdType storedIdType = idType;
+        final int storedIdLength = idLength;
         List<PropDef> copied = copyProperties(properties);
         return store.withWriteLock(() -> {
             requireWritable(graphId);
@@ -965,10 +1472,11 @@ public final class Catalog {
                         ? KeyCodec.nextNodeTypeKey(graphId)
                         : KeyCodec.nextRelTypeKey(graphId);
                 int typeId = allocate(session.get(Cf.CATALOG, counterKey), true);
-                CatalogCodec.DecodedType decoded = new CatalogCodec.DecodedType(1, name, copied);
+                CatalogCodec.DecodedType decoded = new CatalogCodec.DecodedType(
+                        1, name, copied, storedIdType, storedIdLength, comment);
                 StoreBatch batch = new StoreBatch();
                 batch.put(Cf.CATALOG, KeyCodec.typeKey(graphId, kind, typeId),
-                        CatalogCodec.typeRecord(1, name, copied));
+                        CatalogCodec.typeRecord(1, name, copied, storedIdType, storedIdLength, comment));
                 batch.put(Cf.CATALOG, counterKey, counterAfter(typeId, true));
                 store.mutate(batch);
                 StoredType stored = remember(new KeyCodec.TypeKey(graphId, kind, typeId), decoded);
@@ -979,7 +1487,7 @@ public final class Catalog {
     }
 
     private StoredType addProperty(
-            int graphId, int kind, String typeName, String property, ValueType type, boolean nullable) {
+            int graphId, int kind, String typeName, String property, ValueType type, boolean nullable, String comment) {
         checkIdentifier(typeName);
         checkIdentifier(property);
         if ("id".equals(property)) {
@@ -1010,12 +1518,14 @@ public final class Catalog {
                     throw new CengyanException(ErrorCode.INTERNAL, "类型版本已经用完");
                 }
                 List<PropDef> next = new ArrayList<>(current.properties());
-                next.add(new PropDef(property, type, true));
+                next.add(new PropDef(property, type, true, comment));
                 int schemaVersion = current.schemaVersion() + 1;
-                CatalogCodec.DecodedType decoded = new CatalogCodec.DecodedType(schemaVersion, typeName, List.copyOf(next));
+                CatalogCodec.DecodedType decoded = new CatalogCodec.DecodedType(
+                        schemaVersion, typeName, List.copyOf(next), current.idType(), current.idLength(), current.comment());
                 StoreBatch batch = new StoreBatch();
                 batch.put(Cf.CATALOG, KeyCodec.typeKey(graphId, kind, typeKey.typeId()),
-                        CatalogCodec.typeRecord(schemaVersion, typeName, decoded.properties()));
+                        CatalogCodec.typeRecord(
+                        schemaVersion, typeName, decoded.properties(), decoded.idType(), decoded.idLength(), current.comment()));
                 store.mutate(batch);
                 return remember(typeKey, decoded);
             }
@@ -1085,12 +1595,14 @@ public final class Catalog {
     private StoredType remember(KeyCodec.TypeKey typeKey, CatalogCodec.DecodedType decoded) {
         List<PropDef> properties = List.copyOf(decoded.properties());
         if (typeKey.kind() == NODE_KIND) {
-            NodeType type = new NodeType(typeKey.typeId(), decoded.name(), decoded.schemaVersion(), properties);
+            NodeType type = new NodeType(
+                    typeKey.typeId(), decoded.name(), decoded.schemaVersion(), properties,
+                    decoded.idType(), decoded.idLength(), decoded.comment());
             nodeTypes.computeIfAbsent(typeKey.graphId(), id -> new ConcurrentHashMap<>()).put(type.name(), type);
             return new StoredType(type, null);
         }
         if (typeKey.kind() == REL_KIND) {
-            RelType type = new RelType(typeKey.typeId(), decoded.name(), decoded.schemaVersion(), properties);
+            RelType type = new RelType(typeKey.typeId(), decoded.name(), decoded.schemaVersion(), properties, decoded.comment());
             relTypes.computeIfAbsent(typeKey.graphId(), id -> new ConcurrentHashMap<>()).put(type.name(), type);
             return new StoredType(null, type);
         }
@@ -1290,7 +1802,7 @@ public final class Catalog {
             if (seen.put(property.name(), true) != null) {
                 throw new CengyanException(ErrorCode.TYPE_MISMATCH, "属性名重复：" + property.name());
             }
-            copied.add(new PropDef(property.name(), property.type(), property.nullable()));
+            copied.add(new PropDef(property.name(), property.type(), property.nullable(), property.comment()));
         }
         return List.copyOf(copied);
     }
@@ -1328,6 +1840,12 @@ public final class Catalog {
             }
             Space space = spaceOf(graphId);
             if (space.parts == partCount) {
+                return null;
+            }
+            if (store.repartitionGraph(graphId, space.parts, partCount)) {
+                store.mutate(spaceBatch(graphId, space.mode, space.replicas, partCount));
+                spaces.put(graphId, new Space(space.mode, space.replicas, partCount));
+                log.info("ͼ {} �ķ�Ƭ���Ѹ�Ϊ {}", graphId, partCount);
                 return null;
             }
             try (ReadSession session = store.read()) {
@@ -1724,6 +2242,33 @@ public final class Catalog {
     }
 
     private record Space(int mode, int replicas, int parts) {
+    }
+
+    public record BulkVertex(long vid, Map<String, Object> properties) {
+        public BulkVertex {
+            properties = properties == null
+                    ? Map.of()
+                    : Collections.unmodifiableMap(new LinkedHashMap<>(properties));
+        }
+    }
+
+    public record BulkVertexValue(Object id, Map<String, Object> properties) {
+        public BulkVertexValue {
+            properties = properties == null
+                    ? Map.of()
+                    : Collections.unmodifiableMap(new LinkedHashMap<>(properties));
+        }
+    }
+
+    public record BulkEdge(long rank, long src, long dst, Map<String, Object> properties) {
+        public BulkEdge {
+            properties = properties == null
+                    ? Map.of()
+                    : Collections.unmodifiableMap(new LinkedHashMap<>(properties));
+        }
+    }
+
+    private record EdgeIdentity(long rank, long src, long dst) {
     }
 
     private record VertexPut(int tagId, long vid, byte[] value) {

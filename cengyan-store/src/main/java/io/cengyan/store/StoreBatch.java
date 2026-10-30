@@ -16,6 +16,15 @@ public final class StoreBatch {
         operations.add(new Op(family, key.clone(), value.clone(), false));
     }
 
+    /** Adds an operation while preserving the caller's delete flag. */
+    public void put(Cf family, byte[] key, byte[] value, boolean delete) {
+        if (delete) {
+            delete(family, key);
+        } else {
+            put(family, key, value);
+        }
+    }
+
     public void delete(Cf family, byte[] key) {
         if (family == null || key == null) {
             throw new IllegalArgumentException("列族和键都不能为空");

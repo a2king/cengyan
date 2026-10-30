@@ -34,7 +34,7 @@ class QueryHandleTest {
 
     @Test
     void 到点后检查取消会自己超时() throws Exception {
-        QueryHandle handle = QueryHandle.start(0);
+        QueryHandle handle = QueryHandle.start(1);
         AtomicInteger hits = new AtomicInteger();
         handle.onCancel(hits::incrementAndGet);
         Thread.sleep(5);

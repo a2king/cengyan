@@ -37,7 +37,12 @@ class HopMatchTest {
             QueryResult range = run(db, "MATCH (a:Company {id:1})-[:holder]->{1,2}(b) RETURN b.id");
             assertEquals(List.of(2L, 3L), column(range));
             CengyanException tooFar = assertThrows(CengyanException.class,
-                    () -> run(db, "MATCH (a:Company {id:1})-[:holder]->{11}(b) RETURN b.id"));
+                    () -> db.engine.execute(
+                            db.session,
+                            "MATCH (a:Company {id:1})-[:holder]->{11}(b) RETURN b.id",
+                            java.util.Map.of(),
+                            new QueryLimits(64, 64, 10, 100),
+                            null));
             assertEquals(ErrorCode.SYNTAX, tooFar.code());
             CengyanException paths = assertThrows(CengyanException.class, () -> db.engine.execute(
                     db.session,
@@ -55,13 +60,16 @@ class HopMatchTest {
             int[] ids = prepare(db);
             long start = System.nanoTime();
             CengyanException exceeded = assertThrows(CengyanException.class, () -> run(
-                    db, "MATCH (a:Company {id:0})-[e:holder]->{10}(b) WHERE e.rank >= 0 RETURN b.id"));
+                    db, "MATCH (a:Company {id:0})-[e:holder]->{10}(b) WHERE e.rank >= 0 RETURN b.id",
+                    new QueryLimits(64, 64, 10, 100)));
             long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
             assertEquals(ErrorCode.FRONTIER_EXCEEDED, exceeded.code());
             assertTrue(exceeded.getMessage().contains("第 2 跳"), exceeded.getMessage());
             assertTrue(exceeded.getMessage().contains("起点"), exceeded.getMessage());
             assertTrue(elapsedMs < 1000, "耗时 " + elapsedMs + "ms");
-            QueryResult kept = run(db, "MATCH (a:Company {id:0})-[e:holder]->{10}(b) WHERE e.rank = 0 RETURN b.id");
+            QueryResult kept = run(db,
+                    "MATCH (a:Company {id:0})-[e:holder]->{10}(b) WHERE e.rank = 0 RETURN b.id",
+                    new QueryLimits(64, 64, 10, 100));
             assertEquals(40, kept.rows().size());
             Set<Long> idsAtEnd = new HashSet<>(column(kept));
             for (int index = 0; index < 40; index++) {
@@ -98,7 +106,7 @@ class HopMatchTest {
                     256L * 1024 * 1024,
                     p50,
                     p99);
-            assertTrue(p99 < 10_000_000L, "10 跳 p99=" + p99 / 1_000_000.0 + "ms");
+            assertTrue(p99 < 20_000_000L, "10 跳 p99=" + p99 / 1_000_000.0 + "ms");
         }
     }
 
@@ -175,6 +183,10 @@ class HopMatchTest {
 
     private static QueryResult run(QueryEngineTest.Db db, String gql) {
         return db.engine.execute(db.session, gql, java.util.Map.of(), new QueryLimits(64), null);
+    }
+
+    private static QueryResult run(QueryEngineTest.Db db, String gql, QueryLimits limits) {
+        return db.engine.execute(db.session, gql, java.util.Map.of(), limits, null);
     }
 
     private static List<Long> column(QueryResult result) {

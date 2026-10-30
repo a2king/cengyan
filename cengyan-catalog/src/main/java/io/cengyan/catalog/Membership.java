@@ -156,7 +156,7 @@ public final class Membership implements WriteGate {
                     throw new CengyanException(ErrorCode.INTERNAL, "无法创建节点目录：" + ex.getMessage(), ex);
                 }
                 local.checkpoint(dir);
-                GraphStore opened = GraphStore.open(dir, options);
+                GraphStore opened = local.openReplica(dir);
                 stores.put(nodeId, opened);
                 created.add(nodeId);
                 putNode(nodeId, ClusterCodec.ROLE_STORAGE, ClusterCodec.STATE_LEARNER, "checkpoint");
@@ -192,13 +192,14 @@ public final class Membership implements WriteGate {
     public int addStorage(String address) {
         String location = requireAddress(address);
         int nodeId = nextNodeId();
-        GraphStore opened = GraphStore.open(nodeDir(nodeId), options);
+        GraphStore opened = local.openReplica(nodeDir(nodeId));
         stores.put(nodeId, opened);
         putNode(nodeId, ClusterCodec.ROLE_STORAGE, ClusterCodec.STATE_ACTIVE, location);
         for (String graph : catalog.graphs()) {
             int graphId = catalog.graph(graph).graphId();
             ensureVotes(graphId);
-            movePart(graphId, 0, nodeId);
+            int parts = Math.max(1, catalog.partCount(graphId));
+            movePart(graphId, Math.floorMod(nodeId - 2, parts), nodeId);
         }
         log.info("已加入存储节点 {}，地址 {}", nodeId, location);
         return nodeId;
@@ -428,6 +429,10 @@ public final class Membership implements WriteGate {
             voters.put(target, true);
             if (!hasVote(source)) {
                 voters.remove(source);
+                GraphStore sourceStore = stores.get(source);
+                if (sourceStore != null && sourceStore != targetStore) {
+                    sourceStore.deletePartition(graphId, partId);
+                }
                 if (source == LOCAL_NODE) {
                     voters.put(LOCAL_NODE, true);
                 }
@@ -613,7 +618,7 @@ public final class Membership implements WriteGate {
             }
             Path dir = nodeDir(nodeId);
             if (Files.isDirectory(dir)) {
-                stores.put(nodeId, GraphStore.open(dir, options));
+                stores.put(nodeId, local.openReplica(dir));
             }
         }
         if (voters.isEmpty()) {

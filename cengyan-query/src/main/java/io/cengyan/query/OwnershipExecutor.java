@@ -43,13 +43,11 @@ public final class OwnershipExecutor {
             Map<Long, List<Edge>> edges,
             long start,
             int hops,
-            double minEdgeRatio,
-            double minAccumRatio,
             CancelToken cancel) {
         if (edges == null) {
             throw new IllegalArgumentException("边不能为空");
         }
-        return compute(start, hops, minEdgeRatio, minAccumRatio, cancel,
+        return compute(start, hops, cancel,
                 vid -> edges.getOrDefault(vid, List.of()));
     }
 
@@ -61,21 +59,17 @@ public final class OwnershipExecutor {
             String ratioProp,
             long start,
             int hops,
-            double minEdgeRatio,
-            double minAccumRatio,
             CancelToken cancel) {
         if (session == null || type == null) {
             throw new IllegalArgumentException("快照和边类型不能为空");
         }
-        return compute(start, hops, minEdgeRatio, minAccumRatio, cancel,
+        return compute(start, hops, cancel,
                 vid -> load(session, graphId, type, ratioProp, vid, cancel));
     }
 
     private static Result compute(
             long start,
             int hops,
-            double minEdgeRatio,
-            double minAccumRatio,
             CancelToken cancel,
             LongFunction<List<Edge>> edges) {
         if (hops < 0) {
@@ -86,7 +80,7 @@ public final class OwnershipExecutor {
         HashSet<Long> onStack = new HashSet<>();
         stack.push(start);
         onStack.add(start);
-        dfs(start, 1.0d, 0, hops, minEdgeRatio, minAccumRatio, edges, best, stack, onStack, cancel);
+        dfs(start, 1.0d, 0, hops, edges, best, stack, onStack, cancel);
         best.remove(start);
         Long chosen = null;
         double chosenRatio = 0d;
@@ -109,8 +103,6 @@ public final class OwnershipExecutor {
             double accum,
             int depth,
             int hops,
-            double minEdgeRatio,
-            double minAccumRatio,
             LongFunction<List<Edge>> edges,
             Map<Long, Double> best,
             ArrayDeque<Long> stack,
@@ -128,20 +120,14 @@ public final class OwnershipExecutor {
             if ((seen++ & 63) == 0 && cancel != null && cancel.cancelled()) {
                 throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
             }
-            if (edge.ratio() < minEdgeRatio) {
-                continue;
-            }
             double nxt = accum * edge.ratio();
-            if (nxt < minAccumRatio) {
-                continue;
-            }
             if (onStack.contains(edge.dst())) {
                 continue;
             }
             best.merge(edge.dst(), nxt, Double::sum);
             stack.push(edge.dst());
             onStack.add(edge.dst());
-            dfs(edge.dst(), nxt, depth + 1, hops, minEdgeRatio, minAccumRatio, edges, best, stack, onStack, cancel);
+            dfs(edge.dst(), nxt, depth + 1, hops, edges, best, stack, onStack, cancel);
             stack.pop();
             onStack.remove(edge.dst());
         }

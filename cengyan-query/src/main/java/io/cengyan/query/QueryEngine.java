@@ -10,6 +10,7 @@ import io.cengyan.catalog.ClusterCodec;
 import io.cengyan.catalog.GraphName;
 import io.cengyan.catalog.Membership;
 import io.cengyan.catalog.IndexDef;
+import io.cengyan.catalog.IdType;
 import io.cengyan.catalog.NodeType;
 import io.cengyan.catalog.PropDef;
 import io.cengyan.catalog.RelType;
@@ -30,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /** 执行一条 GQL。同一会话上的语句串行，失败时不返回半截结果。 */
 public final class QueryEngine {
@@ -46,32 +48,18 @@ public final class QueryEngine {
     }
 
     public QueryEngine(Catalog catalog, GraphStore store, String duckdbMemory, Path duckdbTempDirectory) {
-        this(catalog, store, duckdbMemory, duckdbTempDirectory, 0.01d, 0.001d);
+        this(catalog, store, duckdbMemory, duckdbTempDirectory, null);
     }
+
 
     public QueryEngine(
             Catalog catalog,
             GraphStore store,
             String duckdbMemory,
             Path duckdbTempDirectory,
-            double minEdgeRatio,
-            double minAccumRatio) {
-        this(catalog, store, duckdbMemory, duckdbTempDirectory, minEdgeRatio, minAccumRatio, null);
-    }
-
-    public QueryEngine(
-            Catalog catalog,
-            GraphStore store,
-            String duckdbMemory,
-            Path duckdbTempDirectory,
-            double minEdgeRatio,
-            double minAccumRatio,
             Auth auth) {
         if (catalog == null || store == null) {
             throw new IllegalArgumentException("目录和存储不能为空");
-        }
-        if (minEdgeRatio < 0d || minAccumRatio < 0d || !Double.isFinite(minEdgeRatio) || !Double.isFinite(minAccumRatio)) {
-            throw new IllegalArgumentException("比例阈值不能为负");
         }
         this.catalog = catalog;
         this.store = store;
@@ -79,7 +67,7 @@ public final class QueryEngine {
         DuckSettings duck = new DuckSettings(duckdbMemory, duckdbTempDirectory);
         this.match = new MatchExecutor(catalog, store, duck);
         this.mutate = new MutateExecutor(catalog, store);
-        this.procedures = new ProcedureExecutor(catalog, store, minEdgeRatio, minAccumRatio);
+        this.procedures = new ProcedureExecutor(catalog, store);
     }
 
     public void bind(Membership bound) {
@@ -119,7 +107,7 @@ public final class QueryEngine {
             Map<String, Object> values = normalize(params);
             return switch (stmt) {
                 case Stmt.CreateGraph create -> {
-                    int created = catalog.createGraph(create.name());
+                     int created = catalog.createGraph(create.name(), create.parts(), create.comment());
                     if (membership != null) {
                         membership.ensureVotes(created);
                     }
@@ -143,6 +131,7 @@ public final class QueryEngine {
                 }
                 case Stmt.Show show -> show(session, show);
                 case Stmt.Describe describe -> describe(session, describe);
+                case Stmt.Explain explain -> explain(session, explain.query());
                 case Stmt.CreateType create -> {
                     createType(graphId(session), create);
                     yield QueryResult.changed(1);
@@ -179,6 +168,102 @@ public final class QueryEngine {
         }
     }
 
+    /**
+     * 专用批量导入入口。它绕过逐条 GQL 解析，但仍复用目录 Schema、索引和权限校验。
+     * 网络层应把大数据集切成有限大小的批次，不要把十亿行放进一个请求。
+     */
+    public QueryResult bulkInsert(
+            SessionState session,
+            String kind,
+            String typeName,
+            List<Map<String, Object>> rows,
+            boolean ignoreExisting,
+            CancelToken cancel) {
+        if (session == null || rows == null || kind == null || typeName == null) {
+            throw new IllegalArgumentException("批量导入参数不能为空");
+        }
+        synchronized (session) {
+            if (session.readOnly()) {
+                throw new CengyanException(ErrorCode.FORBIDDEN, "只读会话不能修改数据");
+            }
+            if (cancel != null && cancel.cancelled()) {
+                throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
+            }
+            int graphId = graphId(session);
+            if ("node".equalsIgnoreCase(kind)) {
+                NodeType type = catalog.nodeType(graphId, typeName);
+                List<Object> externalIds = new ArrayList<>(rows.size());
+                for (Map<String, Object> row : rows) {
+                    if (row == null || !row.containsKey("id")) {
+                        throw new CengyanException(ErrorCode.SYNTAX, "批量节点缺少 id");
+                    }
+                    externalIds.add(row.get("id"));
+                }
+                List<Catalog.BulkVertexValue> writes = new ArrayList<>(rows.size());
+                for (int i = 0; i < rows.size(); i++) {
+                    Map<String, Object> properties = new LinkedHashMap<>(rows.get(i));
+                    properties.remove("id");
+                    writes.add(new Catalog.BulkVertexValue(externalIds.get(i), properties));
+                }
+                int written = catalog.bulkInsertVerticesExternal(graphId, typeName, writes, ignoreExisting);
+                return QueryResult.changed(written);
+            }
+            if ("edge".equalsIgnoreCase(kind) || "rel".equalsIgnoreCase(kind)) {
+                catalog.relType(graphId, typeName);
+                List<Catalog.BulkEdge> writes = new ArrayList<>(rows.size());
+                List<Object> sourceValues = new ArrayList<>(rows.size());
+                List<Object> targetValues = new ArrayList<>(rows.size());
+                for (Map<String, Object> row : rows) {
+                    if (row == null || !row.containsKey("src") || !row.containsKey("dst")) {
+                        throw new CengyanException(ErrorCode.SYNTAX, "批量边缺少 src 或 dst");
+                    }
+                    sourceValues.add(row.get("src"));
+                    targetValues.add(row.get("dst"));
+                }
+                List<Long> sourceIds = catalog.findBulkUnqualifiedVertexIds(graphId, sourceValues);
+                List<Long> targetIds = catalog.findBulkUnqualifiedVertexIds(graphId, targetValues);
+                for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+                    Map<String, Object> row = rows.get(rowIndex);
+                    long src = sourceIds.get(rowIndex);
+                    long dst = targetIds.get(rowIndex);
+                    long rank = row.containsKey("rank") ? bulkLong(row.get("rank"), "rank") : 0L;
+                    Map<String, Object> properties = new LinkedHashMap<>();
+                    Object nested = row.get("properties");
+                    if (nested != null) {
+                        if (!(nested instanceof Map<?, ?> map)) {
+                            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "边 properties 必须是 JSON 对象");
+                        }
+                        for (Map.Entry<?, ?> entry : map.entrySet()) {
+                            if (!(entry.getKey() instanceof String key)) {
+                                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "边属性名必须是字符串");
+                            }
+                            properties.put(key, entry.getValue());
+                        }
+                    }
+                    for (Map.Entry<String, Object> entry : row.entrySet()) {
+                        if (!Set.of("src", "dst", "rank", "properties").contains(entry.getKey())) {
+                            properties.put(entry.getKey(), entry.getValue());
+                        }
+                    }
+                    writes.add(new Catalog.BulkEdge(rank, src, dst, properties));
+                }
+                int written = catalog.bulkInsertRels(graphId, typeName, writes, ignoreExisting);
+                return QueryResult.changed(written);
+            }
+            throw new CengyanException(ErrorCode.SYNTAX, "bulkInsert 的 kind 只能是 node 或 edge");
+        }
+    }
+
+    private static long bulkLong(Object value, String name) {
+        if (!(value instanceof Number number)
+                || value instanceof Float
+                || value instanceof Double && number.doubleValue() != number.longValue()) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, name + " 必须是整数");
+        }
+        return number.longValue();
+    }
+
+
     private int bindCompute(SessionState session) {
         if (membership == null) {
             return 0;
@@ -200,9 +285,9 @@ public final class QueryEngine {
             case GRAPHS -> {
                 List<List<Object>> rows = new ArrayList<>();
                 for (String name : catalog.graphs()) {
-                    rows.add(List.of(name));
+                    rows.add(new ArrayList<>(List.of(name, catalog.graph(name).comment())));
                 }
-                yield new QueryResult(List.of("name"), rows, 0);
+                yield new QueryResult(List.of("name", "comment"), rows, 0);
             }
             case ALIASES -> {
                 List<List<Object>> rows = new ArrayList<>();
@@ -311,9 +396,9 @@ public final class QueryEngine {
                 case "stats" -> {
                     List<List<Object>> rows = new ArrayList<>();
                     for (StatsRow row : catalog.stats(graphId(session), cancel)) {
-                        rows.add(List.of(row.target(), row.name(), row.count(), row.maxDegree()));
+                        rows.add(List.of(row.target(), row.name(), row.count()));
                     }
-                    yield new QueryResult(List.of("target", "name", "count", "maxDegree"), rows, 0);
+                    yield new QueryResult(List.of("target", "name", "count"), rows, 0);
                 }
                 case "storage" -> new QueryResult(
                         List.of("bytes"), List.of(List.of(store.storageSizeBytes())), 0);
@@ -484,14 +569,16 @@ public final class QueryEngine {
         List<List<Object>> rows = new ArrayList<>();
         if (node) {
             for (NodeType type : catalog.nodeTypes(graphId)) {
-                rows.add(List.of(type.name(), type.id(), type.schemaVersion()));
+                rows.add(nullableRow(type.name(), type.id(), type.schemaVersion(), type.idType().name(), type.idLength(), type.comment()));
             }
         } else {
             for (RelType type : catalog.relTypes(graphId)) {
-                rows.add(List.of(type.name(), type.id(), type.schemaVersion()));
+                rows.add(nullableRow(type.name(), type.id(), type.schemaVersion(), type.comment()));
             }
         }
-        return new QueryResult(List.of("name", "id", "schemaVersion"), rows, 0);
+        return node
+                ? new QueryResult(List.of("name", "id", "schemaVersion", "idType", "idLength", "comment"), rows, 0)
+                : new QueryResult(List.of("name", "id", "schemaVersion", "comment"), rows, 0);
     }
 
     private QueryResult describe(SessionState session, Stmt.Describe describe) {
@@ -501,25 +588,52 @@ public final class QueryEngine {
                 : catalog.relType(graphId, describe.name()).properties();
         List<List<Object>> rows = new ArrayList<>();
         for (PropDef property : properties) {
-            rows.add(List.of(property.name(), property.type().name(), property.nullable()));
+            rows.add(nullableRow(property.name(), property.type().name(), property.nullable(), property.comment()));
         }
-        return new QueryResult(List.of("property", "type", "nullable"), rows, 0);
+        return new QueryResult(List.of("property", "type", "nullable", "comment"), rows, 0);
     }
 
     private void createType(int graphId, Stmt.CreateType create) {
         List<PropDef> properties = new ArrayList<>();
         for (Stmt.Field field : create.fields()) {
-            properties.add(new PropDef(field.name(), valueType(field.valueType()), field.nullable()));
+            properties.add(new PropDef(field.name(), valueType(field.valueType()), field.nullable(), field.comment()));
         }
         if (create.node()) {
-            catalog.createNodeType(graphId, create.name(), properties);
+            IdType idType;
+            try {
+                idType = IdType.parse(create.idType());
+            } catch (IllegalArgumentException ex) {
+                throw new CengyanException(ErrorCode.TYPE_MISMATCH, ex.getMessage(), ex);
+            }
+            catalog.createNodeType(graphId, create.name(), idType, create.idLength(), properties, create.comment());
         } else {
-            catalog.createRelType(graphId, create.name(), properties);
+            catalog.createRelType(graphId, create.name(), properties, create.comment());
         }
     }
 
+    private QueryResult explain(SessionState session, Stmt.Match match) {
+        List<List<Object>> rows = new ArrayList<>();
+        String source = match.source().typeName() == null ? "unknown" : match.source().typeName();
+        boolean hasId = match.source().properties().stream().anyMatch(prop -> "id".equals(prop.name()));
+        rows.add(List.of("Source", "NODE TYPE " + source));
+        rows.add(List.of(hasId ? "IdLookup" : "VertexScan", hasId ? "pattern id lookup" : "scan node keys"));
+        if (match.where() != null) rows.add(List.of("Filter", "WHERE residual/pushdown analysis"));
+        if (!match.orderBy().isEmpty()) rows.add(List.of("Sort", "ORDER BY"));
+        if (match.distinct()) rows.add(List.of("Distinct", "RETURN DISTINCT"));
+        if (match.skip() != null || match.limit() != null) {
+            rows.add(List.of("Window", "skip=" + (match.skip() == null ? 0 : match.skip())
+                    + " limit=" + (match.limit() == null ? "none" : match.limit())));
+        }
+        rows.add(List.of("Projection", Integer.toString(match.items().size()) + " columns"));
+        return new QueryResult(List.of("operator", "detail"), rows, 0);
+    }
+
+    private static List<Object> nullableRow(Object... values) {
+        return new ArrayList<>(java.util.Arrays.asList(values));
+    }
+
     private void alterType(int graphId, Stmt.AlterType alter) {
-        PropDef property = new PropDef(alter.property(), valueType(alter.valueType()), true);
+        PropDef property = new PropDef(alter.property(), valueType(alter.valueType()), true, alter.comment());
         if (alter.node()) {
             catalog.addNodeProperty(graphId, alter.typeName(), property);
         } else {
@@ -530,7 +644,8 @@ public final class QueryEngine {
     private void insert(int graphId, Stmt.Insert insert, Map<String, Object> params) {
         ExprEval eval = new ExprEval(params, true);
         if (insert.edge() == null) {
-            catalog.insertVertex(graphId, requireType(insert.source()), idOf(insert.source(), eval),
+            NodeType type = catalog.nodeType(graphId, requireType(insert.source()));
+            catalog.insertVertex(graphId, type.name(), catalog.resolveVertexId(graphId, type, idValue(insert.source(), eval)),
                     properties(insert.source(), eval), false);
             return;
         }
@@ -551,14 +666,16 @@ public final class QueryEngine {
                 graphId,
                 insert.edge().typeName(),
                 rank,
-                vertex(from, eval),
-                vertex(to, eval),
+                vertex(graphId, from, eval),
+                vertex(graphId, to, eval),
                 properties(insert.edge().properties(), eval),
                 false);
     }
 
-    private static VertexWrite vertex(Stmt.NodePat node, ExprEval eval) {
-        long vid = idOf(node, eval);
+    private VertexWrite vertex(int graphId, Stmt.NodePat node, ExprEval eval) {
+        Object value = idValue(node, eval);
+        NodeType type = node.typeName() == null ? null : catalog.nodeType(graphId, node.typeName());
+        long vid = catalog.resolveVertexId(graphId, type, value);
         if (node.typeName() == null) {
             return VertexWrite.onlyId(vid);
         }
@@ -572,16 +689,12 @@ public final class QueryEngine {
         return node.typeName();
     }
 
-    private static long idOf(Stmt.NodePat node, ExprEval eval) {
+    private static Object idValue(Stmt.NodePat node, ExprEval eval) {
         for (Stmt.Prop prop : node.properties()) {
             if (!"id".equals(prop.name())) {
                 continue;
             }
-            Object value = eval.eval(prop.value());
-            if (!(value instanceof Long id)) {
-                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "id 必须是整数");
-            }
-            return id;
+            return eval.eval(prop.value());
         }
         throw new CengyanException(ErrorCode.SYNTAX, "插入需要 id");
     }

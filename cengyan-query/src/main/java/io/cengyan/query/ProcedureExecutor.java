@@ -31,14 +31,10 @@ final class ProcedureExecutor {
 
     private final Catalog catalog;
     private final GraphStore store;
-    private final double minEdgeRatio;
-    private final double minAccumRatio;
 
-    ProcedureExecutor(Catalog catalog, GraphStore store, double minEdgeRatio, double minAccumRatio) {
+    ProcedureExecutor(Catalog catalog, GraphStore store) {
         this.catalog = catalog;
         this.store = store;
-        this.minEdgeRatio = minEdgeRatio;
-        this.minAccumRatio = minAccumRatio;
     }
 
     QueryResult call(Stmt.Call call, int graphId, Map<String, Object> params, QueryLimits limits, CancelToken cancel) {
@@ -60,11 +56,14 @@ final class ProcedureExecutor {
             CancelToken cancel) {
         known(args, SHORTEST_ARGS);
         List<String> columns = columns(yield, SHORTEST_YIELD);
-        long start = requiredLong(args, "start");
-        long end = requiredLong(args, "end");
+        long start = requiredVertexId(graphId, args, "start");
+        long end = requiredVertexId(graphId, args, "end");
         String rel = requiredString(args, "rel");
         int hops = hops(requiredLong(args, "hops"), limits.maxHops());
         RelType type = catalog.relType(graphId, rel);
+        if (start == Catalog.MISSING_VERTEX_ID || end == Catalog.MISSING_VERTEX_ID) {
+            return new QueryResult(columns, List.of(), 0);
+        }
         ShortestPath.Found found;
         try (ReadSession session = store.read()) {
             found = ShortestPath.find(
@@ -74,7 +73,11 @@ final class ProcedureExecutor {
         if (found == null) {
             return new QueryResult(columns, List.of(), 0);
         }
-        Map<String, Object> values = Map.of("length", (long) found.length(), "vids", found.vids());
+        List<Object> external = new ArrayList<>(found.vids().size());
+        for (long vid : found.vids()) {
+            external.add(catalog.externalVertexId(graphId, null, vid));
+        }
+        Map<String, Object> values = Map.of("length", (long) found.length(), "vids", external);
         return new QueryResult(columns, List.of(row(columns, values)), 0);
     }
 
@@ -86,7 +89,7 @@ final class ProcedureExecutor {
             CancelToken cancel) {
         known(args, OWNERSHIP_ARGS);
         List<String> columns = columns(yield, OWNERSHIP_YIELD);
-        long start = requiredLong(args, "start");
+        long start = requiredVertexId(graphId, args, "start");
         String rel = requiredString(args, "rel");
         String ratioProp = requiredString(args, "ratioProp");
         int hops = hops(requiredLong(args, "hops"), limits.maxHops());
@@ -95,12 +98,13 @@ final class ProcedureExecutor {
         OwnershipExecutor.Result result;
         try (ReadSession session = store.read()) {
             result = OwnershipExecutor.largest(
-                    session, graphId, type, ratioProp, start, hops, minEdgeRatio, minAccumRatio, cancel);
+                    session, graphId, type, ratioProp, start, hops, cancel);
         }
-        if (result.vid() == null) {
+        if (result.vid() == null || start == Catalog.MISSING_VERTEX_ID) {
             return new QueryResult(columns, List.of(), 0);
         }
-        Map<String, Object> values = Map.of("vid", result.vid(), "ratio", result.ratio());
+        Map<String, Object> values = Map.of(
+                "vid", catalog.externalVertexId(graphId, null, result.vid()), "ratio", result.ratio());
         return new QueryResult(columns, List.of(row(columns, values)), 0);
     }
 
@@ -113,11 +117,14 @@ final class ProcedureExecutor {
             CancelToken cancel) {
         known(args, SUBGRAPH_ARGS);
         List<String> columns = columns(yield, SUBGRAPH_YIELD);
-        long start = requiredLong(args, "start");
+        long start = requiredVertexId(graphId, args, "start");
         String rel = requiredString(args, "rel");
         int hops = hops(requiredLong(args, "hops"), limits.maxHops());
         RelType type = catalog.relType(graphId, rel);
         List<Long> vids = new ArrayList<>();
+        if (start == Catalog.MISSING_VERTEX_ID) {
+            return new QueryResult(columns, List.of(), 0);
+        }
         vids.add(start);
         if (hops > 0) {
             try (ReadSession session = store.read()) {
@@ -129,7 +136,8 @@ final class ProcedureExecutor {
         }
         List<List<Object>> rows = new ArrayList<>();
         for (long vid : vids) {
-            rows.add(row(columns, Map.<String, Object>of("vid", vid)));
+            rows.add(row(columns, Map.<String, Object>of(
+                    "vid", catalog.externalVertexId(graphId, null, vid))));
         }
         return new QueryResult(columns, rows, 0);
     }
@@ -207,6 +215,14 @@ final class ProcedureExecutor {
             return number.longValue();
         }
         throw new CengyanException(ErrorCode.TYPE_MISMATCH, key + " 必须是整数");
+    }
+
+    private long requiredVertexId(int graphId, Map<String, Object> args, String key) {
+        Object value = required(args, key);
+        if (!(value instanceof Number) && !(value instanceof String)) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, key + " 必须是整数或字符串");
+        }
+        return catalog.findVertexId(graphId, null, value);
     }
 
     private static String requiredString(Map<String, Object> args, String key) {

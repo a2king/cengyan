@@ -48,6 +48,58 @@ class QueryEngineTest {
     }
 
     @Test
+    void 批量节点和边一次提交并可查询() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH Bulk",
+                    "USE Bulk",
+                    "CREATE NODE TYPE Person (name STRING NULL)",
+                    "CREATE REL TYPE knows (score DOUBLE NULL)");
+            QueryResult nodes = db.engine.bulkInsert(
+                    db.session,
+                    "node",
+                    "Person",
+                    List.of(
+                            Map.of("id", 1L, "name", "one"),
+                            Map.of("id", 2L, "name", "two"),
+                            Map.of("id", 3L, "name", "three")),
+                    false,
+                    null);
+            assertEquals(3, nodes.rowsAffected());
+            QueryResult edges = db.engine.bulkInsert(
+                    db.session,
+                    "edge",
+                    "knows",
+                    List.of(
+                            Map.of("src", 1L, "dst", 2L, "rank", 0L, "score", 0.5d),
+                            Map.of("src", 1L, "dst", 3L, "rank", 0L, "score", 0.25d)),
+                    false,
+                    null);
+            assertEquals(2, edges.rowsAffected());
+            QueryResult result = run(db, "MATCH (a:Person {id:1})-[e:knows]->(b) RETURN b.id, e.score");
+            assertEquals(2, result.rows().size());
+        }
+    }
+
+    @Test
+    void 批量节点校验失败时整批不提交() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH BulkAtomic",
+                    "USE BulkAtomic",
+                    "CREATE NODE TYPE Person (name STRING)");
+            assertThrows(CengyanException.class, () -> db.engine.bulkInsert(
+                    db.session,
+                    "node",
+                    "Person",
+                    List.of(Map.of("id", 1L, "name", "ok"), Map.of("id", 2L)),
+                    false,
+                    null));
+            assertEquals(0, run(db, "MATCH (a:Person) RETURN a.id").rows().size());
+        }
+    }
+
+    @Test
     void 参数不会拼进语句() throws Exception {
         try (Db db = new Db()) {
             script(db,

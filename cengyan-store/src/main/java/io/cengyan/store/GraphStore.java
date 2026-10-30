@@ -1,6 +1,7 @@
 package io.cengyan.store;
 
 import java.nio.file.Path;
+import java.util.function.IntFunction;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
@@ -86,6 +87,36 @@ public interface GraphStore extends AutoCloseable {
 
     /** 按图计算边和点的分片号。没设置时分片数是 1，分片号是 0。 */
     void setPartResolver(BiFunction<Integer, Long, Integer> resolver);
+
+    /** Sets the number of partitions for each graph when the store is physically sharded. */
+    default void setPartCountResolver(IntFunction<Integer> resolver) {
+    }
+
+    /** Sets the physical directory used by a graph partition. */
+    default void setPartitionDirectoryResolver(BiFunction<Integer, Integer, Path> resolver) {
+    }
+
+    /** Migrates legacy graph data that was stored in the root database. */
+    default void migrateLegacy(int[] graphIds) {
+    }
+
+    /** Opens all known physical partitions before a full-node checkpoint. */
+    default void preparePartitions(int[] graphIds) {
+    }
+
+    /** Removes a physical graph partition after ownership has moved away. */
+    default void deletePartition(int graphId, int partId) {
+    }
+
+    /** Rehomes graph data when its partition count changes. */
+    default boolean repartitionGraph(int graphId, int oldPartCount, int newPartCount) {
+        return false;
+    }
+
+    /** Opens a local replica using the same physical layout and routing policy. */
+    default GraphStore openReplica(Path directory) {
+        return GraphStore.open(directory);
+    }
 
     @Override
     void close();

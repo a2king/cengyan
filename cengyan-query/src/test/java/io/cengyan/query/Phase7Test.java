@@ -88,9 +88,9 @@ class Phase7Test {
 
             script(db, "INSERT (a {id:1})-[:holder@1 {ratio:0.1}]->(b {id:1})");
             QueryResult stats = db.engine.admin(db.session, "stats", "", null);
-            assertEquals(List.of("target", "name", "count", "maxDegree"), stats.columns());
-            assertEquals(List.of("NODE", "Company", 3L, 3L), stats.rows().get(0));
-            assertEquals(List.of("REL", "holder", 4L, 3L), stats.rows().get(1));
+            assertEquals(List.of("target", "name", "count"), stats.columns());
+            assertEquals(List.of("NODE", "Company", 3L), stats.rows().get(0));
+            assertEquals(List.of("REL", "holder", 4L), stats.rows().get(1));
 
             run(db, "MATCH (a:Company {id:1}) SET a.name = 'gamma'");
             vertices = db.store.verticesExamined();
@@ -103,6 +103,78 @@ class Phase7Test {
             vertices = db.store.verticesExamined();
             assertEquals(List.of(3L), ids(run(db, "MATCH (a:Company)-[:holder]->(b) WHERE a.capital >= 0 RETURN a.id")));
             assertEquals(vertices, db.store.verticesExamined());
+        }
+    }
+
+    @Test
+    void 字符串节点ID可以写入查询并连接边() throws Exception {
+        try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
+            script(db,
+                    "CREATE GRAPH corp",
+                    "USE corp",
+                    "CREATE NODE TYPE Company ID STRING(32) (name STRING NULL)",
+                    "CREATE REL TYPE holder (ratio DOUBLE NULL)",
+                    "INSERT (a:Company {id:'e_001', name:'root'})",
+                    "INSERT (a:Company {id:'e_002', name:'child'})",
+                    "INSERT (a {id:'e_001'})-[:holder {ratio:0.5}]->(b {id:'e_002'})");
+            QueryResult listed = run(db, "SHOW NODE TYPES");
+            assertEquals(List.of("name", "id", "schemaVersion", "idType", "idLength", "comment"), listed.columns());
+            assertEquals(java.util.Arrays.asList("Company", 1, 1, "STRING", 32, null), listed.rows().get(0));
+            QueryResult result = run(db, "MATCH (a:Company {id:'e_001'}) RETURN a.id, a.name");
+            assertEquals(List.of(List.of("e_001", "root")), result.rows());
+            assertEquals(List.of(List.of("e_002")),
+                    run(db, "MATCH (a:Company {id:'e_001'})-[:holder]->(b) RETURN b.id").rows());
+            assertEquals(List.of(List.of("e_002")),
+                    run(db, "MATCH (a:Company {id:'e_001'})-[:holder]->(b {id:'e_002'}) RETURN b.id").rows());
+            assertEquals(List.of(),
+                    run(db, "MATCH (a:Company {id:'e_001'})-[:holder]->(b {id:'missing'}) RETURN b.id").rows());
+            Map<?, ?> edge = (Map<?, ?>) run(db,
+                    "MATCH (a:Company {id:'e_001'})-[e:holder]->(b) RETURN e").rows().get(0).get(0);
+            assertEquals("e_001", edge.get("src"));
+            assertEquals("e_002", edge.get("dst"));
+        }
+    }
+
+    @Test
+    void 查询和修改不存在的字符串ID不会创建映射() throws Exception {
+        try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
+            script(db,
+                    "CREATE GRAPH corp",
+                    "USE corp",
+                    "CREATE NODE TYPE Company ID STRING(32) (name STRING NULL)",
+                    "CREATE REL TYPE holder ()",
+                    "INSERT (a:Company {id:'e_001', name:'root'})");
+            assertEquals(List.of(), run(db, "MATCH (a:Company {id:'missing'}) RETURN a.id").rows());
+            script(db, "MATCH (a:Company {id:'missing'}) SET a.name = 'ghost'");
+            assertEquals(List.of(), run(db, "MATCH (a {id:'missing'}) RETURN a.id").rows());
+            CengyanException missing = assertThrows(CengyanException.class,
+                    () -> run(db, "INSERT (a {id:'missing'})-[:holder]->(b {id:'e_001'})"));
+            assertEquals(ErrorCode.TYPE_MISMATCH, missing.code());
+        }
+    }
+
+    @Test
+    void 过程调用支持字符串节点ID并返回外部ID() throws Exception {
+        try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
+            script(db,
+                    "CREATE GRAPH corp",
+                    "USE corp",
+                    "CREATE NODE TYPE Company ID STRING(32) (name STRING NULL)",
+                    "CREATE REL TYPE holder (ratio DOUBLE NULL)",
+                    "INSERT (a:Company {id:'e_001', name:'root'})",
+                    "INSERT (a:Company {id:'e_002', name:'mid'})",
+                    "INSERT (a:Company {id:'e_003', name:'leaf'})",
+                    "INSERT (a {id:'e_001'})-[:holder {ratio:0.8}]->(b {id:'e_002'})",
+                    "INSERT (a {id:'e_002'})-[:holder {ratio:0.7}]->(b {id:'e_003'})");
+            QueryResult shortest = run(db,
+                    "CALL path.shortest({start: 'e_001', end: 'e_003', rel: 'holder', hops: 3}) YIELD length, vids");
+            assertEquals(List.of(2L, List.of("e_001", "e_002", "e_003")), shortest.rows().get(0));
+            QueryResult subgraph = run(db,
+                    "CALL subgraph.bounded({start: 'e_001', rel: 'holder', hops: 1}) YIELD vid");
+            assertEquals(List.of(List.of("e_001"), List.of("e_002")), subgraph.rows());
+            QueryResult ownership = run(db,
+                    "CALL ownership.largest_holder({start: 'e_001', rel: 'holder', ratioProp: 'ratio', hops: 3}) YIELD vid, ratio");
+            assertEquals("e_002", ownership.rows().get(0).get(0));
         }
     }
 

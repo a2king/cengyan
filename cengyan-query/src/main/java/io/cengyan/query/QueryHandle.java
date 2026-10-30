@@ -33,9 +33,11 @@ public final class QueryHandle implements CancelToken {
     /** 从现在起 {@code timeoutMs} 毫秒后到期。 */
     public static QueryHandle start(long timeoutMs) {
         if (timeoutMs < 0) {
-            throw new IllegalArgumentException("timeoutMs 不能为负");
+            throw new IllegalArgumentException("timeoutMs 不能为负，0 表示不限");
         }
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        long deadline = timeoutMs == 0
+                ? Long.MAX_VALUE
+                : System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         return new QueryHandle(UUID.randomUUID().toString(), deadline);
     }
 
@@ -74,7 +76,7 @@ public final class QueryHandle implements CancelToken {
         if (canceled.get()) {
             return true;
         }
-        if (System.nanoTime() - deadlineNanos >= 0) {
+        if (deadlineNanos != Long.MAX_VALUE && System.nanoTime() - deadlineNanos >= 0) {
             cancel("超时");
             return true;
         }

@@ -59,7 +59,7 @@ final class MatchExecutor {
         NodeType targetType = match.target().typeName() == null ? null : catalog.nodeType(graphId, match.target().typeName());
         Needs needs = new Needs(match, names, sourceType, targetType, openTypes ? null : rels, sorts(match, names));
         ExprEval eval = new ExprEval(params, false);
-        Long startId = constantId(match.source().properties(), eval);
+        Long startId = constantId(graphId, sourceType, match.source().properties(), eval);
         int window = window(match);
         Push push = push(match.where(), names, eval);
         LongPredicate rankFilter = push.rank;
@@ -69,9 +69,14 @@ final class MatchExecutor {
         }
         LongPredicate rankOnly = rankFilter;
         LongPredicate neighborOnly = push.neighbor;
+        Long targetId = constantId(graphId, targetType, match.target().properties(), eval);
+        if (targetId != null) {
+            neighborOnly = and(neighborOnly, value -> value == targetId);
+        }
+        LongPredicate neighborFilter = neighborOnly;
         if (match.edge().minHop() != null) {
             return multi(match, graphId, limits, cancel, names, relType, openTypes, rels, sourceType, targetType, needs, eval,
-                    rankOnly, neighborOnly, aggregates);
+                    rankOnly, neighborFilter, aggregates);
         }
         Map<Integer, String> typeNames = new HashMap<>();
         if (relType == null) {
@@ -106,7 +111,7 @@ final class MatchExecutor {
                     allowed = filterStarts(session, graphId, sourceType, eval, match.source(), allowed);
                 }
                 hops.addAll(hopsFromIndex(
-                        indexed, match.edge().direction(), allowed, restrict, rankOnly, neighborOnly, window, cancel));
+                        indexed, match.edge().direction(), allowed, restrict, rankOnly, neighborFilter, window, cancel));
             } else {
                 List<Long> indexedStarts = startId == null && sourceType != null && names.source != null
                         ? IndexLookup.vertexIds(
@@ -128,7 +133,7 @@ final class MatchExecutor {
                         int remaining = window < 0 ? -1 : window - hops.size();
                         try (EdgeCursor cursor = session.scanEdges(
                                 graphId, start, relType.id(), direction, remaining, maxEdges,
-                                edge -> rankOk(rankOnly, edge.rank()) && neighborOk(neighborOnly, other(edge, direction)),
+                                edge -> rankOk(rankOnly, edge.rank()) && neighborOk(neighborFilter, other(edge, direction)),
                                 cancel)) {
                             while (cursor.hasNext()) {
                                 EdgeRef edge = cursor.next();
@@ -152,7 +157,7 @@ final class MatchExecutor {
                     int remaining = window < 0 ? -1 : window - hops.size();
                     try (EdgeCursor cursor = session.scanEdges(
                             graphId, start, typeIds, wideDirections, remaining, maxEdges,
-                            edge -> rankOk(rankOnly, edge.rank()) && neighborOk(neighborOnly, endpoint(edge, start)),
+                            edge -> rankOk(rankOnly, edge.rank()) && neighborOk(neighborFilter, endpoint(edge, start)),
                             cancel)) {
                         while (cursor.hasNext()) {
                             EdgeRef edge = cursor.next();
@@ -179,7 +184,7 @@ final class MatchExecutor {
                     continue;
                 }
                 if (push.residual != null) {
-                    eval.slots(slots(names, match, hop, sourceType, targetType,
+                    eval.slots(slots(graphId, names, match, hop, sourceType, targetType,
                             edgeTypeName(relType, typeNames, hop.edge()),
                             edgeProps == null ? null : edgeProps.get(i),
                             sourceProps.get(hop.start()), targetProps.get(hop.neighbor())));
@@ -209,13 +214,21 @@ final class MatchExecutor {
                 ? null : catalog.nodeType(graphId, match.source().typeName());
         Needs needs = new Needs(match, names, sourceType, null, null, sorts(match, names));
         ExprEval eval = new ExprEval(params, false);
-        Long startId = constantId(match.source().properties(), eval);
+        Long startId = constantId(graphId, sourceType, match.source().properties(), eval);
         int window = window(match);
         Push push = push(match.where(), names, eval);
+        IdConstraint idConstraint = idConstraint(graphId, sourceType, match.where(), names, eval);
         try (ReadSession session = store.read()) {
+            List<Long> candidates = startId != null
+                    ? startId == Catalog.MISSING_VERTEX_ID ? List.of() : List.of(startId)
+                    : idConstraint != null
+                    ? idConstraint.ids()
+                    : null;
             List<Long> starts = filterStarts(
                     session, graphId, sourceType, eval, match.source(),
-                    starts(session, graphId, match.source(), sourceType, startId, limits.maxEdgesPerVertex(), cancel));
+                    candidates != null
+                            ? candidates
+                            : indexedStartsOrScan(session, graphId, sourceType, match, names, eval, window, limits, cancel));
             List<Hop> hops = new ArrayList<>();
             for (long vid : starts) {
                 if (window >= 0 && hops.size() >= window) {
@@ -228,7 +241,7 @@ final class MatchExecutor {
             List<Hop> matched = new ArrayList<>();
             for (Hop hop : hops) {
                 if (push.residual != null) {
-                    eval.slots(slots(names, match, hop, sourceType, null, null, null,
+                    eval.slots(slots(graphId, names, match, hop, sourceType, null, null, null,
                             sourceProps.get(hop.start()), null));
                     if (!eval.isTrue(push.residual)) {
                         continue;
@@ -240,6 +253,62 @@ final class MatchExecutor {
                     sourceProps, Map.of(), session, graphId, aggregates, false, cancel);
         }
     }
+
+    private List<Long> indexedStartsOrScan(
+            ReadSession session, int graphId, NodeType sourceType, Stmt.Match match,
+            Names names, ExprEval eval, int window, QueryLimits limits, CancelToken cancel) {
+        List<Long> indexed = sourceType == null || names.source == null
+                ? null
+                : IndexLookup.vertexIds(catalog.indexes(graphId), session, graphId, sourceType.id(),
+                        sourceType.properties(), names.source, match.where(), eval, cancel);
+        if (indexed != null) return indexed;
+        boolean safeWindow = window >= 0 && match.where() == null
+                && match.orderBy().isEmpty() && !match.distinct();
+        return starts(session, graphId, match.source(), sourceType, null,
+                safeWindow ? window : limits.maxEdgesPerVertex(), cancel);
+    }
+
+    private IdConstraint idConstraint(int graphId, NodeType type, Expr where, Names names, ExprEval eval) {
+        if (where == null || names.source == null || type == null) return null;
+        if (where instanceof Expr.Binary binary && "AND".equals(binary.op())) {
+            IdConstraint left = idConstraint(graphId, type, binary.left(), names, eval);
+            return left != null ? left : idConstraint(graphId, type, binary.right(), names, eval);
+        }
+        if (where instanceof Expr.Binary binary && "=".equals(binary.op())) {
+            Expr constant = isIdExpr(binary.left(), names.source) ? binary.right()
+                    : isIdExpr(binary.right(), names.source) ? binary.left() : null;
+            Object value = evalConstant(constant, eval);
+            if (constant != null && value != null) {
+                long id = catalog.findVertexId(graphId, type, value);
+                return id == Catalog.MISSING_VERTEX_ID ? new IdConstraint(List.of()) : new IdConstraint(List.of(id));
+            }
+        }
+        if (where instanceof Expr.In in && !in.negated()) {
+            if (isIdExpr(in.value(), names.source)) {
+                List<Long> ids = new ArrayList<>();
+                for (Expr option : in.options()) {
+                    Object value = evalConstant(option, eval);
+                    if (value == null) return null;
+                    long id = catalog.findVertexId(graphId, type, value);
+                    if (id != Catalog.MISSING_VERTEX_ID) ids.add(id);
+                }
+                return new IdConstraint(ids);
+            }
+        }
+        return null;
+    }
+
+    private static boolean isIdExpr(Expr expr, String variable) {
+        return expr instanceof Expr.Prop prop && variable.equals(prop.variable()) && "id".equals(prop.field())
+                || expr instanceof Expr.Call call && "id".equalsIgnoreCase(call.name())
+                && call.args().size() == 1 && call.args().get(0) instanceof Expr.Variable v && variable.equals(v.name());
+    }
+
+    private static Object evalConstant(Expr expr, ExprEval eval) {
+        return expr instanceof Expr.Literal || expr instanceof Expr.Param ? eval.eval(expr) : null;
+    }
+
+    private record IdConstraint(List<Long> ids) { }
 
     private QueryResult multi(
             Stmt.Match match,
@@ -259,7 +328,7 @@ final class MatchExecutor {
             String[] aggregates) {
         int minHop = match.edge().minHop();
         int maxHop = match.edge().maxHop() == null ? minHop : match.edge().maxHop();
-        Long startId = constantId(match.source().properties(), eval);
+        Long startId = constantId(graphId, sourceType, match.source().properties(), eval);
         List<Reach> reached = new ArrayList<>();
         java.util.Set<Long> seen = new java.util.LinkedHashSet<>();
         try (ReadSession session = store.read()) {
@@ -326,6 +395,9 @@ final class MatchExecutor {
             int maxEdges,
             CancelToken cancel) {
         if (startId != null) {
+            if (startId == Catalog.MISSING_VERTEX_ID) {
+                return List.of();
+            }
             if (sourceType != null) {
                 byte[] raw = session.get(
                         Cf.VERTEX, KeyCodec.vertexKey(graphId, catalog.partOf(graphId, startId), startId, sourceType.id()));
@@ -464,7 +536,8 @@ final class MatchExecutor {
         return rest;
     }
 
-    private static Map<String, ExprEval.Slot> slots(
+    private Map<String, ExprEval.Slot> slots(
+            int graphId,
             Names names,
             Stmt.Match match,
             Hop hop,
@@ -476,19 +549,26 @@ final class MatchExecutor {
             Map<String, Object> targetProps) {
         Map<String, ExprEval.Slot> slots = new HashMap<>();
         if (names.source != null) {
-            slots.put(names.source, ExprEval.Slot.node(hop.start(), typeName(sourceType), sourceProps));
+            slots.put(names.source, ExprEval.Slot.node(
+                    hop.start(), catalog.externalVertexId(graphId, sourceType, hop.start()),
+                    typeName(sourceType), sourceProps));
         }
         if (names.target != null) {
-            slots.put(names.target, ExprEval.Slot.node(hop.neighbor(), typeName(targetType), targetProps));
+            slots.put(names.target, ExprEval.Slot.node(
+                    hop.neighbor(), catalog.externalVertexId(graphId, targetType, hop.neighbor()),
+                    typeName(targetType), targetProps));
         }
         if (names.edge != null && hop.edge() != null) {
             slots.put(names.edge, ExprEval.Slot.edge(
-                    edgeType, hop.edge().rank(), hop.edge().outSrc(), hop.edge().outDst(), edgeProps));
+                    edgeType, hop.edge().rank(), hop.edge().outSrc(), hop.edge().outDst(),
+                    catalog.externalVertexId(graphId, null, hop.edge().outSrc()),
+                    catalog.externalVertexId(graphId, null, hop.edge().outDst()), edgeProps, null, null));
         }
         return slots;
     }
 
-    private static Map<String, ExprEval.Slot> slots(
+    private Map<String, ExprEval.Slot> slots(
+            int graphId,
             Names names,
             Stmt.Match match,
             Hop hop,
@@ -503,14 +583,18 @@ final class MatchExecutor {
         String sourceName = ends.source != null ? ends.source : typeName(sourceType);
         String targetName = ends.target != null ? ends.target : typeName(targetType);
         if (names.source != null) {
-            slots.put(names.source, ExprEval.Slot.node(hop.start(), sourceName, sourceProps));
+            slots.put(names.source, ExprEval.Slot.node(
+                    hop.start(), catalog.externalVertexId(graphId, sourceType, hop.start()), sourceName, sourceProps));
         }
         if (names.target != null) {
-            slots.put(names.target, ExprEval.Slot.node(hop.neighbor(), targetName, targetProps));
+            slots.put(names.target, ExprEval.Slot.node(
+                    hop.neighbor(), catalog.externalVertexId(graphId, targetType, hop.neighbor()), targetName, targetProps));
         }
         if (names.edge != null && hop.edge() != null) {
             slots.put(names.edge, ExprEval.Slot.edge(
-                    edgeType, hop.edge().rank(), hop.edge().outSrc(), hop.edge().outDst(), edgeProps,
+                    edgeType, hop.edge().rank(), hop.edge().outSrc(), hop.edge().outDst(),
+                    catalog.externalVertexId(graphId, null, hop.edge().outSrc()),
+                    catalog.externalVertexId(graphId, null, hop.edge().outDst()), edgeProps,
                     ends.edgeSrc, ends.edgeDst));
         }
         return slots;
@@ -598,7 +682,7 @@ final class MatchExecutor {
                     hop.edge().outSrc(), hop, sourceName, targetName, session, graphId, typeCache);
             String edgeDst = hop.edge() == null ? null : endpointType(
                     hop.edge().outDst(), hop, sourceName, targetName, session, graphId, typeCache);
-            eval.slots(slots(names, match, hop, sourceType, targetType,
+            eval.slots(slots(graphId, names, match, hop, sourceType, targetType,
                     edgeTypeName(relType, typeNames, hop.edge()),
                     edgeProps == null ? null : edgeProps.get(i),
                     sourceProps.get(hop.start()), targetProps.get(hop.neighbor()),
@@ -758,16 +842,12 @@ final class MatchExecutor {
         return (int) total;
     }
 
-    private static Long constantId(List<Stmt.Prop> props, ExprEval eval) {
+    private Long constantId(int graphId, NodeType type, List<Stmt.Prop> props, ExprEval eval) {
         for (Stmt.Prop prop : props) {
             if (!"id".equals(prop.name())) {
                 continue;
             }
-            Object value = eval.eval(prop.value());
-            if (!(value instanceof Long id)) {
-                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "id 必须是整数");
-            }
-            return id;
+            return catalog.findVertexId(graphId, type, eval.eval(prop.value()));
         }
         return null;
     }

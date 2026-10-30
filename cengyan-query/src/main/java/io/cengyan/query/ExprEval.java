@@ -82,7 +82,7 @@ final class ExprEval {
     private Object field(String variable, String name) {
         Slot slot = slot(variable);
         if (!slot.edge && "id".equals(name)) {
-            return slot.vid;
+            return slot.externalId;
         }
         if (slot.edge && "rank".equals(name)) {
             return slot.rank;
@@ -111,7 +111,7 @@ final class ExprEval {
                 if (slot.edge) {
                     throw new CengyanException(ErrorCode.TYPE_MISMATCH, "边没有 id");
                 }
-                yield slot.vid;
+                yield slot.externalId;
             }
             case "labels", "type" -> {
                 requireArgs(call, 1);
@@ -126,13 +126,13 @@ final class ExprEval {
                 requireArgs(call, 1);
                 Slot slot = slotOf(args.get(0));
                 requireEdge(slot);
-                yield slot.src;
+                yield slot.externalSrc;
             }
             case "endnode" -> {
                 requireArgs(call, 1);
                 Slot slot = slotOf(args.get(0));
                 requireEdge(slot);
-                yield slot.dst;
+                yield slot.externalDst;
             }
             case "coalesce" -> {
                 if (args.isEmpty()) {
@@ -150,10 +150,17 @@ final class ExprEval {
             case "size", "length" -> {
                 requireArgs(call, 1);
                 Object value = eval(args.get(0));
-                if (!(value instanceof List<?> list)) {
-                    throw new CengyanException(ErrorCode.TYPE_MISMATCH, name + " 目前只接受列表");
+                if (value instanceof List<?> list) {
+                    yield (long) list.size();
                 }
-                yield (long) list.size();
+                if (value instanceof Map<?, ?> map) {
+                    yield (long) map.size();
+                }
+                if (value instanceof CharSequence text) {
+                    String string = text.toString();
+                    yield (long) string.codePointCount(0, string.length());
+                }
+                throw new CengyanException(ErrorCode.TYPE_MISMATCH, name + " 需要列表、映射或字符串");
             }
             case "count", "sum" -> throw new CengyanException(ErrorCode.SYNTAX, "聚合只能写在 RETURN");
             default -> throw new CengyanException(ErrorCode.SYNTAX, "未知函数 " + call.name());
@@ -373,38 +380,51 @@ final class ExprEval {
     static final class Slot {
         final boolean edge;
         final long vid;
+        final Object externalId;
         final String typeName;
         final Long rank;
         final Long src;
         final Long dst;
+        final Object externalSrc;
+        final Object externalDst;
         final Map<String, Object> props;
         final Map<String, Object> whole;
 
         private Slot(
                 boolean edge,
                 long vid,
+                Object externalId,
                 String typeName,
                 Long rank,
                 Long src,
                 Long dst,
+                Object externalSrc,
+                Object externalDst,
                 Map<String, Object> props,
                 Map<String, Object> whole) {
             this.edge = edge;
             this.vid = vid;
+            this.externalId = externalId;
             this.typeName = typeName;
             this.rank = rank;
             this.src = src;
             this.dst = dst;
+            this.externalSrc = externalSrc;
+            this.externalDst = externalDst;
             this.props = props;
             this.whole = whole;
         }
 
         static Slot node(long vid, String typeName, Map<String, Object> props) {
+            return node(vid, vid, typeName, props);
+        }
+
+        static Slot node(long vid, Object externalId, String typeName, Map<String, Object> props) {
             Map<String, Object> body = new java.util.LinkedHashMap<>();
-            body.put("id", vid);
+            body.put("id", externalId);
             body.put("type", typeName);
             body.put("properties", props == null ? Map.of() : props);
-            return new Slot(false, vid, typeName, null, null, null, props, body);
+            return new Slot(false, vid, externalId, typeName, null, null, null, null, null, props, body);
         }
 
         static Slot edge(String typeName, long rank, long src, long dst, Map<String, Object> props) {
@@ -419,11 +439,24 @@ final class ExprEval {
                 Map<String, Object> props,
                 String srcType,
                 String dstType) {
+            return edge(typeName, rank, src, dst, src, dst, props, srcType, dstType);
+        }
+
+        static Slot edge(
+                String typeName,
+                long rank,
+                long src,
+                long dst,
+                Object externalSrc,
+                Object externalDst,
+                Map<String, Object> props,
+                String srcType,
+                String dstType) {
             Map<String, Object> body = new java.util.LinkedHashMap<>();
             body.put("type", typeName);
             body.put("rank", rank);
-            body.put("src", src);
-            body.put("dst", dst);
+            body.put("src", externalSrc);
+            body.put("dst", externalDst);
             if (srcType != null && !srcType.isBlank()) {
                 body.put("srcType", srcType);
             }
@@ -431,7 +464,7 @@ final class ExprEval {
                 body.put("dstType", dstType);
             }
             body.put("properties", props == null ? Map.of() : props);
-            return new Slot(true, 0L, typeName, rank, src, dst, props, body);
+            return new Slot(true, 0L, null, typeName, rank, src, dst, externalSrc, externalDst, props, body);
         }
 
         Object whole() {

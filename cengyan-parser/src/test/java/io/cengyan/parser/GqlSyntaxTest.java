@@ -103,4 +103,20 @@ class GqlSyntaxTest {
         assertTrue(duplicated.getMessage().contains("边类型重复"));
         assertInstanceOf(Stmt.Insert.class, Gql.parse("INSERT (a {id:1})-[e]->(b {id:2})"));
     }
+
+    @Test
+    void 关键字可以作为变量和函数名使用() {
+        assertTrue(Gql.tree("MATCH (type:Company {id:1})-[type:holder]->(b) RETURN type(type)")
+                .contains("type(type)"));
+    }
+
+    @Test
+    void schema注释可以写在图类型和字段上() {
+        Stmt.CreateGraph graph = (Stmt.CreateGraph) Gql.parse("CREATE GRAPH Company COMMENT '企业图谱'");
+        assertEquals("企业图谱", graph.comment());
+        Stmt.CreateType type = (Stmt.CreateType) Gql.parse(
+                "CREATE NODE TYPE Company COMMENT '企业节点' ID STRING(32) (name STRING NULL COMMENT '名称')");
+        assertEquals("企业节点", type.comment());
+        assertEquals("名称", type.fields().get(0).comment());
+    }
 }

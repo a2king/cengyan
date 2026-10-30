@@ -103,7 +103,7 @@ final class MutateExecutor {
             if (!same(eval, withoutId(bound.source.properties()), props)) {
                 continue;
             }
-            slots(eval, bound, vid, vid, null, props, Map.of(), Map.of());
+            slots(graphId, eval, bound, vid, vid, null, props, Map.of(), Map.of());
             if (where != null && !eval.isTrue(where)) {
                 continue;
             }
@@ -127,7 +127,7 @@ final class MutateExecutor {
             int maxEdges,
             CancelToken cancel) {
         List<Long> starts = starts(session, graphId, bound, eval, maxEdges, cancel);
-        Long targetId = id(bound.target, eval);
+        Long targetId = id(graphId, bound.target, bound.targetType, eval);
         Map<Long, VertexUpdate> vertices = new LinkedHashMap<>();
         Map<EdgeRef, EdgeUpdate> edges = new LinkedHashMap<>();
         LinkedHashSet<Long> deletedVertices = new LinkedHashSet<>();
@@ -209,7 +209,7 @@ final class MutateExecutor {
             if (!same(eval, withoutId(bound.target.properties()), targetProps == null ? Map.of() : targetProps)) {
                 continue;
             }
-            slots(eval, bound, start, neighbor, edge, sourceProps, targetProps, edgeProps);
+            slots(graphId, eval, bound, start, neighbor, edge, sourceProps, targetProps, edgeProps);
             if (where != null && !eval.isTrue(where)) {
                 continue;
             }
@@ -305,8 +305,11 @@ final class MutateExecutor {
 
     private List<Long> starts(
             ReadSession session, int graphId, Bound bound, ExprEval eval, int maxEdges, CancelToken cancel) {
-        Long sourceId = id(bound.source, eval);
+        Long sourceId = id(graphId, bound.source, bound.sourceType, eval);
         if (sourceId != null) {
+            if (sourceId == Catalog.MISSING_VERTEX_ID) {
+                return List.of();
+            }
             if (bound.sourceType != null && vertexProps(session, graphId, bound.sourceType, sourceId) == null) {
                 return List.of();
             }
@@ -487,7 +490,8 @@ final class MutateExecutor {
         throw new CengyanException(ErrorCode.SYNTAX, "未知变量 " + variable);
     }
 
-    private static void slots(
+    private void slots(
+            int graphId,
             ExprEval eval,
             Bound bound,
             long start,
@@ -499,15 +503,19 @@ final class MutateExecutor {
         Map<String, ExprEval.Slot> slots = new LinkedHashMap<>();
         if (bound.source.variable() != null) {
             slots.put(bound.source.variable(), ExprEval.Slot.node(
-                    start, bound.sourceType == null ? null : bound.sourceType.name(), sourceProps));
+                    start, catalog.externalVertexId(graphId, bound.sourceType, start),
+                    bound.sourceType == null ? null : bound.sourceType.name(), sourceProps));
         }
         if (bound.target != null && bound.target.variable() != null) {
             slots.put(bound.target.variable(), ExprEval.Slot.node(
-                    neighbor, bound.targetType == null ? null : bound.targetType.name(), targetProps));
+                    neighbor, catalog.externalVertexId(graphId, bound.targetType, neighbor),
+                    bound.targetType == null ? null : bound.targetType.name(), targetProps));
         }
         if (bound.edge != null && bound.edge.variable() != null && edge != null) {
             slots.put(bound.edge.variable(), ExprEval.Slot.edge(
-                    typeOf(bound, edge).name(), edge.rank(), edge.outSrc(), edge.outDst(), edgeProps));
+                    typeOf(bound, edge).name(), edge.rank(), edge.outSrc(), edge.outDst(),
+                    catalog.externalVertexId(graphId, null, edge.outSrc()),
+                    catalog.externalVertexId(graphId, null, edge.outDst()), edgeProps, null, null));
         }
         eval.slots(slots);
     }
@@ -554,7 +562,7 @@ final class MutateExecutor {
         return true;
     }
 
-    private static Long id(Stmt.NodePat node, ExprEval eval) {
+    private Long id(int graphId, Stmt.NodePat node, NodeType type, ExprEval eval) {
         if (node == null) {
             return null;
         }
@@ -562,11 +570,7 @@ final class MutateExecutor {
             if (!"id".equals(prop.name())) {
                 continue;
             }
-            Object value = eval.eval(prop.value());
-            if (!(value instanceof Long id)) {
-                throw new CengyanException(ErrorCode.TYPE_MISMATCH, "id 必须是整数");
-            }
-            return id;
+            return catalog.findVertexId(graphId, type, eval.eval(prop.value()));
         }
         return null;
     }

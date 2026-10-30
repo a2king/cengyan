@@ -5,7 +5,8 @@ grammar Gql;
 script: statement ';'? EOF;
 
 statement
-    : CREATE GRAPH name=IDENT                                 #createGraph
+    : EXPLAIN MATCH node (edge node)? whereClause? returnClause orderClause? skipClause? limitClause? #explainMatch
+    | CREATE GRAPH name=IDENT PARTS INTEGER_LIT COMMENT STRING_LIT? #createGraph
     | USE name=IDENT                                          #useGraph
     | CREATE ALIAS alias=IDENT FOR GRAPH target=IDENT         #createAlias
     | DROP ALIAS name=IDENT                                   #dropAlias
@@ -18,8 +19,8 @@ statement
     | SHOW INDEXES                                            #showIndexes
     | DESCRIBE NODE TYPE name=IDENT                           #describeNode
     | DESCRIBE REL TYPE name=IDENT                            #describeRel
-    | CREATE NODE TYPE name=IDENT '(' fields? ')'             #createNodeType
-    | CREATE REL TYPE name=IDENT '(' fields? ')'              #createRelType
+    | CREATE NODE TYPE name=IDENT commentClause? '(' fields? ')' #createNodeType
+    | CREATE REL TYPE name=IDENT commentClause? '(' fields? ')'  #createRelType
     | CREATE UNIQUE? INDEX name=IDENT ON NODE TYPE typeName=IDENT '(' indexCols ')' #createNodeIndex
     | CREATE UNIQUE? INDEX name=IDENT ON REL TYPE typeName=IDENT '(' indexCols ')' #createRelIndex
     | ALTER NODE TYPE typeName=IDENT ADD prop=IDENT valueType NULL #alterNode
@@ -32,17 +33,18 @@ statement
     ;
 
 fields: field (',' field)*;
-field: name=IDENT valueType NULL?;
+field: name=IDENT valueType NULL? commentClause?;
+commentClause: COMMENT STRING_LIT;
 indexCols: IDENT (',' IDENT)*;
 valueType: BOOL | BOOLEAN | INT | INTEGER | INT64 | DOUBLE | STRING | DATETIME;
 
-node: '(' variable=IDENT? (':' typeName=IDENT)? props? ')';
+node: '(' variable=(IDENT | TYPE | ID)? (':' typeName=IDENT)? props? ')';
 edge
     : '-' '[' edgeBody ']' '->' quantifier?   #edgeOut
     | '<-' '[' edgeBody ']' '-' quantifier?   #edgeIn
     | '-' '[' edgeBody ']' '-' quantifier?    #edgeAny
     ;
-edgeBody: variable=IDENT? ':' typeName=IDENT ('@' rank=INTEGER_LIT)? props?;
+edgeBody: variable=(IDENT | TYPE | ID)? ':' typeName=IDENT ('@' rank=INTEGER_LIT)? props?;
 // 星号表示所有路径。手写解析器会拒绝，并提示改用最短路或加上边界。
 quantifier: '{' min=INTEGER_LIT (',' max=INTEGER_LIT)? '}' | '*';
 callArgs: callArg (',' callArg)*;
@@ -94,6 +96,9 @@ INTEGER: I N T E G E R;
 DOUBLE: D O U B L E;
 STRING: S T R I N G;
 DATETIME: D A T E T I M E;
+    COMMENT: C O M M E N T;
+    PARTS: P A R T S;
+ID: I D;
 CREATE: C R E A T E;
 GRAPH: G R A P H;
 GRAPHS: G R A P H S;

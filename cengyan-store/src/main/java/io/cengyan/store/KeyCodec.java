@@ -194,6 +194,54 @@ public final class KeyCodec {
         return markedGraphKey(0x22, graphId);
     }
 
+    /** 字符串 ID 映射记录：0x60 + kind + graphId + payload。 */
+    public static byte[] stringIdCounterKey(int graphId) {
+        byte[] key = new byte[4];
+        key[0] = 0x60;
+        key[1] = 0x00;
+        putUint16(key, 2, graphId);
+        return key;
+    }
+
+    public static byte[] stringIdForwardKey(int graphId, String value) {
+        byte[] text = stringIdUtf8(value);
+        if (text.length > 0xFFFF) {
+            throw new IllegalArgumentException("字符串 ID 太长");
+        }
+        byte[] key = new byte[6 + text.length];
+        key[0] = 0x60;
+        key[1] = 0x01;
+        putUint16(key, 2, graphId);
+        putUint16(key, 4, text.length);
+        System.arraycopy(text, 0, key, 6, text.length);
+        return key;
+    }
+
+    public static byte[] stringIdForwardPrefix(int graphId) {
+        byte[] key = new byte[4];
+        key[0] = 0x60;
+        key[1] = 0x01;
+        putUint16(key, 2, graphId);
+        return key;
+    }
+
+    public static byte[] stringIdReverseKey(int graphId, long internalId) {
+        byte[] key = new byte[12];
+        key[0] = 0x60;
+        key[1] = 0x02;
+        putUint16(key, 2, graphId);
+        putInt64(key, 4, internalId);
+        return key;
+    }
+
+    public static byte[] stringIdReversePrefix(int graphId) {
+        byte[] key = new byte[4];
+        key[0] = 0x60;
+        key[1] = 0x02;
+        putUint16(key, 2, graphId);
+        return key;
+    }
+
     public static byte[] typeKey(int graphId, int kind, int typeId) {
         checkUint16(graphId, "graphId");
         checkUint32(typeId, "typeId");
@@ -586,6 +634,19 @@ public final class KeyCodec {
         for (byte one : utf8) {
             if (one == 0) {
                 throw new IllegalArgumentException("名字不能包含空字节");
+            }
+        }
+        return utf8;
+    }
+
+    private static byte[] stringIdUtf8(String value) {
+        if (value == null || value.isEmpty()) {
+            throw new IllegalArgumentException("字符串 ID 不能为空");
+        }
+        byte[] utf8 = value.getBytes(StandardCharsets.UTF_8);
+        for (byte one : utf8) {
+            if (one == 0) {
+                throw new IllegalArgumentException("字符串 ID 不能包含空字节");
             }
         }
         return utf8;

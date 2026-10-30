@@ -4,7 +4,9 @@ import java.util.List;
 
 /** 一条语句。字段名沿用用户写下的大小写。 */
 public sealed interface Stmt {
-    record CreateGraph(String name) implements Stmt {
+    record CreateGraph(String name, int parts, String comment) implements Stmt {
+        public CreateGraph(String name) { this(name, 1, null); }
+        public CreateGraph(String name, String comment) { this(name, 1, comment); }
     }
 
     record Use(String name) implements Stmt {
@@ -28,7 +30,10 @@ public sealed interface Stmt {
     record Describe(boolean node, String name) implements Stmt {
     }
 
-    record CreateType(boolean node, String name, List<Field> fields) implements Stmt {
+    record CreateType(boolean node, String name, String comment, String idType, int idLength, List<Field> fields) implements Stmt {
+        public CreateType(boolean node, String name, String idType, int idLength, List<Field> fields) {
+            this(node, name, null, idType, idLength, fields);
+        }
     }
 
     record CreateIndex(boolean unique, String name, boolean node, String typeName, List<String> properties)
@@ -38,7 +43,10 @@ public sealed interface Stmt {
     record DropIndex(String name) implements Stmt {
     }
 
-    record AlterType(boolean node, String typeName, String property, String valueType) implements Stmt {
+    record AlterType(boolean node, String typeName, String property, String valueType, String comment) implements Stmt {
+        public AlterType(boolean node, String typeName, String property, String valueType) {
+            this(node, typeName, property, valueType, null);
+        }
     }
 
     record Insert(NodePat source, EdgePat edge, NodePat target) implements Stmt {
@@ -56,6 +64,9 @@ public sealed interface Stmt {
             boolean distinct) implements Stmt {
     }
 
+    record Explain(Match query) implements Stmt {
+    }
+
     record Assign(String variable, String field, Expr value) {
     }
 
@@ -71,7 +82,8 @@ public sealed interface Stmt {
     record Call(String name, List<Arg> args, List<String> yield) implements Stmt {
     }
 
-    record Field(String name, String valueType, boolean nullable) {
+    record Field(String name, String valueType, boolean nullable, String comment) {
+        public Field(String name, String valueType, boolean nullable) { this(name, valueType, nullable, null); }
     }
 
     record NodePat(String variable, String typeName, List<Prop> properties) {

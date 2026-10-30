@@ -8,7 +8,6 @@ import io.cengyan.store.KeyCodec;
 import io.cengyan.store.StoreBatch;
 import org.junit.jupiter.api.Test;
 
-import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,7 +29,7 @@ class Phase6Test {
         graph.put(source, List.of(new OwnershipExecutor.Edge(alpha, 0.5d), new OwnershipExecutor.Edge(beta, 0.5d)));
         graph.put(alpha, List.of(new OwnershipExecutor.Edge(gamma, 0.4d)));
         graph.put(beta, List.of(new OwnershipExecutor.Edge(gamma, 0.4d)));
-        OwnershipExecutor.Result result = OwnershipExecutor.largest(graph, source, 10, 0d, 0d, null);
+        OwnershipExecutor.Result result = OwnershipExecutor.largest(graph, source, 10, null);
         assertEquals(0.5d, result.best().get(alpha), 1e-9);
         assertEquals(0.5d, result.best().get(beta), 1e-9);
         assertEquals(0.4d, result.best().get(gamma), 1e-9);
@@ -41,14 +40,11 @@ class Phase6Test {
         cycle.put(source, List.of(new OwnershipExecutor.Edge(alpha, 0.5d), new OwnershipExecutor.Edge(beta, 0.5d)));
         cycle.put(alpha, List.of(new OwnershipExecutor.Edge(alpha, 0.4d)));
         cycle.put(beta, List.of(new OwnershipExecutor.Edge(gamma, 0.4d)));
-        OwnershipExecutor.Result cycled = OwnershipExecutor.largest(cycle, source, 10, 0d, 0d, null);
+        OwnershipExecutor.Result cycled = OwnershipExecutor.largest(cycle, source, 10, null);
         assertEquals(0.5d, cycled.best().get(alpha), 1e-9);
         assertEquals(0.2d, cycled.best().get(gamma), 1e-9);
         assertEquals(alpha, cycled.vid());
 
-        OwnershipExecutor.Result pruned = OwnershipExecutor.largest(graph, source, 10, 0.45d, 0d, null);
-        assertNull(pruned.best().get(gamma));
-        assertEquals(alpha, pruned.vid());
     }
 
     @Test
@@ -220,13 +216,7 @@ class Phase6Test {
     }
 
     private static QueryEngine zeroThresholds(QueryEngineTest.Db db) {
-        return new QueryEngine(
-                db.catalog,
-                db.store,
-                "1GB",
-                Path.of(System.getProperty("java.io.tmpdir"), "cengyan-duck"),
-                0d,
-                0d);
+        return new QueryEngine(db.catalog, db.store);
     }
 
     private static QueryResult run(QueryEngineTest.Db db, String gql) {

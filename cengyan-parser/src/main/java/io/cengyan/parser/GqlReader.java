@@ -18,9 +18,12 @@ final class GqlReader {
             Map.entry("integer", Kind.INTEGER_WORD),
             Map.entry("double", Kind.DOUBLE),
             Map.entry("string", Kind.STRING),
+            Map.entry("id", Kind.ID),
             Map.entry("datetime", Kind.DATETIME),
+            Map.entry("comment", Kind.COMMENT),
             Map.entry("create", Kind.CREATE),
-            Map.entry("graph", Kind.GRAPH),
+             Map.entry("graph", Kind.GRAPH),
+             Map.entry("parts", Kind.PARTS),
             Map.entry("graphs", Kind.GRAPHS),
             Map.entry("use", Kind.USE),
             Map.entry("alias", Kind.ALIAS),
@@ -38,6 +41,7 @@ final class GqlReader {
             Map.entry("null", Kind.NULL),
             Map.entry("insert", Kind.INSERT),
             Map.entry("match", Kind.MATCH),
+            Map.entry("explain", Kind.EXPLAIN),
             Map.entry("where", Kind.WHERE),
             Map.entry("return", Kind.RETURN),
             Map.entry("order", Kind.ORDER),
@@ -100,6 +104,10 @@ final class GqlReader {
             case ALTER -> alter();
             case INSERT -> insert();
             case MATCH -> match();
+            case EXPLAIN -> {
+                next();
+                yield new Stmt.Explain((Stmt.Match) match());
+            }
             case CALL -> call();
             default -> fail("无法识别的语句");
         };
@@ -108,7 +116,9 @@ final class GqlReader {
     private Stmt create() {
         expect(Kind.CREATE, "缺少 CREATE");
         if (take(Kind.GRAPH)) {
-            return new Stmt.CreateGraph(ident());
+            String name = ident();
+            int parts = take(Kind.PARTS) ? positiveInt("分片数量") : 1;
+            return new Stmt.CreateGraph(name, parts, comment());
         }
         if (take(Kind.ALIAS)) {
             String alias = ident();
@@ -122,10 +132,45 @@ final class GqlReader {
         boolean node = nodeOrRel();
         expect(Kind.TYPE, "缺少 TYPE");
         String name = ident();
+        String comment = comment();
+        String idType = "INT";
+        int idLength = 19;
+        if (node && take(Kind.ID)) {
+            if (take(Kind.STRING)) {
+                idType = "STRING";
+                idLength = idLength();
+            } else if (take(Kind.INT) || take(Kind.INT64) || take(Kind.INTEGER_WORD)) {
+                idType = "INT";
+                if (take(Kind.LP)) {
+                    idLength = positiveInt("ID 长度");
+                    expect(Kind.RP, "ID 长度缺少右括号");
+                }
+                if (idLength > 19) {
+                    return fail("INT ID 长度不能超过 19 位");
+                }
+            } else {
+                return fail("ID 后面要写 INT 或 STRING");
+            }
+        }
         expect(Kind.LP, "类型定义缺少左括号");
         List<Stmt.Field> fields = fields();
         expect(Kind.RP, "类型定义缺少右括号");
-        return new Stmt.CreateType(node, name, fields);
+        return new Stmt.CreateType(node, name, comment, idType, idLength, fields);
+    }
+
+    private int idLength() {
+        expect(Kind.LP, "STRING ID 后面要写长度，例如 STRING(64)");
+        int value = positiveInt("ID 长度");
+        expect(Kind.RP, "ID 长度缺少右括号");
+        return value;
+    }
+
+    private int positiveInt(String label) {
+        long value = integer();
+        if (value <= 0 || value > 4096) {
+            return fail(label + "必须在 1 到 4096 之间");
+        }
+        return (int) value;
     }
 
     private Stmt createIndex(boolean unique) {
@@ -196,7 +241,7 @@ final class GqlReader {
         String property = ident();
         String valueType = typeName();
         expect(Kind.NULL, "只能在末尾增加可空列");
-        return new Stmt.AlterType(node, typeName, property, valueType);
+        return new Stmt.AlterType(node, typeName, property, valueType, comment());
     }
 
     private Stmt insert() {
@@ -322,7 +367,14 @@ final class GqlReader {
     private Stmt.Field field() {
         String name = ident();
         String valueType = typeName();
-        return new Stmt.Field(name, valueType, take(Kind.NULL));
+        boolean nullable = take(Kind.NULL);
+        return new Stmt.Field(name, valueType, nullable, comment());
+    }
+
+    private String comment() {
+        if (!take(Kind.COMMENT)) return null;
+        if (peek() != Kind.STRING) return fail("COMMENT 后面要写字符串");
+        return next().text;
     }
 
     private String typeName() {
@@ -337,7 +389,7 @@ final class GqlReader {
     private Stmt.NodePat node() {
         expect(Kind.LP, "节点缺少左括号");
         String variable = null;
-        if (peek() == Kind.IDENT) {
+        if (peek() == Kind.IDENT || peek() == Kind.ID || peek() == Kind.TYPE) {
             variable = next().text;
         }
         String typeName = null;
@@ -407,7 +459,7 @@ final class GqlReader {
 
     private Stmt.EdgePat edgeBody(Stmt.EdgePat.Direction direction) {
         String variable = null;
-        if (peek() == Kind.IDENT) {
+        if (peek() == Kind.IDENT || peek() == Kind.ID || peek() == Kind.TYPE) {
             variable = next().text;
         }
         List<String> typeNames = List.of();
@@ -618,7 +670,7 @@ final class GqlReader {
         if (take(Kind.NULL)) {
             return new Expr.Literal(null);
         }
-        if (peek() == Kind.IDENT) {
+        if (peek() == Kind.IDENT || peek() == Kind.ID || peek() == Kind.TYPE) {
             String name = next().text;
             if (take(Kind.LP)) {
                 List<Expr> args = new ArrayList<>();
@@ -645,7 +697,7 @@ final class GqlReader {
     }
 
     private String ident() {
-        if (peek() != Kind.IDENT) {
+        if (peek() != Kind.IDENT && peek() != Kind.ID && peek() != Kind.TYPE) {
             return fail("这里要写名字");
         }
         return next().text;
@@ -915,10 +967,10 @@ final class GqlReader {
 
     private enum Kind {
         IDENT, INTEGER, REAL, STRING,
-        BOOL, BOOLEAN, INT, INT64, INTEGER_WORD, DOUBLE, DATETIME,
-        CREATE, GRAPH, GRAPHS, USE, ALIAS, ALIASES, FOR, DROP, SHOW, NODE, REL, TYPES, TYPE,
+        BOOL, BOOLEAN, INT, INT64, INTEGER_WORD, DOUBLE, DATETIME, ID,
+        CREATE, GRAPH, GRAPHS, PARTS, USE, ALIAS, ALIASES, FOR, DROP, SHOW, NODE, REL, TYPES, TYPE,
         DESCRIBE, ALTER, ADD, NULL, INSERT, MATCH, WHERE, RETURN, ORDER, BY, LIMIT, SKIP,
-        SET, DELETE, DISTINCT, CALL, YIELD, INDEX, INDEXES, UNIQUE, ON,
+        SET, DELETE, DISTINCT, CALL, YIELD, INDEX, INDEXES, UNIQUE, ON, COMMENT, EXPLAIN,
         AND, OR, NOT, IS, IN, AS, ASC, DESC, TRUE, FALSE,
         ARROW, LARROW, LE, GE, NEQ, EQ, LT, GT, PLUS, MINUS, STAR, SLASH,
         LP, RP, LB, RB, LC, RC, COMMA, COLON, SEMI, DOT, AT, DOLLAR, PIPE, EOF
