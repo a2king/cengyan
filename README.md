@@ -17,10 +17,36 @@ $env:Path = "$env:JAVA_HOME\bin;" + $env:Path
 mvn "-DskipTests" package
 ```
 
+如果要生成给新用户直接解压部署的发布包，仓库根目录执行：
+
+```powershell
+# Windows
+$env:JAVA_HOME = "D:\workspace\code_env\jdk21"
+$env:Path = "$env:JAVA_HOME\bin;" + $env:Path
+.\build-dist.ps1
+```
+
+```bash
+# Linux
+export JAVA_HOME=/path/to/jdk-21
+export PATH="$JAVA_HOME/bin:$PATH"
+bash ./build-dist.sh
+```
+
+脚本只构建并打包 `cengyan-server` 和 `cengyan-studio`，会在 `dist/` 下同时生成发布目录和压缩包。发布包内的 JAR、`bin/` 启动命令、`config/` 配置样例、数据目录和日志目录已经准备好，解压后运行 `bin/start-all.bat`（Windows）或 `./bin/start-all.sh`（Linux）即可。所有打包和启动命令都会检查 Java 主版本，检测到不是 Java 21 时会中断并说明原因。
+
+Linux 服务器如果没有把 JDK 21 配到系统环境变量，可以直接编辑发布包里的 `bin/java.env`：
+
+```bash
+export JAVA_HOME=/opt/jdk-21
+```
+
+启动脚本会自动读取这个文件。Shell 中设置环境变量时写成 `export JAVA_HOME=/opt/jdk-21`，不要写成 `export $JAVA_HOME=...`。
+
 开一个终端启动服务。配置文件要在当前目录，所以就在仓库根目录执行：
 
 ```powershell
-java -jar cengyan-server\target\cengyan-server-1.0.0-SNAPSHOT.jar cengyan.properties
+java -jar cengyan-server\target\cengyan-server-1.0.0.jar cengyan.properties
 ```
 
 看到日志里的 `0.0.0.0:19669` 就可以连。内网另一台机器用这台电脑的局域网 IP，不要写 `0.0.0.0`。数据写在 `data\`，日志打在这个终端。`Ctrl+C` 会关库。Windows 防火墙若拦截入站，需要放行这个端口。
@@ -28,7 +54,7 @@ java -jar cengyan-server\target\cengyan-server-1.0.0-SNAPSHOT.jar cengyan.proper
 再开一个终端启动客户端：
 
 ```powershell
-java -jar cengyan-cli\target\cengyan-cli-1.0.0-SNAPSHOT.jar
+java -jar cengyan-cli\target\cengyan-cli-1.0.0.jar
 ```
 
 `--host` 和 `--port` 可改连接地址，默认 `127.0.0.1:19669`。交互模式里输入 `exit` 或 `quit` 退出。不要用「启动一次只发一条命令」的方式连续操作：每次新进程都不记得上次的登录。
@@ -36,10 +62,10 @@ java -jar cengyan-cli\target\cengyan-cli-1.0.0-SNAPSHOT.jar
 浏览器控制台另开一个终端：
 
 ```powershell
-java -jar cengyan-studio\target\cengyan-studio-1.0.0-SNAPSHOT.jar
+java -jar cengyan-studio\target\cengyan-studio-1.0.0.jar
 ```
 
-打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--port`、`--db-host`、`--db-port` 可改。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
+打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--host`、`--port`、`--db-host`、`--db-port` 可改；部署包的 `config/studio.properties` 默认使用 `host=0.0.0.0`，内网用户可以通过服务器 IP 访问。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
 
 Studio 前端源码在 `cengyan-studio-web`，和 Java 转发服务分开维护。开发前端时：
 
@@ -66,7 +92,7 @@ npm run build
 :login root cengyan
 CREATE GRAPH Company
 USE Company
-CREATE NODE TYPE Company (name STRING NULL)
+CREATE NODE TYPE Company ID INT (name STRING NULL)
 CREATE REL TYPE holder (ratio DOUBLE NULL)
 INSERT (a:Company {id:1, name:'root'})-[:holder {ratio:0.5}]->(b:Company {id:2, name:'sub'})
 MATCH (a:Company {id:1})-[e:holder]->(b) RETURN b.id, e.ratio
@@ -75,6 +101,15 @@ MATCH (a:Company {id:1})-[e:holder]->(b) RETURN b.id, e.ratio
 最后一行应返回 `b.id = 2`、`e.ratio = 0.5`。
 
 名字只能是英文字母、数字、下划线，不能以数字或下划线开头，不能用中文，最长 128 字节。关键字不区分大小写，图名、类型名、属性名区分大小写。`id` 是点的编号，不是属性列。
+
+节点 ID 可以按类型定义为非负整数或字符串。字符串 ID 需要指定 UTF-8 最大字节长度；旧的 `CREATE NODE TYPE Company (...)` 写法等同于 `ID INT`。
+
+```text
+CREATE NODE TYPE Company ID INT (name STRING NULL)
+CREATE NODE TYPE Person ID STRING(64) (name STRING NULL)
+```
+
+字符串 ID 写入和查询时使用引号，例如 `id:'person-001'`。`SHOW NODE TYPES` 会返回 `idType` 和 `idLength` 两列。
 
 ## 点和边怎么写
 
@@ -120,6 +155,66 @@ ALTER NODE TYPE Company ADD founded DATETIME NULL
 
 时间字面量写成 `DATETIME '2024-01-31T12:00:00Z'`。不带时区的 `DATETIME '2024-01-31 12:00:00'` 按 UTC。返回值是 ISO 字符串。
 
+## Spark 初始化脚本
+
+`dev-scripts/data_init_node.py` 和 `dev-scripts/data_init_edge.py` 都在 `main` 中创建 `SparkSession`，执行 `spark.sql`，再用 `foreachPartition` 复用一个 Cengyan 会话逐条写入。脚本只依赖随目录提供的 `cengyan.py`，不需要安装 Nebula 客户端。
+
+节点导入示例：
+
+```bash
+spark-submit --py-files dev-scripts/cengyan.py dev-scripts/data_init_node.py \
+  --sql "select id, name from company_source" \
+  --host 127.0.0.1 --port 19669 --user root --password cengyan \
+  --space Company --node-type Company --id-field id \
+  --id-type STRING --id-length 64 --property-fields name --batch 512
+```
+
+边导入示例：
+
+```bash
+spark-submit --py-files dev-scripts/cengyan.py dev-scripts/data_init_edge.py \
+  --sql "select src_id, dst_id, ratio from holding_source" \
+  --host 127.0.0.1 --port 19669 --user root --password cengyan \
+  --space Company --edge-type holder --src-field src_id --dst-field dst_id \
+  --id-type STRING --id-length 64 --property-fields ratio --batch 512
+```
+
+`--id-type INT` 是默认值；使用 `STRING` 时脚本会为 ID 自动加引号并转义单引号，`--id-length` 按 UTF-8 字节校验，需与节点类型定义一致。
+
+当前初始化脚本使用服务端批量接口。`--batch` 表示一次 `bulkInsert` 的行数，默认 512，服务端单批最多 10000 行、请求体最多 16 MiB；它不再为每行发一个 GQL 请求。
+
+批量接口的 JSON 形状如下：
+
+```json
+{
+  "op": "bulkInsert",
+  "session": "...",
+  "kind": "node",
+  "type": "Person",
+  "rows": [
+    {"id": 1, "name": "Alice"},
+    {"id": 2, "name": "Bob"}
+  ]
+}
+```
+
+边批次使用 `src`、`dst`、可选 `rank` 和属性列：
+
+```json
+{
+  "op": "bulkInsert",
+  "kind": "edge",
+  "type": "knows",
+  "rows": [
+    {"src": 1, "dst": 2, "rank": 0, "score": 0.5}
+  ]
+}
+```
+
+一个批次在服务端对应一次 RocksDB `WriteBatch`。节点的字符串 ID 映射、节点属性和索引也在同一个批次中提交；任意一行校验失败时整批失败。
+
+10 亿级数据不能放进一个请求，应该由 Spark 分区或外部导入器切成 512～10000 行的批次，并通过多个分区并行提交。当前边批量接口要求边的两端在同一分片；默认单机单分片满足此条件，跨分片边要等分布式写入阶段实现。
+
 ## 目录
 
 ```text
@@ -151,7 +246,6 @@ CALL ownership.largest_holder({start: 1, rel: "holder", ratioProp: "ratio", hops
 
 子图从起点沿这种边的出边和入边一起扩，结果包含起点，只返回 `vid`。`hops: 0` 只返回起点。
 
-穿透持股沿出边走。单条比例低于 `min_edge_ratio`（默认 `0.01`），或累乘后低于 `min_accum_ratio`（默认 `0.001`），就不再往下走。环不会把同一段比例再乘一次。
 
 ## 索引
 
@@ -241,19 +335,19 @@ TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`
 | `data_dir` | `data` | 数据目录，相对启动时的工作目录 |
 | `root_password` | `cengyan` | 只在还没有任何用户时，用来创建 `root` |
 | `query_threads` | `16` | 查询线程数 |
-| `max_execution_time_ms` | `1000` | 一条语句默认最多跑 1 秒 |
-| `max_edges_per_vertex` | `64` | 从一个点扫边的上限，超过返回 `TRUNCATED` |
-| `max_frontier_per_hop` | `64` | 一跳里新点的上限，超过返回 `FRONTIER_EXCEEDED` |
-| `max_hops` | `10` | 多跳、最短路、子图的跳数上限 |
-| `max_paths` | `100` | 路径条数上限 |
+| `max_execution_time_ms` | `0` | 一条语句的服务端超时，`0` 表示不限 |
+| `max_edges_per_vertex` | `0` | 每点扫描边数预算，`0` 表示不限 |
+| `max_frontier_per_hop` | `0` | 每跳新点预算，`0` 表示不限 |
+| `max_hops` | `0` | 多跳、最短路、子图的跳数预算，`0` 表示不限 |
+| `max_paths` | `0` | 路径结果预算，`0` 表示不限 |
 | `query_memory_bytes` | `67108864` | 单条查询的内存预算 |
 | `block_cache_bytes` | `268435456` | RocksDB 块缓存 |
 | `duckdb_memory` | `1GB` | 排序和聚合使用的 DuckDB 内存 |
 | `duckdb_temp_directory` | `tmp/duck` | DuckDB 临时目录 |
-| `min_edge_ratio` | `0.01` | 穿透持股单条边的最低比例 |
-| `min_accum_ratio` | `0.001` | 穿透持股累乘后的最低比例 |
+| ocksdb_background_jobs | 6 | RocksDB background flush/compaction jobs |
+| ocksdb_write_buffer_bytes | 134217728 | MemTable write buffer per Column Family, in bytes |
 
-一个点上写出超过 64 条边可以成功，但默认配置下再去 `MATCH` 这个点会因为扫边超过上限而失败，不是悄悄少返回几行。
+这些预算是执行策略，不是 GQL 语义。默认值为 `0`，不会因为固定的 64 条边、10 跳或 100 条路径拒绝查询；不受信任的部署可以显式设置正数。
 
 ## 测试
 
