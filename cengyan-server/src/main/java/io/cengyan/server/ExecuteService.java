@@ -515,7 +515,7 @@ final class ExecuteService {
 
     private static Map<String, Object> object(JsonNode node) {
         Map<String, Object> values = new LinkedHashMap<>();
-        node.fields().forEachRemaining(entry -> values.put(entry.getKey(), valueDeep(entry.getValue())));
+        node.properties().forEach(entry -> values.put(entry.getKey(), valueDeep(entry.getValue())));
         return values;
     }
 
