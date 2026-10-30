@@ -4,6 +4,7 @@ import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
 import io.cengyan.catalog.Auth;
 import io.cengyan.catalog.Catalog;
+import io.cengyan.catalog.LayoutMigration;
 import io.cengyan.catalog.Membership;
 import io.cengyan.query.QueryEngine;
 import io.cengyan.store.GraphStore;
@@ -92,7 +93,7 @@ public final class GraphDbServer implements AutoCloseable {
     }
 
     public static GraphDbServer start(ServerConfig config) {
-        GraphStore store = null;
+        ShardedGraphStore store = null;
         Membership membership = null;
         ScheduledExecutorService timeoutThread = null;
         ScheduledExecutorService compensateThread = null;
@@ -105,24 +106,10 @@ public final class GraphDbServer implements AutoCloseable {
                     config.blockCacheBytes(),
                     config.rocksdbBackgroundJobs(),
                     config.rocksdbWriteBufferBytes());
-            store = ShardedGraphStore.open(config.dataDir(), storeOptions);
+            ShardedGraphStore opened = ShardedGraphStore.open(config.dataDir(), storeOptions);
+            store = opened;
+            LayoutMigration.migrate(config.dataDir(), opened);
             Catalog catalog = Catalog.load(store);
-            store.setPartCountResolver(catalog::partCount);
-            store.setPartitionDirectoryResolver((graphId, partId) -> {
-                String graph = catalog.graphs().stream()
-                        .filter(name -> catalog.graph(name).graphId() == graphId)
-                        .findFirst()
-                        .orElse("graph-" + graphId);
-                return config.dataDir().toAbsolutePath().normalize().resolve(graph)
-                        .resolve("part-" + partId)
-                        .resolve("db");
-            });
-            store.preparePartitions(catalog.graphs().stream()
-                    .mapToInt(name -> catalog.graph(name).graphId())
-                    .toArray());
-            store.migrateLegacy(catalog.graphs().stream()
-                    .mapToInt(name -> catalog.graph(name).graphId())
-                    .toArray());
             log.info("已加载目录，共 {} 张图", catalog.graphs().size());
             Auth auth = new Auth(store);
             auth.ensureRoot(config.rootPassword());

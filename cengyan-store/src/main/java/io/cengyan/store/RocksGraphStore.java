@@ -26,15 +26,18 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
 /**
- * 嵌入式 RocksDB。七个列族在第一次打开时建好，WAL 保持打开，边列族使用 17 字节前缀。
+ * 嵌入式 RocksDB。整库打开时七个列族一次建好；按图拆开时只建这个目录要用的列族。
+ * WAL 保持打开，写在这个库自己的目录里。边列族使用 17 字节前缀。
  */
 public final class RocksGraphStore implements GraphStore {
     private static final Logger log = LoggerFactory.getLogger(RocksGraphStore.class);
@@ -50,6 +53,7 @@ public final class RocksGraphStore implements GraphStore {
     private final List<ColumnFamilyHandle> handles;
     private final Map<Cf, ColumnFamilyHandle> byFamily;
     private final Cache blockCache;
+    private final boolean ownsCache;
     private final BloomFilter edgeBloom;
     private final ReentrantLock writeLock = new ReentrantLock();
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
@@ -70,6 +74,7 @@ public final class RocksGraphStore implements GraphStore {
             List<ColumnFamilyHandle> handles,
             Map<Cf, ColumnFamilyHandle> byFamily,
             Cache blockCache,
+            boolean ownsCache,
             BloomFilter edgeBloom) {
         this.directory = directory;
         this.db = db;
@@ -78,15 +83,26 @@ public final class RocksGraphStore implements GraphStore {
         this.handles = handles;
         this.byFamily = byFamily;
         this.blockCache = blockCache;
+        this.ownsCache = ownsCache;
         this.edgeBloom = edgeBloom;
     }
 
     public static RocksGraphStore open(Path directory, StoreOptions options) {
+        return open(directory, options, Set.of(Cf.values()), null);
+    }
+
+    /**
+     * @param sharedCache 多个库共用的块缓存。为空时这个库自己创建并在关闭时释放。
+     */
+    public static RocksGraphStore open(Path directory, StoreOptions options, Set<Cf> families, Cache sharedCache) {
         if (directory == null) {
             throw new IllegalArgumentException("数据目录不能为空");
         }
         if (options == null) {
             throw new IllegalArgumentException("打开参数不能为空");
+        }
+        if (families == null || families.isEmpty()) {
+            throw new IllegalArgumentException("列族不能为空");
         }
         Path path = directory.toAbsolutePath().normalize();
         try {
@@ -95,6 +111,7 @@ public final class RocksGraphStore implements GraphStore {
             throw new CengyanException(ErrorCode.INTERNAL, "无法创建数据目录：" + ex.getMessage(), ex);
         }
 
+        boolean ownsCache = sharedCache == null;
         Cache cache = null;
         BloomFilter bloom = null;
         DBOptions dbOptions = null;
@@ -102,30 +119,37 @@ public final class RocksGraphStore implements GraphStore {
         List<ColumnFamilyHandle> handles = new ArrayList<>();
         RocksDB db = null;
         try {
-            cache = new LRUCache(options.blockCacheBytes());
-            bloom = new BloomFilter(10);
+            cache = ownsCache ? new LRUCache(options.blockCacheBytes()) : sharedCache;
+            List<Cf> ordered = orderedFamilies(families);
+            if (ordered.contains(Cf.EDGE)) {
+                bloom = new BloomFilter(10);
+            }
             dbOptions = new DBOptions();
             dbOptions.setCreateIfMissing(true);
             dbOptions.setCreateMissingColumnFamilies(true);
             dbOptions.setMaxBackgroundJobs(options.maxBackgroundJobs());
+            // 预写日志、运行日志、刷盘和压缩产生的文件都留在这个库自己的目录。
+            String location = path.toString();
+            dbOptions.setWalDir(location);
+            dbOptions.setDbLogDir(location);
 
+            boolean slimDefault = ordered.size() < Cf.values().length;
             List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
-            for (Cf cf : Cf.values()) {
-                ColumnFamilyOptions one = columnFamilyOptions(cf, options, cache, bloom);
+            for (Cf cf : ordered) {
+                ColumnFamilyOptions one = columnFamilyOptions(cf, options, cache, bloom, slimDefault);
                 cfOptions.add(one);
                 descriptors.add(new ColumnFamilyDescriptor(cf.nameBytes(), one));
             }
             db = RocksDB.open(dbOptions, path.toString(), descriptors, handles);
             Map<Cf, ColumnFamilyHandle> byFamily = new EnumMap<>(Cf.class);
-            Cf[] families = Cf.values();
-            if (handles.size() != families.length) {
+            if (handles.size() != ordered.size()) {
                 throw new CengyanException(ErrorCode.INTERNAL, "列族数量与预期不符");
             }
-            for (int i = 0; i < families.length; i++) {
-                byFamily.put(families[i], handles.get(i));
+            for (int i = 0; i < ordered.size(); i++) {
+                byFamily.put(ordered.get(i), handles.get(i));
             }
             log.info("已打开数据库，目录 {}", path);
-            return new RocksGraphStore(path, db, dbOptions, cfOptions, handles, byFamily, cache, bloom);
+            return new RocksGraphStore(path, db, dbOptions, cfOptions, handles, byFamily, cache, ownsCache, bloom);
         } catch (RuntimeException | RocksDBException ex) {
             for (ColumnFamilyHandle handle : handles) {
                 handle.close();
@@ -142,7 +166,7 @@ public final class RocksGraphStore implements GraphStore {
             if (bloom != null) {
                 bloom.close();
             }
-            if (cache != null) {
+            if (ownsCache && cache != null) {
                 cache.close();
             }
             if (ex instanceof CengyanException cengyan) {
@@ -152,11 +176,25 @@ public final class RocksGraphStore implements GraphStore {
         }
     }
 
+    private static List<Cf> orderedFamilies(Set<Cf> families) {
+        LinkedHashSet<Cf> ordered = new LinkedHashSet<>();
+        ordered.add(Cf.DEFAULT);
+        for (Cf cf : Cf.values()) {
+            if (cf != Cf.DEFAULT && families.contains(cf)) {
+                ordered.add(cf);
+            }
+        }
+        return List.copyOf(ordered);
+    }
+
     private static ColumnFamilyOptions columnFamilyOptions(
-            Cf cf, StoreOptions options, Cache cache, BloomFilter bloom) {
+            Cf cf, StoreOptions options, Cache cache, BloomFilter bloom, boolean slimDefault) {
         ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
         cfOptions.setCompressionType(CompressionType.LZ4_COMPRESSION);
-        cfOptions.setWriteBufferSize(options.writeBufferSize());
+        long buffer = cf == Cf.DEFAULT && slimDefault
+                ? Math.min(1L << 20, options.writeBufferSize())
+                : options.writeBufferSize();
+        cfOptions.setWriteBufferSize(buffer);
         BlockBasedTableConfig table = new BlockBasedTableConfig();
         table.setBlockCache(cache);
         table.setCacheIndexAndFilterBlocks(true);
@@ -164,8 +202,10 @@ public final class RocksGraphStore implements GraphStore {
             // 出边前缀是前 17 字节。前缀布隆只挂在边列族上。
             cfOptions.useFixedLengthPrefixExtractor(KeyCodec.EDGE_PREFIX_LENGTH);
             cfOptions.setMemtablePrefixBloomSizeRatio(0.125);
-            table.setFilterPolicy(bloom);
-            table.setWholeKeyFiltering(false);
+            if (bloom != null) {
+                table.setFilterPolicy(bloom);
+                table.setWholeKeyFiltering(false);
+            }
         }
         cfOptions.setTableFormatConfig(table);
         return cfOptions;
@@ -474,8 +514,12 @@ public final class RocksGraphStore implements GraphStore {
             opt.close();
         }
         dbOptions.close();
-        edgeBloom.close();
-        blockCache.close();
+        if (edgeBloom != null) {
+            edgeBloom.close();
+        }
+        if (ownsCache) {
+            blockCache.close();
+        }
         log.info("已关闭数据库，目录 {}", directory);
     }
 }

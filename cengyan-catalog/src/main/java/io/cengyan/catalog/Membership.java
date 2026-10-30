@@ -40,7 +40,6 @@ public final class Membership implements WriteGate {
     private final Catalog catalog;
     private final GraphStore local;
     private final Path home;
-    private final StoreOptions options;
     private final ConcurrentHashMap<Integer, GraphStore> stores = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Boolean> voters = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Compute> computes = new ConcurrentHashMap<>();
@@ -49,11 +48,10 @@ public final class Membership implements WriteGate {
     private volatile Runnable duringMove;
     private volatile boolean crashBeforePromote;
 
-    private Membership(Catalog catalog, GraphStore local, Path home, StoreOptions options) {
+    private Membership(Catalog catalog, GraphStore local, Path home) {
         this.catalog = catalog;
         this.local = local;
         this.home = home;
-        this.options = options;
     }
 
     public static Membership open(Catalog catalog, GraphStore local, String address, StoreOptions options) {
@@ -66,7 +64,7 @@ public final class Membership implements WriteGate {
         if (options == null) {
             throw new IllegalArgumentException("打开参数不能为空");
         }
-        Membership membership = new Membership(catalog, local, local.directory(), options);
+        Membership membership = new Membership(catalog, local, local.directory());
         membership.stores.put(LOCAL_NODE, local);
         membership.ensureLocal(address);
         membership.reopenVoters();

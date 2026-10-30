@@ -6,8 +6,10 @@ import io.cengyan.ErrorCode;
 import io.cengyan.store.Cf;
 import io.cengyan.store.Direction;
 import io.cengyan.store.EdgeRef;
+import io.cengyan.store.GraphPaths;
 import io.cengyan.store.GraphStore;
 import io.cengyan.store.KeyCodec;
+import io.cengyan.store.ShardedGraphStore;
 import io.cengyan.store.ReadSession;
 import io.cengyan.store.StoreBatch;
 import org.slf4j.Logger;
@@ -64,10 +66,16 @@ public final class Catalog {
             throw new IllegalArgumentException("存储不能为空");
         }
         Catalog catalog = new Catalog(store);
+        if (store instanceof ShardedGraphStore sharded) {
+            GraphPlacement placement = new GraphPlacement(sharded);
+            placement.bind(catalog);
+            sharded.setDataPlacement(placement);
+        }
         catalog.reload();
         catalog.healIncomplete();
         catalog.recoverTxn();
         store.setPartResolver(catalog::partOf);
+        store.setPartCountResolver(catalog::partCount);
         return catalog;
     }
 
@@ -278,6 +286,9 @@ public final class Catalog {
 
     public int createGraph(String name, int parts, String comment) {
         checkIdentifier(name);
+        if (GraphPaths.RESERVED_GRAPH_NAME.equals(name)) {
+            throw new CengyanException(ErrorCode.SYNTAX, "cache 是系统目录，不能作为图名");
+        }
         if (parts <= 0 || parts > 4096) {
             throw new CengyanException(ErrorCode.SYNTAX, "分片数量必须在 1 到 4096 之间");
         }
@@ -292,6 +303,7 @@ public final class Catalog {
                 batch.put(Cf.CATALOG, KeyCodec.graphRecordKey(graphId), CatalogCodec.graphRecord(name, comment));
                 batch.put(Cf.CATALOG, KeyCodec.spaceKey(graphId), ClusterCodec.space(ClusterCodec.MODE_NORMAL, 1, parts));
                 batch.put(Cf.CATALOG, KeyCodec.nextGraphIdKey(), counterAfter(graphId, false));
+                store.noteGraph(graphId, name);
                 store.mutate(batch);
                 names.put(name, new NameEntry(GraphName.GRAPH, graphId, name));
                 canonicals.put(graphId, name);
@@ -402,6 +414,7 @@ public final class Catalog {
                 deletePrefix(batch, session, Cf.TXN, dataPrefix);
                 deletePrefix(batch, session, Cf.PROP, KeyCodec.propGraphPrefix(graphId));
                 store.mutate(batch);
+                store.deleteGraphDirectory(name);
                 names.entrySet().removeIf(entry -> entry.getValue().graphId == graphId);
                 canonicals.remove(graphId);
                 nodeTypes.remove(graphId);
@@ -488,7 +501,7 @@ public final class Catalog {
     public boolean insertVertex(
             int graphId, String typeName, long vid, Map<String, Object> properties, boolean ifNotExists) {
         checkIdentifier(typeName);
-        return store.withWriteLock(() -> {
+        return store.withStripes(List.of(nodeStripe(graphId, typeName)), () -> {
             requireGraph(graphId);
             requireWritable(graphId);
             requirePart(graphId, partOf(graphId, vid));
@@ -523,7 +536,7 @@ public final class Catalog {
         if (type == null || values == null) {
             throw new IllegalArgumentException("节点类型和 ID 列表不能为空");
         }
-        return store.withWriteLock(() -> {
+        return store.withStripes(List.of(metaStripe(graphId)), () -> {
             List<Long> result = new ArrayList<>(values.size());
             if (type.idType() == IdType.INT) {
                 for (Object value : values) {
@@ -606,7 +619,7 @@ public final class Catalog {
     }
 
     /**
-     * 批量写入节点。整个列表在一次 RocksDB WriteBatch 中提交；调用方应按网络和内存大小分块。
+     * 批量写入节点。调用方应按网络和内存大小分块。
      * 同一批内重复的 (type, vid) 按最后一行覆盖，唯一索引冲突或任意一行校验失败时整批失败。
      */
     public int bulkInsertVertices(
@@ -615,7 +628,7 @@ public final class Catalog {
         if (rows == null) {
             throw new IllegalArgumentException("批量节点不能为空");
         }
-        return store.withWriteLock(() -> {
+        return store.withStripes(List.of(nodeStripe(graphId, typeName)), () -> {
             requireGraph(graphId);
             requireWritable(graphId);
             NodeType type = nodeType(graphId, typeName);
@@ -664,7 +677,13 @@ public final class Catalog {
         if (rows == null) {
             throw new IllegalArgumentException("批量节点不能为空");
         }
-        return store.withWriteLock(() -> {
+        NodeType planned = nodeType(graphId, typeName);
+        List<String> stripes = new ArrayList<>();
+        stripes.add(nodeStripe(graphId, typeName));
+        if (planned.idType() == IdType.STRING) {
+            stripes.add(metaStripe(graphId));
+        }
+        return store.withStripes(stripes, () -> {
             requireGraph(graphId);
             requireWritable(graphId);
             NodeType type = nodeType(graphId, typeName);
@@ -763,7 +782,15 @@ public final class Catalog {
             throw new IllegalArgumentException("边的两端不能为空");
         }
         checkIdentifier(relType);
-        return store.withWriteLock(() -> {
+        List<String> stripes = new ArrayList<>();
+        stripes.add(edgeStripe(graphId, relType));
+        if (source.typeName() != null) {
+            stripes.add(nodeStripe(graphId, source.typeName()));
+        }
+        if (target.typeName() != null) {
+            stripes.add(nodeStripe(graphId, target.typeName()));
+        }
+        return store.withStripes(stripes, () -> {
             requireGraph(graphId);
             requireWritable(graphId);
             int outPart = partOf(graphId, source.vid());
@@ -842,7 +869,7 @@ public final class Catalog {
         if (rows == null) {
             throw new IllegalArgumentException("批量边不能为空");
         }
-        return store.withWriteLock(() -> {
+        return store.withStripes(List.of(edgeStripe(graphId, relTypeName)), () -> {
             requireGraph(graphId);
             requireWritable(graphId);
             RelType type = relType(graphId, relTypeName);
@@ -1760,10 +1787,6 @@ public final class Catalog {
         return -1;
     }
 
-    private static void bump(Map<Long, Integer> degrees, long vid) {
-        degrees.merge(vid, 1, Integer::sum);
-    }
-
     private static void deletePrefix(StoreBatch batch, ReadSession session, Cf family, byte[] prefix) {
         for (byte[] key : session.keysWithPrefix(family, prefix)) {
             batch.delete(family, key);
@@ -1845,7 +1868,7 @@ public final class Catalog {
             if (store.repartitionGraph(graphId, space.parts, partCount)) {
                 store.mutate(spaceBatch(graphId, space.mode, space.replicas, partCount));
                 spaces.put(graphId, new Space(space.mode, space.replicas, partCount));
-                log.info("ͼ {} �ķ�Ƭ���Ѹ�Ϊ {}", graphId, partCount);
+                log.info("图 {} 的分片数已改为 {}", graphId, partCount);
                 return null;
             }
             try (ReadSession session = store.read()) {
@@ -2239,6 +2262,74 @@ public final class Catalog {
         if (movingParts(graphId).contains(partId)) {
             throw new CengyanException(ErrorCode.PART_READONLY, "分片 " + partId + " 正在搬迁");
         }
+    }
+
+    private static String nodeStripe(int graphId, String typeName) {
+        return "node:" + graphId + ":" + typeName;
+    }
+
+    private static String edgeStripe(int graphId, String typeName) {
+        return "edge:" + graphId + ":" + typeName;
+    }
+
+    private static String metaStripe(int graphId) {
+        return "meta:" + graphId;
+    }
+
+    String graphNameOrNull(int graphId) {
+        return canonicals.get(graphId);
+    }
+
+    String nodeTypeNameOrNull(int graphId, int typeId) {
+        for (NodeType type : nodeTypes.getOrDefault(graphId, new ConcurrentHashMap<>()).values()) {
+            if (type.id() == typeId) {
+                return type.name();
+            }
+        }
+        return null;
+    }
+
+    String relTypeNameOrNull(int graphId, int typeId) {
+        for (RelType type : relTypes.getOrDefault(graphId, new ConcurrentHashMap<>()).values()) {
+            if (type.id() == typeId) {
+                return type.name();
+            }
+        }
+        return null;
+    }
+
+    Set<Integer> nodeTypeIds(int graphId) {
+        Set<Integer> ids = new HashSet<>();
+        for (NodeType type : nodeTypes.getOrDefault(graphId, new ConcurrentHashMap<>()).values()) {
+            ids.add(type.id());
+        }
+        return ids;
+    }
+
+    Set<Integer> relTypeIds(int graphId) {
+        Set<Integer> ids = new HashSet<>();
+        for (RelType type : relTypes.getOrDefault(graphId, new ConcurrentHashMap<>()).values()) {
+            ids.add(type.id());
+        }
+        return ids;
+    }
+
+    List<IndexDef> indexesOf(int graphId) {
+        return List.copyOf(indexes.getOrDefault(graphId, new ConcurrentHashMap<>()).values());
+    }
+
+    IndexLocation locateIndex(int indexId) {
+        for (var entry : indexes.entrySet()) {
+            for (IndexDef index : entry.getValue().values()) {
+                if (index.id() == indexId) {
+                    return new IndexLocation(entry.getKey(), index);
+                }
+            }
+        }
+        return null;
+    }
+
+    record IndexLocation(int graphId, IndexDef index) {
     }
 
     private record Space(int mode, int replicas, int parts) {

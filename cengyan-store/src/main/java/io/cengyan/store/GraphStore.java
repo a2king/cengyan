@@ -1,6 +1,7 @@
 package io.cengyan.store;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.function.IntFunction;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
@@ -67,6 +68,14 @@ public interface GraphStore extends AutoCloseable {
     /** 压缩全部列族。进行中的快照读可以继续。 */
     void compact();
 
+    /**
+     * 压缩已经打开的库。分片存储不会为此打开尚未使用的目录，
+     * 避免空分片凭空出现写缓存。
+     */
+    default void compactOpen() {
+        compact();
+    }
+
     /** 数据目录。副本的提交日志写在这个目录下。 */
     Path directory();
 
@@ -116,6 +125,21 @@ public interface GraphStore extends AutoCloseable {
     /** Opens a local replica using the same physical layout and routing policy. */
     default GraphStore openReplica(Path directory) {
         return GraphStore.open(directory);
+    }
+
+    /**
+     * 不同条带可以同时写。单库实现没有独立目录，退回整库写锁。
+     */
+    default <T> T withStripes(List<String> stripes, Supplier<T> action) {
+        return withWriteLock(action);
+    }
+
+    /** 建图提交前登记图名，用来创建 {@code data/<图名>}。 */
+    default void noteGraph(int graphId, String name) {
+    }
+
+    /** 删除图目录。单库实现的数据和图目录混在一起，这里什么都不做。 */
+    default void deleteGraphDirectory(String name) {
     }
 
     @Override

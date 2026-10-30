@@ -191,7 +191,7 @@ public final class QueryEngine {
             }
             int graphId = graphId(session);
             if ("node".equalsIgnoreCase(kind)) {
-                NodeType type = catalog.nodeType(graphId, typeName);
+                catalog.nodeType(graphId, typeName);
                 List<Object> externalIds = new ArrayList<>(rows.size());
                 for (Map<String, Object> row : rows) {
                     if (row == null || !row.containsKey("id")) {

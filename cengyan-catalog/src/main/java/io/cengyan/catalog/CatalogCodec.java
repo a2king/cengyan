@@ -80,7 +80,6 @@ final class CatalogCodec {
             PropDef property = properties.get(i);
             byte[] propertyName = utf8(property.name());
             propertyNames.add(propertyName);
-            byte[] propertyComment = utf8(property.comment() == null ? "" : property.comment());
             size += 2 + propertyName.length + 2;
         }
         size += 1 + 2 + note.length + 2;
