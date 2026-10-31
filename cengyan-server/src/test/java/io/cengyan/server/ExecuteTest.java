@@ -90,6 +90,7 @@ class ExecuteTest {
                 assertEquals("OK", stats.get("code").asText(), stats.toString());
                 assertEquals("NODE", stats.get("rows").get(0).get(0).asText());
                 assertEquals(1, stats.get("rows").get(0).get(2).asInt());
+                assertTrue(stats.get("collectedAt").asLong() > 0);
                 JsonNode created = adminUser(writer, reader, session, "createUser", "reader", "secret", "read");
                 assertEquals("OK", created.get("code").asText(), created.toString());
                 session = login(writer, reader, session, "reader", "secret");

@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -91,6 +92,8 @@ class Phase7Test {
             assertEquals(List.of("target", "name", "count"), stats.columns());
             assertEquals(List.of("NODE", "Company", 3L), stats.rows().get(0));
             assertEquals(List.of("REL", "holder", 4L), stats.rows().get(1));
+            assertNotNull(stats.collectedAt());
+            assertEquals(stats.collectedAt(), db.engine.admin(db.session, "stats", "", null).collectedAt());
 
             run(db, "MATCH (a:Company {id:1}) SET a.name = 'gamma'");
             vertices = db.store.verticesExamined();

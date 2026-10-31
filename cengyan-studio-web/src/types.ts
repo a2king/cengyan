@@ -14,6 +14,7 @@ export interface QueryResponse {
   rows?: unknown[][];
   rowsAffected?: number;
   queryId?: string;
+  collectedAt?: number;
 }
 
 export interface GraphSpace {

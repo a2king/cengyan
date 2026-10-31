@@ -42,6 +42,7 @@ public final class QueryEngine {
     private final MatchExecutor match;
     private final MutateExecutor mutate;
     private final ProcedureExecutor procedures;
+    private final StatsCache statsCache = new StatsCache();
 
     public QueryEngine(Catalog catalog, GraphStore store) {
         this(catalog, store, "1GB", Path.of(System.getProperty("java.io.tmpdir"), "cengyan-duck"));
@@ -401,14 +402,19 @@ public final class QueryEngine {
                     yield QueryResult.changed(catalog.rebuildIndex(graphId(session), index, cancel));
                 }
                 case "stats" -> {
+                    int graphId = graphId(session);
+                    StatsCache.Snapshot<List<StatsRow>> sample = statsCache.counts(
+                            graphId, () -> catalog.stats(graphId, cancel));
                     List<List<Object>> rows = new ArrayList<>();
-                    for (StatsRow row : catalog.stats(graphId(session), cancel)) {
+                    for (StatsRow row : sample.value()) {
                         rows.add(List.of(row.target(), row.name(), row.count()));
                     }
-                    yield new QueryResult(List.of("target", "name", "count"), rows, 0);
+                    yield new QueryResult(List.of("target", "name", "count"), rows, 0, sample.collectedAt());
                 }
-                case "storage" -> new QueryResult(
-                        List.of("bytes"), List.of(List.of(store.storageSizeBytes())), 0);
+                case "storage" -> {
+                    StatsCache.Snapshot<Long> sample = statsCache.storage(store::storageSizeBytes);
+                    yield new QueryResult(List.of("bytes"), List.of(List.of(sample.value())), 0, sample.collectedAt());
+                }
                 case "flush" -> {
                     requireWrite(session);
                     store.flush();
