@@ -72,8 +72,8 @@ class GqlSyntaxTest {
     void 所有路径直接拒绝() {
         ParseException all = assertThrows(ParseException.class,
                 () -> Gql.parse("MATCH (a:Company {id:1})-[:holder]->*(b) RETURN b.id"));
-        assertTrue(all.getMessage().contains("所有路径"));
-        assertTrue(all.getMessage().contains("最短路"));
+        assertTrue(all.getMessage().contains("无上界"));
+        assertTrue(all.getMessage().contains("LIMIT"));
         ParseException emptyIndex = assertThrows(ParseException.class,
                 () -> Gql.parse("CREATE INDEX idx ON NODE TYPE Company ()"));
         assertTrue(emptyIndex.getMessage().contains("至少要有一列"));
@@ -98,6 +98,8 @@ class GqlSyntaxTest {
                 Gql.tree("MATCH (a {id:1})-[:holder|works]->(b) RETURN b.id"));
         assertEquals("(match (node p:org id=100) (return p))",
                 Gql.tree("MATCH (p:org {id: 100}) RETURN p"));
+        assertEquals("(match p = (node a id=1) (edge OUT:holder{1,3}) (node b) (return p) (limit 20))",
+                Gql.tree("MATCH p = (a {id:1})-[:holder]->{1,3}(b) RETURN p LIMIT 20"));
         ParseException duplicated = assertThrows(ParseException.class,
                 () -> Gql.parse("MATCH (a {id:1})-[:holder|:holder]->(b) RETURN a"));
         assertTrue(duplicated.getMessage().contains("边类型重复"));

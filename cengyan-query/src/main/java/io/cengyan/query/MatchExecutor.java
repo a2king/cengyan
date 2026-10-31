@@ -49,6 +49,14 @@ final class MatchExecutor {
         String[] aggregates = aggregateKinds(match);
         int maxEdges = limits.maxEdgesPerVertex();
         Names names = names(match);
+        if (match.pathVariable() != null) {
+            if (match.edge() == null) {
+                throw new CengyanException(ErrorCode.SYNTAX, "路径需要一条边");
+            }
+            if (match.edge().minHop() != null) {
+                return variablePaths(match, graphId, params, limits, cancel, names, aggregates);
+            }
+        }
         if (match.edge() == null) {
             return nodes(match, graphId, params, limits, cancel, aggregates, names);
         }
@@ -309,6 +317,235 @@ final class MatchExecutor {
     }
 
     private record IdConstraint(List<Long> ids) { }
+
+    /**
+     * {@code MATCH p = ...-{min,max}-> RETURN p LIMIT n}。
+     * 一条路上的点不重复。条数超过 LIMIT 直接失败，不截断。
+     */
+    private QueryResult variablePaths(
+            Stmt.Match match,
+            int graphId,
+            Map<String, Object> params,
+            QueryLimits limits,
+            CancelToken cancel,
+            Names names,
+            String[] aggregates) {
+        if (match.limit() == null) {
+            throw new CengyanException(ErrorCode.SYNTAX, "路径查询需要写 LIMIT");
+        }
+        if (mentionsEdge(match, names.edge)) {
+            throw new CengyanException(ErrorCode.SYNTAX, "变长路径请返回路径变量");
+        }
+        if (!match.edge().properties().isEmpty()
+                || !withoutId(match.source().properties()).isEmpty()
+                || (match.target() != null && !withoutId(match.target().properties()).isEmpty())) {
+            throw new CengyanException(ErrorCode.SYNTAX, "路径查询暂不比较属性");
+        }
+        boolean openTypes = match.edge().typeNames().isEmpty();
+        List<RelType> rels = openTypes ? catalog.relTypes(graphId) : namedRels(graphId, match.edge().typeNames());
+        NodeType sourceType = match.source().typeName() == null ? null : catalog.nodeType(graphId, match.source().typeName());
+        NodeType targetType = match.target().typeName() == null ? null : catalog.nodeType(graphId, match.target().typeName());
+        Needs needs = new Needs(match, names, sourceType, targetType, openTypes ? null : rels, sorts(match, names));
+        if (needs.edge) {
+            throw new CengyanException(ErrorCode.SYNTAX, "变长路径请返回路径变量");
+        }
+        ExprEval eval = new ExprEval(params, false);
+        Long startId = constantId(graphId, sourceType, match.source().properties(), eval);
+        if (startId == null) {
+            throw new CengyanException(ErrorCode.SYNTAX, "路径查询的起点需要写 id");
+        }
+        if (match.limit() == 0) {
+            return emptyMatch(match);
+        }
+        int collect = window(match);
+        if (collect > limits.maxPaths()) {
+            throw new CengyanException(ErrorCode.SYNTAX, "路径条数 " + collect + " 超过上限 " + limits.maxPaths());
+        }
+        Push push = push(match.where(), names, eval);
+        if (push.residual != null) {
+            throw new CengyanException(ErrorCode.SYNTAX, "路径查询的条件目前只能比较 rank 和终点 id");
+        }
+        Long patternEnd = constantId(graphId, targetType, match.target().properties(), eval);
+        Long whereEnd = whereEnd(graphId, targetType, match.where(), names, eval);
+        if (startId == Catalog.MISSING_VERTEX_ID
+                || (patternEnd != null && patternEnd == Catalog.MISSING_VERTEX_ID)
+                || (whereEnd != null && whereEnd == Catalog.MISSING_VERTEX_ID)
+                || (patternEnd != null && whereEnd != null && !patternEnd.equals(whereEnd))) {
+            return emptyMatch(match);
+        }
+        Long end = patternEnd != null ? patternEnd : whereEnd;
+        LongPredicate rank = push.rank;
+        if (match.edge().rank() != null) {
+            long exact = match.edge().rank();
+            rank = and(rank, value -> value == exact);
+        }
+        int minHop = match.edge().minHop();
+        int maxHop = match.edge().maxHop() == null ? minHop : match.edge().maxHop();
+        if (minHop < 1) {
+            throw new CengyanException(ErrorCode.SYNTAX, "路径至少 1 跳");
+        }
+        List<PathAll.Found> found;
+        List<Hop> hops = new ArrayList<>();
+        Map<Long, Map<String, Object>> sourceProps;
+        Map<Long, Map<String, Object>> targetProps;
+        try (ReadSession session = store.read()) {
+            List<Long> starts = filterStarts(
+                    session, graphId, sourceType, eval, match.source(), List.of(startId));
+            if (starts.isEmpty()) {
+                return emptyMatch(match);
+            }
+            found = PathAll.find(
+                    session,
+                    graphId,
+                    openTypes ? null : typeIds(rels),
+                    directions(match.edge().direction()),
+                    startId,
+                    end,
+                    minHop,
+                    maxHop,
+                    limits.maxHops(),
+                    limits.maxEdgesPerVertex(),
+                    collect,
+                    rank,
+                    cancel);
+            for (PathAll.Found path : found) {
+                List<Long> vids = path.vids();
+                hops.add(new Hop(vids.get(0), vids.get(vids.size() - 1), null));
+            }
+            sourceProps = needs.source
+                    ? vertexProps(session, graphId, sourceType, hops, true) : Map.of();
+            targetProps = needs.target
+                    ? vertexProps(session, graphId, targetType, hops, false) : Map.of();
+        }
+        Map<Integer, String> typeNames = PathValue.typeNames(catalog, graphId);
+        List<String> columns = new ArrayList<>();
+        for (Stmt.Item item : match.items()) {
+            columns.add(item.alias() == null ? item.text() : item.alias());
+        }
+        List<Stmt.Sort> sorts = aggregates == null ? sorts(match, names) : List.of();
+        List<List<Object>> rows = new ArrayList<>();
+        List<List<Object>> sortKeys = new ArrayList<>();
+        String sourceName = typeName(sourceType);
+        String targetName = typeName(targetType);
+        for (int i = 0; i < found.size(); i++) {
+            Hop hop = hops.get(i);
+            Map<String, ExprEval.Slot> bound = slots(
+                    graphId, names, match, hop, sourceType, targetType, null, null,
+                    sourceProps.get(hop.start()), targetProps.get(hop.neighbor()),
+                    new EndpointTypes(sourceName, targetName, null, null));
+            bound.put(match.pathVariable(), ExprEval.Slot.path(
+                    PathValue.of(catalog, graphId, typeNames, found.get(i))));
+            eval.slots(bound);
+            List<Object> row = new ArrayList<>();
+            for (int column = 0; column < match.items().size(); column++) {
+                row.add(cell(eval, match.items().get(column), aggregates == null ? null : aggregates[column]));
+            }
+            rows.add(row);
+            if (!sorts.isEmpty()) {
+                List<Object> keys = new ArrayList<>();
+                for (Stmt.Sort sort : sorts) {
+                    keys.add(DateTimes.plain(eval.eval(sort.expr())));
+                }
+                sortKeys.add(keys);
+            }
+        }
+        return finish(match, columns, rows, sortKeys, sorts, aggregates, true, cancel);
+    }
+
+    private Long whereEnd(int graphId, NodeType targetType, Expr where, Names names, ExprEval eval) {
+        if (where == null || names.target == null) {
+            return null;
+        }
+        List<Expr> conjuncts = new ArrayList<>();
+        collectAnd(where, conjuncts);
+        Long end = null;
+        for (Expr conjunct : conjuncts) {
+            if (!(conjunct instanceof Expr.Binary binary) || !isComparison(binary.op())) {
+                continue;
+            }
+            Ref left = ref(binary.left(), names);
+            Ref right = ref(binary.right(), names);
+            boolean neighbor = left != null && left.kind == Kind.NEIGHBOR
+                    || right != null && right.kind == Kind.NEIGHBOR;
+            if (!neighbor) {
+                continue;
+            }
+            if (!"=".equals(binary.op())) {
+                throw new CengyanException(ErrorCode.SYNTAX, "路径查询的终点只能写成 id 相等");
+            }
+            Object value = left != null && left.kind == Kind.NEIGHBOR
+                    ? constant(binary.right(), eval)
+                    : constant(binary.left(), eval);
+            if (!(value instanceof Long) && !(value instanceof String)) {
+                throw new CengyanException(ErrorCode.SYNTAX, "路径查询的终点只能写成 id 相等");
+            }
+            long id = catalog.findVertexId(graphId, targetType, value);
+            if (end != null && end != id) {
+                return Catalog.MISSING_VERTEX_ID;
+            }
+            end = id;
+        }
+        return end;
+    }
+
+    private static QueryResult emptyMatch(Stmt.Match match) {
+        List<String> columns = new ArrayList<>();
+        for (Stmt.Item item : match.items()) {
+            columns.add(item.alias() == null ? item.text() : item.alias());
+        }
+        return new QueryResult(columns, List.of(), 0);
+    }
+
+    private static boolean mentionsEdge(Stmt.Match match, String edge) {
+        if (edge == null) {
+            return false;
+        }
+        if (match.where() != null && mentions(match.where(), edge)) {
+            return true;
+        }
+        for (Stmt.Item item : match.items()) {
+            if (mentions(item.expr(), edge)) {
+                return true;
+            }
+        }
+        for (Stmt.Sort sort : match.orderBy()) {
+            if (mentions(sort.expr(), edge)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean mentions(Expr expr, String name) {
+        return switch (expr) {
+            case Expr.Literal ignored -> false;
+            case Expr.Param ignored -> false;
+            case Expr.Variable variable -> name.equals(variable.name());
+            case Expr.Prop prop -> name.equals(prop.variable());
+            case Expr.Call call -> {
+                for (Expr arg : call.args()) {
+                    if (mentions(arg, name)) {
+                        yield true;
+                    }
+                }
+                yield false;
+            }
+            case Expr.Unary unary -> mentions(unary.inner(), name);
+            case Expr.Binary binary -> mentions(binary.left(), name) || mentions(binary.right(), name);
+            case Expr.In in -> {
+                if (mentions(in.value(), name)) {
+                    yield true;
+                }
+                for (Expr option : in.options()) {
+                    if (mentions(option, name)) {
+                        yield true;
+                    }
+                }
+                yield false;
+            }
+            case Expr.IsNull isNull -> mentions(isNull.value(), name);
+        };
+    }
 
     private QueryResult multi(
             Stmt.Match match,
@@ -682,11 +919,17 @@ final class MatchExecutor {
                     hop.edge().outSrc(), hop, sourceName, targetName, session, graphId, typeCache);
             String edgeDst = hop.edge() == null ? null : endpointType(
                     hop.edge().outDst(), hop, sourceName, targetName, session, graphId, typeCache);
-            eval.slots(slots(graphId, names, match, hop, sourceType, targetType,
+            Map<String, ExprEval.Slot> bound = slots(graphId, names, match, hop, sourceType, targetType,
                     edgeTypeName(relType, typeNames, hop.edge()),
                     edgeProps == null ? null : edgeProps.get(i),
                     sourceProps.get(hop.start()), targetProps.get(hop.neighbor()),
-                    new EndpointTypes(sourceName, targetName, edgeSrc, edgeDst)));
+                    new EndpointTypes(sourceName, targetName, edgeSrc, edgeDst));
+            if (match.pathVariable() != null && hop.edge() != null) {
+                bound.put(match.pathVariable(), ExprEval.Slot.path(PathValue.one(
+                        catalog, graphId, edgeTypeName(relType, typeNames, hop.edge()),
+                        hop.start(), hop.neighbor(), hop.edge())));
+            }
+            eval.slots(bound);
             List<Object> row = new ArrayList<>();
             for (int column = 0; column < match.items().size(); column++) {
                 row.add(cell(eval, match.items().get(column), aggregates == null ? null : aggregates[column]));
@@ -1058,6 +1301,9 @@ final class MatchExecutor {
             names.edge = unique(names, match.edge().variable());
             names.target = unique(names, match.target().variable());
         }
+        if (match.pathVariable() != null) {
+            names.path = unique(names, match.pathVariable());
+        }
         return names;
     }
 
@@ -1118,6 +1364,7 @@ final class MatchExecutor {
         private String source;
         private String edge;
         private String target;
+        private String path;
         private final java.util.Set<String> declared = new java.util.HashSet<>();
         private final java.util.Set<EdgeRef> seen = new LinkedHashSet<>();
     }
@@ -1267,6 +1514,9 @@ final class MatchExecutor {
         }
 
         private void property(Expr.Prop prop) {
+            if (names.path != null && prop.variable().equals(names.path)) {
+                throw new CengyanException(ErrorCode.SYNTAX, "路径请整段返回");
+            }
             if (names.edge != null && prop.variable().equals(names.edge)) {
                 if (!"rank".equals(prop.field())) {
                     if (edgeTypes != null) {
@@ -1309,6 +1559,9 @@ final class MatchExecutor {
         }
 
         private void variable(String name, boolean whole) {
+            if (name.equals(names.path)) {
+                return;
+            }
             if (name.equals(names.edge)) {
                 if (whole) {
                     edge = true;

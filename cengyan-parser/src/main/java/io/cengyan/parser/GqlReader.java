@@ -255,6 +255,11 @@ final class GqlReader {
 
     private Stmt match() {
         expect(Kind.MATCH, "缺少 MATCH");
+        String pathVariable = null;
+        if (look(1) == Kind.EQ) {
+            pathVariable = name();
+            expect(Kind.EQ, "路径变量后面要写等号");
+        }
         Stmt.NodePat source = node();
         Stmt.EdgePat edge = null;
         Stmt.NodePat target = null;
@@ -279,7 +284,7 @@ final class GqlReader {
         }
         Long skip = take(Kind.SKIP) ? integer() : null;
         Long limit = take(Kind.LIMIT) ? integer() : null;
-        return new Stmt.Match(source, edge, target, where, items, order, skip, limit, distinct);
+        return new Stmt.Match(source, edge, target, where, items, order, skip, limit, distinct, pathVariable);
     }
 
     private Stmt call() {
@@ -430,7 +435,7 @@ final class GqlReader {
     private int[] quantifier() {
         if (peek() == Kind.STAR) {
             next();
-            return fail("不支持所有路径，请用最短路或给跳数加上边界");
+            return fail("不支持无上界路径，请写成 MATCH p = (a)-[:类型]->{1,n}(b) RETURN p LIMIT m");
         }
         if (!take(Kind.LC)) {
             return null;

@@ -61,7 +61,8 @@ public sealed interface Stmt {
             List<Sort> orderBy,
             Long skip,
             Long limit,
-            boolean distinct) implements Stmt {
+            boolean distinct,
+            String pathVariable) implements Stmt {
     }
 
     record Explain(Match query) implements Stmt {

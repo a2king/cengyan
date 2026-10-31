@@ -28,6 +28,9 @@ final class TreeText {
                     + (insert.edge() == null ? "" : " " + edge(insert.edge()) + " " + node(insert.target())) + ")";
             case Stmt.Match match -> {
                 StringBuilder text = new StringBuilder("(match ");
+                if (match.pathVariable() != null) {
+                    text.append(match.pathVariable()).append(" = ");
+                }
                 text.append(node(match.source()));
                 if (match.edge() != null) {
                     text.append(' ').append(edge(match.edge())).append(' ').append(node(match.target()));

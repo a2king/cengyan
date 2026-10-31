@@ -233,16 +233,19 @@ DROP GRAPH Company
 
 ## 多跳、最短路、子图
 
-变长跳写在箭头后面。`{3}` 是正好第 3 跳的点，`{1,3}` 是第 1 到第 3 跳新到达的点，每个点只出现一次。
+变长跳写在箭头后面。`{3}` 是正好第 3 跳的点，`{1,3}` 是第 1 到第 3 跳新到达的点，每个点只出现一次。要整条路，绑定路径变量并写 `LIMIT`。
 
 ```text
 MATCH (a:Company {id:1})-[:holder]->{1,3}(b) RETURN b.id
+MATCH p = (a:Company {id:1})-[:holder]->{1,3}(b) RETURN p LIMIT 10000
+MATCH p = (a {id:1})-[:holder]->{1,3}(b {id:4}) RETURN p LIMIT 10000
 CALL path.shortest({start: 1, end: 2, rel: "holder", hops: 10}) YIELD length, vids
+CALL path.all({start: 1, rel: "holder", min: 1, max: 3, limit: 10000}) YIELD path
 CALL subgraph.bounded({start: 1, rel: "holder", hops: 3}) YIELD vid
 CALL ownership.largest_holder({start: 1, rel: "holder", ratioProp: "ratio", hops: 10}) YIELD vid, ratio
 ```
 
-多跳 `MATCH` 的 `WHERE` 目前只能比较边的 `rank` 和终点 `id`。`*` 表示所有路径，会直接报语法错误。
+`p` 每行是 `{length, nodes:[{id}], edges:[{type, rank, src, dst}]}`。一条路上的点不重复，再多一条超过 `LIMIT` 就失败。多跳 `MATCH` 的 `WHERE` 目前只能比较边的 `rank` 和终点 `id`。`*` 表示无上界路径，会直接报语法错误。
 
 子图从起点沿这种边的出边和入边一起扩，结果包含起点，只返回 `vid`。`hops: 0` 只返回起点。
 

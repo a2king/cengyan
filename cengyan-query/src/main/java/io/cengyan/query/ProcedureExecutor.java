@@ -15,17 +15,20 @@ import io.cengyan.store.ReadSession;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
-/** {@code CALL ... YIELD}。最短路和穿透持股不走普通 MATCH。 */
+/** {@code CALL ... YIELD}。最短路、全部路径和穿透持股。 */
 final class ProcedureExecutor {
     private static final Set<String> SHORTEST_ARGS = Set.of("start", "end", "rel", "hops");
+    private static final Set<String> ALL_ARGS = Set.of("start", "end", "rel", "min", "max", "direction", "limit");
     private static final Set<String> OWNERSHIP_ARGS = Set.of("start", "rel", "ratioProp", "hops");
     private static final Set<String> SUBGRAPH_ARGS = Set.of("start", "rel", "hops");
     private static final Set<String> SHORTEST_YIELD = Set.of("length", "vids");
+    private static final Set<String> ALL_YIELD = Set.of("length", "path");
     private static final Set<String> OWNERSHIP_YIELD = Set.of("vid", "ratio");
     private static final Set<String> SUBGRAPH_YIELD = Set.of("vid");
 
@@ -42,6 +45,7 @@ final class ProcedureExecutor {
         String name = call.name().toLowerCase(Locale.ROOT);
         return switch (name) {
             case "path.shortest" -> shortest(graphId, args, call.yield(), limits, cancel);
+            case "path.all" -> all(graphId, args, call.yield(), limits, cancel);
             case "ownership.largest_holder" -> ownership(graphId, args, call.yield(), limits, cancel);
             case "subgraph.bounded" -> subgraph(graphId, args, call.yield(), limits, cancel);
             default -> throw new CengyanException(ErrorCode.SYNTAX, "未知过程 " + call.name());
@@ -79,6 +83,52 @@ final class ProcedureExecutor {
         }
         Map<String, Object> values = Map.of("length", (long) found.length(), "vids", external);
         return new QueryResult(columns, List.of(row(columns, values)), 0);
+    }
+
+    private QueryResult all(
+            int graphId,
+            Map<String, Object> args,
+            List<String> yield,
+            QueryLimits limits,
+            CancelToken cancel) {
+        known(args, ALL_ARGS);
+        List<String> columns = columns(yield, ALL_YIELD);
+        long start = requiredVertexId(graphId, args, "start");
+        Long end = args.containsKey("end") ? requiredVertexId(graphId, args, "end") : null;
+        int minHop = args.containsKey("min") ? hops(requiredLong(args, "min"), limits.maxHops()) : 1;
+        int maxHop = hops(requiredLong(args, "max"), limits.maxHops());
+        int limit = pathLimit(requiredLong(args, "limit"), limits.maxPaths());
+        String direction = args.containsKey("direction") ? requiredString(args, "direction") : "out";
+        if (start == Catalog.MISSING_VERTEX_ID || (end != null && end == Catalog.MISSING_VERTEX_ID)) {
+            return new QueryResult(columns, List.of(), 0);
+        }
+        List<PathAll.Found> found;
+        try (ReadSession session = store.read()) {
+            found = PathAll.find(
+                    session,
+                    graphId,
+                    edgeTypes(graphId, args),
+                    directions(direction),
+                    start,
+                    end,
+                    minHop,
+                    maxHop,
+                    limits.maxHops(),
+                    limits.maxEdgesPerVertex(),
+                    limit,
+                    null,
+                    cancel);
+        }
+        Map<Integer, String> typeNames = PathValue.typeNames(catalog, graphId);
+        List<List<Object>> rows = new ArrayList<>(found.size());
+        for (PathAll.Found path : found) {
+            Map<String, Object> body = PathValue.of(catalog, graphId, typeNames, path);
+            Map<String, Object> values = Map.of(
+                    "length", (long) path.length(),
+                    "path", body);
+            rows.add(row(columns, values));
+        }
+        return new QueryResult(columns, rows, 0);
     }
 
     private QueryResult ownership(
@@ -231,6 +281,47 @@ final class ProcedureExecutor {
             return text;
         }
         throw new CengyanException(ErrorCode.TYPE_MISMATCH, key + " 必须是字符串");
+    }
+
+    private Set<Integer> edgeTypes(int graphId, Map<String, Object> args) {
+        if (!args.containsKey("rel")) {
+            return null;
+        }
+        String text = requiredString(args, "rel");
+        if (text.isEmpty()) {
+            throw new CengyanException(ErrorCode.SYNTAX, "rel 不能为空");
+        }
+        Set<Integer> ids = new LinkedHashSet<>();
+        for (String part : text.split("\\|", -1)) {
+            if (part.isEmpty()) {
+                throw new CengyanException(ErrorCode.SYNTAX, "rel 里有空的边类型");
+            }
+            RelType type = catalog.relType(graphId, part);
+            if (!ids.add(type.id())) {
+                throw new CengyanException(ErrorCode.SYNTAX, "边类型重复：" + part);
+            }
+        }
+        return ids;
+    }
+
+    private static List<Direction> directions(String text) {
+        return switch (text.toLowerCase(Locale.ROOT)) {
+            case "out" -> List.of(Direction.OUT);
+            case "in" -> List.of(Direction.IN);
+            case "both" -> List.of(Direction.OUT, Direction.IN);
+            default -> throw new CengyanException(ErrorCode.SYNTAX, "方向只能是 out、in 或 both");
+        };
+    }
+
+    private static int pathLimit(long value, int maxPaths) {
+        if (value < 1 || value > Integer.MAX_VALUE) {
+            throw new CengyanException(ErrorCode.SYNTAX, "路径条数超出范围");
+        }
+        int limit = (int) value;
+        if (limit > maxPaths) {
+            throw new CengyanException(ErrorCode.SYNTAX, "路径条数 " + limit + " 超过上限 " + maxPaths);
+        }
+        return limit;
     }
 
     private static int hops(long value, int maxHops) {

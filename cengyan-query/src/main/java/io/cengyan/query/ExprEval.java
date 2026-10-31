@@ -427,6 +427,11 @@ final class ExprEval {
             return new Slot(false, vid, externalId, typeName, null, null, null, null, null, props, body);
         }
 
+        /** 整条路径。{@code body} 含 length、nodes、edges。 */
+        static Slot path(Map<String, Object> body) {
+            return new Slot(false, 0L, null, null, null, null, null, null, null, null, body);
+        }
+
         static Slot edge(String typeName, long rank, long src, long dst, Map<String, Object> props) {
             return edge(typeName, rank, src, dst, props, null, null);
         }

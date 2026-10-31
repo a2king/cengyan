@@ -130,7 +130,7 @@ class Phase6Test {
             CengyanException unknown = assertThrows(CengyanException.class, () -> run(db,
                     "CALL path.all({start: 1, end: 5, rel: \"holder\", hops: 4}) YIELD length, vids"));
             assertEquals(ErrorCode.SYNTAX, unknown.code());
-            assertTrue(unknown.getMessage().contains("未知过程"));
+            assertTrue(unknown.getMessage().contains("未知参数"));
         }
     }
 
