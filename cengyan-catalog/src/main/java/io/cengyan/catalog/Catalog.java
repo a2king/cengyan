@@ -867,8 +867,8 @@ public final class Catalog {
     }
 
     /**
-     * 批量写入边。当前要求边两端在同一分片；单机和单分片图可直接使用。
-     * 每个逻辑边的出边、入边、属性和索引都进入同一个 RocksDB WriteBatch。
+     * 批量写入边。同一分片的边一次提交出边、入边、属性和索引。
+     * 跨分片的边与单条插入相同：先提交出边、属性和补偿标记，再提交入边，最后删除标记。
      */
     public int bulkInsertRels(
             int graphId, String relTypeName, List<BulkEdge> rows, boolean ifNotExists) {
@@ -880,7 +880,9 @@ public final class Catalog {
             requireGraph(graphId);
             requireWritable(graphId);
             RelType type = relType(graphId, relTypeName);
+            List<IndexDef> edgeIndexes = indexesFor(graphId, false, type.id());
             StoreBatch batch = new StoreBatch();
+            Map<EdgeIdentity, CrossEdge> cross = new LinkedHashMap<>();
             Map<EdgeIdentity, byte[]> previous = new LinkedHashMap<>();
             try (ReadSession session = store.read()) {
                 for (BulkEdge row : rows) {
@@ -888,33 +890,47 @@ public final class Catalog {
                     int inPart = partOf(graphId, row.dst());
                     requirePart(graphId, outPart);
                     requirePart(graphId, inPart);
-                    if (outPart != inPart) {
-                        throw new CengyanException(ErrorCode.CROSS_PART_UNSUPPORTED,
-                                "批量边的两端必须位于同一分片");
-                    }
                     EdgeIdentity identity = new EdgeIdentity(row.rank(), row.src(), row.dst());
                     byte[] propKey = KeyCodec.propKey(graphId, type.id(), row.rank(), row.src(), row.dst());
-                    byte[] old = previous.containsKey(identity) ? previous.get(identity) : session.get(Cf.PROP, propKey);
+                    byte[] old = previous.containsKey(identity)
+                            ? previous.get(identity)
+                            : session.get(Cf.PROP, propKey);
                     if (ifNotExists && old != null) {
                         continue;
                     }
                     Map<String, Object> next = normalizeProperties(type.properties(), row.properties());
                     byte[] encoded = PropCodec.encode(type.schemaVersion(), type.properties(), next);
-                    batch.put(Cf.EDGE, KeyCodec.edgeKey(
-                            graphId, outPart, row.src(), type.id(), Direction.OUT.code(), row.rank(), row.dst()), EMPTY);
-                    batch.put(Cf.EDGE, KeyCodec.edgeKey(
-                            graphId, inPart, row.dst(), type.id(), Direction.IN.code(), row.rank(), row.src()), EMPTY);
-                    batch.put(Cf.PROP, propKey, encoded);
-                    IndexMaintenance.sync(
-                            session,
-                            batch,
-                            indexesFor(graphId, false, type.id()),
-                            type.properties(),
-                            old == null ? null : PropCodec.decode(type.properties(), type.schemaVersion(), old),
-                            PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
-                            graphId,
-                            KeyCodec.edgeIdentity(type.id(), row.rank(), row.src(), row.dst()));
+                    if (outPart == inPart) {
+                        batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                                graphId, outPart, row.src(), type.id(), Direction.OUT.code(), row.rank(), row.dst()), EMPTY);
+                        batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                                graphId, inPart, row.dst(), type.id(), Direction.IN.code(), row.rank(), row.src()), EMPTY);
+                        batch.put(Cf.PROP, propKey, encoded);
+                        IndexMaintenance.sync(
+                                session,
+                                batch,
+                                edgeIndexes,
+                                type.properties(),
+                                old == null ? null : PropCodec.decode(type.properties(), type.schemaVersion(), old),
+                                PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
+                                graphId,
+                                KeyCodec.edgeIdentity(type.id(), row.rank(), row.src(), row.dst()));
+                    } else {
+                        CrossEdge prior = cross.get(identity);
+                        cross.put(identity, new CrossEdge(
+                                row.rank(),
+                                row.src(),
+                                row.dst(),
+                                outPart,
+                                inPart,
+                                propKey,
+                                encoded,
+                                prior == null ? old : prior.baseline()));
+                    }
                     previous.put(identity, encoded);
+                }
+                if (!cross.isEmpty()) {
+                    writeCrossBulk(session, graphId, type, edgeIndexes, List.copyOf(cross.values()));
                 }
                 if (!batch.isEmpty()) {
                     store.commitEdges(batch);
@@ -922,6 +938,82 @@ public final class Catalog {
             }
             return previous.size();
         });
+    }
+
+    /** 一批跨分片边：出边和补偿标记先落盘，入边成功后再清标记。失败时按单条补偿回滚。 */
+    private void writeCrossBulk(
+            ReadSession session,
+            int graphId,
+            RelType type,
+            List<IndexDef> edgeIndexes,
+            List<CrossEdge> rows) {
+        StoreBatch outBatch = new StoreBatch();
+        for (CrossEdge row : rows) {
+            outBatch.put(Cf.EDGE, KeyCodec.edgeKey(
+                    graphId, row.outPart(), row.src(), type.id(), Direction.OUT.code(), row.rank(), row.dst()), EMPTY);
+            outBatch.put(Cf.PROP, row.propKey(), row.encoded());
+            outBatch.put(Cf.TXN, crossTxnKey(graphId, type, row), ClusterCodec.txn(ClusterCodec.TXN_OUT, row.encoded()));
+            if (!edgeIndexes.isEmpty()) {
+                IndexMaintenance.sync(
+                        session,
+                        outBatch,
+                        edgeIndexes,
+                        type.properties(),
+                        row.baseline() == null
+                                ? null
+                                : PropCodec.decode(type.properties(), type.schemaVersion(), row.baseline()),
+                        PropCodec.decode(type.properties(), type.schemaVersion(), row.encoded()),
+                        graphId,
+                        KeyCodec.edgeIdentity(type.id(), row.rank(), row.src(), row.dst()));
+            }
+        }
+        try {
+            store.mutate(outBatch);
+            StoreBatch inBatch = new StoreBatch();
+            for (CrossEdge row : rows) {
+                inBatch.put(Cf.EDGE, KeyCodec.edgeKey(
+                        graphId, row.inPart(), row.dst(), type.id(), Direction.IN.code(), row.rank(), row.src()), EMPTY);
+            }
+            store.mutate(inBatch);
+        } catch (RuntimeException ex) {
+            RuntimeException rollbackError = null;
+            for (CrossEdge row : rows) {
+                try {
+                    rollbackTxn(
+                            graphId,
+                            type,
+                            row.rank(),
+                            row.src(),
+                            row.dst(),
+                            row.outPart(),
+                            row.encoded(),
+                            row.propKey(),
+                            crossTxnKey(graphId, type, row),
+                            edgeIndexes);
+                } catch (RuntimeException rollback) {
+                    if (rollbackError == null) {
+                        rollbackError = rollback;
+                    } else {
+                        rollbackError.addSuppressed(rollback);
+                    }
+                }
+            }
+            CengyanException failure = new CengyanException(
+                    ErrorCode.INTERNAL, "跨分片边写入失败：" + ex.getMessage(), ex);
+            if (rollbackError != null) {
+                failure.addSuppressed(rollbackError);
+            }
+            throw failure;
+        }
+        StoreBatch done = new StoreBatch();
+        for (CrossEdge row : rows) {
+            done.delete(Cf.TXN, crossTxnKey(graphId, type, row));
+        }
+        store.mutate(done);
+    }
+
+    private static byte[] crossTxnKey(int graphId, RelType type, CrossEdge row) {
+        return KeyCodec.txnKey(graphId, row.outPart(), type.id(), row.rank(), row.src(), row.dst());
     }
 
     public Map<String, Object> readVertex(int graphId, String typeName, long vid) {
@@ -2367,6 +2459,17 @@ public final class Catalog {
     }
 
     private record EdgeIdentity(long rank, long src, long dst) {
+    }
+
+    private record CrossEdge(
+            long rank,
+            long src,
+            long dst,
+            int outPart,
+            int inPart,
+            byte[] propKey,
+            byte[] encoded,
+            byte[] baseline) {
     }
 
     private record VertexPut(int tagId, long vid, byte[] value) {
