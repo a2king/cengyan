@@ -26,12 +26,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 
-/** 把 execute 放到查询线程。网络线程只解析 JSON 和占一个名额。 */
+/** 网络线程只解析 JSON。排队和执行交给 {@link QueryScheduler}。 */
 final class ExecuteService {
     private static final Logger log = LoggerFactory.getLogger(ExecuteService.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -39,23 +35,21 @@ final class ExecuteService {
     private final QueryEngine engine;
     private final ServerConfig config;
     private final QueryRegistry queries;
-    private final ExecutorService queryPool;
+    private final QueryScheduler scheduler;
     private final Sessions sessions;
-    private final Semaphore permits;
     private final ConcurrentMap<ChannelId, Set<String>> byChannel = new ConcurrentHashMap<>();
 
     ExecuteService(
             QueryEngine engine,
             ServerConfig config,
             QueryRegistry queries,
-            ExecutorService queryPool,
+            QueryScheduler scheduler,
             Sessions sessions) {
         this.engine = engine;
         this.config = config;
         this.queries = queries;
-        this.queryPool = queryPool;
+        this.scheduler = scheduler;
         this.sessions = sessions;
-        this.permits = new Semaphore(config.queryThreads());
     }
 
     void execute(ChannelHandlerContext ctx, JsonNode node) {
@@ -80,24 +74,8 @@ final class ExecuteService {
             error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
-        boolean acquired;
-        try {
-            acquired = permits.tryAcquire(50, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-            return;
-        }
-        if (!acquired) {
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-            return;
-        }
-        try {
-            queryPool.execute(() -> run(ctx, session, query, params, timeoutMs));
-        } catch (RejectedExecutionException ex) {
-            permits.release();
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-        }
+        dispatch(QueryScheduler.laneForQuery(query), session, timeoutMs,
+                () -> run(ctx, session, query, params, timeoutMs), ctx);
     }
 
     void bulkInsert(ChannelHandlerContext ctx, JsonNode node) {
@@ -134,17 +112,11 @@ final class ExecuteService {
             error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
-        if (!acquire(ctx, session)) {
-            return;
-        }
         boolean ignoreExisting = node.path("ignoreExisting").asBoolean(false);
-        try {
-            queryPool.execute(() -> runBulk(
-                    ctx, session, kind, type, rows, ignoreExisting, timeoutMs));
-        } catch (RejectedExecutionException ex) {
-            permits.release();
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-        }
+        boolean skipMissing = node.path("skipMissing").asBoolean(false);
+        long capped = QueryScheduler.capTimeout(timeoutMs, config.heavyMaxExecutionTimeMs());
+        dispatch(QueryScheduler.Lane.HEAVY, session, capped,
+                () -> runBulk(ctx, session, kind, type, rows, ignoreExisting, skipMissing, capped), ctx);
     }
 
     private void runBulk(
@@ -154,6 +126,7 @@ final class ExecuteService {
             String type,
             List<Map<String, Object>> rows,
             boolean ignoreExisting,
+            boolean skipMissing,
             long timeoutMs) {
         QueryHandle handle = QueryHandle.start(timeoutMs);
         queries.register(handle);
@@ -166,14 +139,12 @@ final class ExecuteService {
                 }
                 handle.describe(session.user(), "bulkInsert " + kind + " " + type + " rows=" + rows.size());
             }
-            QueryResult result = engine.bulkInsert(session, kind, type, rows, ignoreExisting, handle);
+            QueryResult result = engine.bulkInsert(session, kind, type, rows, ignoreExisting, skipMissing, handle);
             ObjectNode node = MAPPER.createObjectNode();
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);
             node.put("queryId", handle.id());
-            node.set("columns", MAPPER.valueToTree(result.columns()));
-            node.set("rows", MAPPER.valueToTree(result.rows()));
-            node.put("rowsAffected", result.rowsAffected());
+            putResult(node, result);
             write(ctx, node);
         } catch (CengyanException ex) {
             error(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
@@ -202,34 +173,22 @@ final class ExecuteService {
             error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
-        boolean acquired;
-        try {
-            acquired = permits.tryAcquire(50, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-            return;
-        }
-        if (!acquired) {
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-            return;
-        }
-        try {
-            queryPool.execute(() -> runAdmin(ctx, session, new AdminCall(
-                    command,
-                    index,
-                    node.path("user").asText(""),
-                    node.path("password").asText(""),
-                    node.path("role").asText(""),
-                    node.path("address").asText(""),
-                    node.path("nodeId").asInt(0),
-                    node.path("graph").asText(""),
-                    node.path("replicas").asInt(0),
-                    node.path("parts").asInt(0)), timeoutMs));
-        } catch (RejectedExecutionException ex) {
-            permits.release();
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-        }
+        QueryScheduler.Lane lane = QueryScheduler.laneForAdmin(command);
+        long effective = lane == QueryScheduler.Lane.HEAVY
+                ? QueryScheduler.capTimeout(timeoutMs, config.heavyMaxExecutionTimeMs())
+                : timeoutMs;
+        AdminCall call = new AdminCall(
+                command,
+                index,
+                node.path("user").asText(""),
+                node.path("password").asText(""),
+                node.path("role").asText(""),
+                node.path("address").asText(""),
+                node.path("nodeId").asInt(0),
+                node.path("graph").asText(""),
+                node.path("replicas").asInt(0),
+                node.path("parts").asInt(0));
+        dispatch(lane, session, effective, () -> runAdmin(ctx, session, call, effective), ctx);
     }
 
     void login(ChannelHandlerContext ctx, JsonNode node) {
@@ -245,15 +204,8 @@ final class ExecuteService {
             error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
-        if (!acquire(ctx, session)) {
-            return;
-        }
-        try {
-            queryPool.execute(() -> runLogin(ctx, session, user, password, timeoutMs));
-        } catch (RejectedExecutionException ex) {
-            permits.release();
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-        }
+        dispatch(QueryScheduler.Lane.RESERVED, session, timeoutMs,
+                () -> runLogin(ctx, session, user, password, timeoutMs), ctx);
     }
 
     private void runLogin(
@@ -268,9 +220,7 @@ final class ExecuteService {
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);
             node.put("queryId", handle.id());
-            node.set("columns", MAPPER.valueToTree(result.columns()));
-            node.set("rows", MAPPER.valueToTree(result.rows()));
-            node.put("rowsAffected", result.rowsAffected());
+            putResult(node, result);
             write(ctx, node);
         } catch (CengyanException ex) {
             error(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
@@ -300,9 +250,7 @@ final class ExecuteService {
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);
             node.put("queryId", handle.id());
-            node.set("columns", MAPPER.valueToTree(result.columns()));
-            node.set("rows", MAPPER.valueToTree(result.rows()));
-            node.put("rowsAffected", result.rowsAffected());
+            putResult(node, result);
             write(ctx, node);
         } catch (CengyanException ex) {
             error(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
@@ -418,9 +366,7 @@ final class ExecuteService {
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);
             node.put("queryId", handle.id());
-            node.set("columns", MAPPER.valueToTree(result.columns()));
-            node.set("rows", MAPPER.valueToTree(result.rows()));
-            node.put("rowsAffected", result.rowsAffected());
+            putResult(node, result);
             write(ctx, node);
         } catch (CengyanException ex) {
             error(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
@@ -430,26 +376,15 @@ final class ExecuteService {
         } finally {
             if (registered) {
                 finish(ctx, handle);
-            } else {
-                permits.release();
             }
         }
     }
 
-    private boolean acquire(ChannelHandlerContext ctx, String session) {
-        boolean acquired;
-        try {
-            acquired = permits.tryAcquire(50, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-            return false;
-        }
-        if (!acquired) {
-            error(ctx, session, null, ErrorCode.BUSY, "查询线程已满");
-            return false;
-        }
-        return true;
+    private void dispatch(
+            QueryScheduler.Lane lane, String sessionId, long timeoutMs, Runnable task, ChannelHandlerContext ctx) {
+        long sessionWaitMs = timeoutMs <= 0 ? config.queryQueueMs() : timeoutMs;
+        scheduler.submit(lane, sessionId, sessionWaitMs, task,
+                message -> error(ctx, sessionId, null, ErrorCode.BUSY, message));
     }
 
     private void finish(ChannelHandlerContext ctx, QueryHandle handle) {
@@ -458,7 +393,6 @@ final class ExecuteService {
         if (ids != null) {
             ids.remove(handle.id());
         }
-        permits.release();
     }
 
     private long timeout(JsonNode node) {
@@ -547,6 +481,15 @@ final class ExecuteService {
             node.put("queryId", queryId);
         }
         write(ctx, node);
+    }
+
+    private static void putResult(ObjectNode node, QueryResult result) {
+        node.set("columns", MAPPER.valueToTree(result.columns()));
+        node.set("rows", MAPPER.valueToTree(result.rows()));
+        node.put("rowsAffected", result.rowsAffected());
+        if (result.collectedAt() != null) {
+            node.put("collectedAt", result.collectedAt());
+        }
     }
 
     private void write(ChannelHandlerContext ctx, ObjectNode node) {

@@ -28,7 +28,6 @@ import org.slf4j.LoggerFactory;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -50,7 +49,7 @@ public final class GraphDbServer implements AutoCloseable {
     private final ScheduledExecutorService timeoutThread;
     private final ScheduledExecutorService compensateThread;
     private final ScheduledExecutorService cacheCompactThread;
-    private final ExecutorService queryPool;
+    private final QueryScheduler scheduler;
     private final EventLoopGroup boss;
     private final EventLoopGroup worker;
     private final Channel channel;
@@ -66,7 +65,7 @@ public final class GraphDbServer implements AutoCloseable {
             ScheduledExecutorService timeoutThread,
             ScheduledExecutorService compensateThread,
             ScheduledExecutorService cacheCompactThread,
-            ExecutorService queryPool,
+            QueryScheduler scheduler,
             EventLoopGroup boss,
             EventLoopGroup worker,
             Channel channel,
@@ -79,7 +78,7 @@ public final class GraphDbServer implements AutoCloseable {
         this.timeoutThread = timeoutThread;
         this.compensateThread = compensateThread;
         this.cacheCompactThread = cacheCompactThread;
-        this.queryPool = queryPool;
+        this.scheduler = scheduler;
         this.boss = boss;
         this.worker = worker;
         this.channel = channel;
@@ -101,7 +100,7 @@ public final class GraphDbServer implements AutoCloseable {
         ScheduledExecutorService timeoutThread = null;
         ScheduledExecutorService compensateThread = null;
         ScheduledExecutorService cacheCompactThread = null;
-        ExecutorService queryPool = null;
+        QueryScheduler scheduler = null;
         EventLoopGroup boss = null;
         EventLoopGroup worker = null;
         HttpGateway httpGateway = null;
@@ -166,18 +165,14 @@ public final class GraphDbServer implements AutoCloseable {
                     }
                 }, cacheMinutes, cacheMinutes, TimeUnit.MINUTES);
             }
-            queryPool = Executors.newFixedThreadPool(config.queryThreads(), runnable -> {
-                Thread thread = new Thread(runnable, "cengyan-query");
-                thread.setDaemon(false);
-                return thread;
-            });
+            scheduler = QueryScheduler.open(config);
             boss = new NioEventLoopGroup(1, new DefaultThreadFactory("cengyan-boss"));
             worker = new NioEventLoopGroup(0, new DefaultThreadFactory("cengyan-io"));
             QueryEngine engine = new QueryEngine(
                     catalog, store, config.duckdbMemory(), config.duckdbTempDirectory(),
                     auth);
             engine.bind(membership);
-            ExecuteService execute = new ExecuteService(engine, config, queries, queryPool, sessions);
+            ExecuteService execute = new ExecuteService(engine, config, queries, scheduler, sessions);
             LineServer lineServer = new LineServer(execute);
             ServerBootstrap bootstrap = new ServerBootstrap();
             bootstrap.group(boss, worker)
@@ -202,7 +197,7 @@ public final class GraphDbServer implements AutoCloseable {
                     config.httpTlsEnabled(), config.httpTlsKeystore(), config.httpTlsPassword());
             return new GraphDbServer(
                     config, store, catalog, membership, queries, timeoutThread, compensateThread,
-                    cacheCompactThread, queryPool, boss, worker, channel, httpGateway);
+                    cacheCompactThread, scheduler, boss, worker, channel, httpGateway);
         } catch (Exception ex) {
             if (worker != null) {
                 worker.shutdownGracefully();
@@ -213,8 +208,8 @@ public final class GraphDbServer implements AutoCloseable {
             if (boss != null) {
                 boss.shutdownGracefully();
             }
-            if (queryPool != null) {
-                queryPool.shutdownNow();
+            if (scheduler != null) {
+                scheduler.close();
             }
             if (cacheCompactThread != null) {
                 cacheCompactThread.shutdownNow();
@@ -257,10 +252,6 @@ public final class GraphDbServer implements AutoCloseable {
         return config;
     }
 
-    ExecutorService queryPool() {
-        return queryPool;
-    }
-
     QueryRegistry queries() {
         return queries;
     }
@@ -277,7 +268,7 @@ public final class GraphDbServer implements AutoCloseable {
             channel.close().syncUninterruptibly();
             worker.shutdownGracefully().syncUninterruptibly();
             boss.shutdownGracefully().syncUninterruptibly();
-            queryPool.shutdownNow();
+            scheduler.close();
             if (cacheCompactThread != null) {
                 cacheCompactThread.shutdownNow();
             }

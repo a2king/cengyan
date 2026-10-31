@@ -20,7 +20,11 @@ public record ServerConfig(
         String httpTlsPassword,
         Path dataDir,
         int queryThreads,
+        int interactiveReserved,
+        int heavyQueryThreads,
+        long queryQueueMs,
         long maxExecutionTimeMs,
+        long heavyMaxExecutionTimeMs,
         int maxEdgesPerVertex,
         int maxFrontierPerHop,
         int maxHops,
@@ -53,8 +57,20 @@ public record ServerConfig(
         if (queryThreads <= 0) {
             throw new IllegalArgumentException("queryThreads 必须为正");
         }
+        if (interactiveReserved < 0 || interactiveReserved >= queryThreads) {
+            throw new IllegalArgumentException("interactiveReserved 必须小于 queryThreads");
+        }
+        if (heavyQueryThreads <= 0) {
+            throw new IllegalArgumentException("heavyQueryThreads 必须为正");
+        }
+        if (queryQueueMs < 0) {
+            throw new IllegalArgumentException("queryQueueMs 不能为负");
+        }
         if (maxExecutionTimeMs < 0) {
             throw new IllegalArgumentException("maxExecutionTimeMs 不能为负，0 表示不限");
+        }
+        if (heavyMaxExecutionTimeMs < 0) {
+            throw new IllegalArgumentException("heavyMaxExecutionTimeMs 不能为负，0 表示不限");
         }
         if (maxEdgesPerVertex < 0 || maxFrontierPerHop < 0 || maxHops < 0 || maxPaths < 0) {
             throw new IllegalArgumentException("查询预算不能为负，0 表示不限");
@@ -104,7 +120,11 @@ public record ServerConfig(
                 "",
                 dataDir,
                 2,
+                0,
+                1,
+                queryQueueMs,
                 maxExecutionTimeMs,
+                heavyMaxExecutionTimeMs,
                 maxEdgesPerVertex,
                 maxFrontierPerHop,
                 maxHops,
@@ -120,7 +140,7 @@ public record ServerConfig(
     }
 
     private static ServerConfig from(Properties properties) {
-        int threads = integer(properties, "query_threads", Runtime.getRuntime().availableProcessors());
+        int threads = Math.max(integer(properties, "query_threads", Runtime.getRuntime().availableProcessors()), 1);
         return new ServerConfig(
                 text(properties, "host", "0.0.0.0"),
                 integer(properties, "port", 19669),
@@ -129,8 +149,12 @@ public record ServerConfig(
                 Path.of(properties.getProperty("http_tls_keystore", "config/server.p12")),
                 properties.getProperty("http_tls_password", ""),
                 Path.of(properties.getProperty("data_dir", "data")),
-                Math.max(threads, 1),
+                threads,
+                integer(properties, "interactive_reserved", Math.min(2, threads - 1)),
+                integer(properties, "heavy_query_threads", 2),
+                longValue(properties, "query_queue_ms", 30_000L),
                 Long.parseLong(properties.getProperty("max_execution_time_ms", "0").trim()),
+                longValue(properties, "heavy_max_execution_time_ms", 0L),
                 integer(properties, "max_edges_per_vertex", 0),
                 integer(properties, "max_frontier_per_hop", 0),
                 integer(properties, "max_hops", 0),

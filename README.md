@@ -334,8 +334,12 @@ TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`
 | `port` | `19669` | 监听端口 |
 | `data_dir` | `data` | 数据目录，相对启动时的工作目录 |
 | `root_password` | `cengyan` | 只在还没有任何用户时，用来创建 `root` |
-| `query_threads` | `16` | 查询线程数 |
-| `max_execution_time_ms` | `0` | 一条语句的服务端超时，`0` 表示不限 |
+| `query_threads` | `16` | 交互查询线程数。登录、SHOW、USE、DESCRIBE 和普通语句走这里 |
+| `interactive_reserved` | `2` | 上面的名额里留给登录和元数据的条数，必须小于 `query_threads` |
+| `heavy_query_threads` | `2` | 统计、存储扫描、重建索引、批量导入使用的线程数，不占用交互线程 |
+| `query_queue_ms` | `30000` | 等一条空闲线程的最长时间，超时返回 `BUSY` |
+| `heavy_max_execution_time_ms` | `0` | 重查询的硬超时。`0` 表示不再额外限制 |
+| `max_execution_time_ms` | `0` | 一条普通语句的服务端超时，`0` 表示不限 |
 | `max_edges_per_vertex` | `0` | 每点扫描边数预算，`0` 表示不限 |
 | `max_frontier_per_hop` | `0` | 每跳新点预算，`0` 表示不限 |
 | `max_hops` | `0` | 多跳、最短路、子图的跳数预算，`0` 表示不限 |
