@@ -65,7 +65,7 @@ $archivePath = Join-Path $distDir "$packageName-windows.zip"
 Write-Host '开始构建 cengyan-server 和 cengyan-studio ...'
 Push-Location $repoRoot
 try {
-    & $maven.Source '-DskipTests' '-pl' 'cengyan-server,cengyan-studio' '-am' 'package'
+    & $maven.Source '-DskipTests' '-pl' 'cengyan-server,cengyan-studio' '-am' 'clean' 'package'
     if ($LASTEXITCODE -ne 0) {
         throw "Maven 构建失败，退出码：$LASTEXITCODE"
     }
@@ -105,6 +105,11 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\studio.properties') -Dest
 Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\studio.properties') -Destination (Join-Path $packageRoot 'config\studio.properties.example')
 
 Copy-Item -Path (Join-Path $repoRoot 'packaging\bin\*') -Destination (Join-Path $packageRoot 'bin') -Recurse
+$utf8 = New-Object System.Text.UTF8Encoding $false
+Get-ChildItem -LiteralPath (Join-Path $packageRoot 'bin') -File | Where-Object { $_.Extension -eq '.sh' -or $_.Name -eq 'java.env' } | ForEach-Object {
+    $text = [System.IO.File]::ReadAllText($_.FullName) -replace "`r`n", "`n" -replace "`r", "`n"
+    [System.IO.File]::WriteAllText($_.FullName, $text, $utf8)
+}
 Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\PACKAGE-README.txt') -Destination (Join-Path $packageRoot 'README.txt')
 Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\lib\README.txt') -Destination (Join-Path $packageRoot 'lib\README.txt')
 

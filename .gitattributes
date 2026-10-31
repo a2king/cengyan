@@ -1,0 +1,3 @@
+packaging/bin/*.sh text eol=lf
+packaging/bin/java.env text eol=lf
+*.bat text eol=crlf

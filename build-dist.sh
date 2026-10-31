@@ -50,7 +50,7 @@ PACKAGE_ROOT="$DIST_DIR/$PACKAGE_NAME"
 ARCHIVE_PATH="$DIST_DIR/$PACKAGE_NAME-linux.tar.gz"
 
 echo '开始构建 cengyan-server 和 cengyan-studio ...'
-(cd "$ROOT_DIR" && mvn -DskipTests -pl cengyan-server,cengyan-studio -am package)
+(cd "$ROOT_DIR" && mvn -DskipTests -pl cengyan-server,cengyan-studio -am clean package)
 
 rm -rf "$PACKAGE_ROOT" "$ARCHIVE_PATH"
 mkdir -p "$PACKAGE_ROOT"/{bin,config,data,logs,pid,tmp,lib}
@@ -74,6 +74,7 @@ cp "$ROOT_DIR/packaging/bin/java.env" "$PACKAGE_ROOT/bin/java.env"
 cp "$ROOT_DIR/packaging/PACKAGE-README.txt" "$PACKAGE_ROOT/README.txt"
 cp "$ROOT_DIR/packaging/lib/README.txt" "$PACKAGE_ROOT/lib/README.txt"
 chmod +x "$PACKAGE_ROOT/bin/"*.sh
+sed -i 's/\r$//' "$PACKAGE_ROOT/bin/"*.sh "$PACKAGE_ROOT/bin/java.env"
 
 tar -czf "$ARCHIVE_PATH" -C "$DIST_DIR" "$PACKAGE_NAME"
 echo "打包完成：$PACKAGE_ROOT"
