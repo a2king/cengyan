@@ -178,6 +178,7 @@ public final class QueryEngine {
             String typeName,
             List<Map<String, Object>> rows,
             boolean ignoreExisting,
+            boolean skipMissing,
             CancelToken cancel) {
         if (session == null || rows == null || kind == null || typeName == null) {
             throw new IllegalArgumentException("批量导入参数不能为空");
@@ -220,12 +221,15 @@ public final class QueryEngine {
                     sourceValues.add(row.get("src"));
                     targetValues.add(row.get("dst"));
                 }
-                List<Long> sourceIds = catalog.findBulkUnqualifiedVertexIds(graphId, sourceValues);
-                List<Long> targetIds = catalog.findBulkUnqualifiedVertexIds(graphId, targetValues);
+                List<Long> sourceIds = catalog.findBulkUnqualifiedVertexIds(graphId, sourceValues, skipMissing);
+                List<Long> targetIds = catalog.findBulkUnqualifiedVertexIds(graphId, targetValues, skipMissing);
                 for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
                     Map<String, Object> row = rows.get(rowIndex);
-                    long src = sourceIds.get(rowIndex);
-                    long dst = targetIds.get(rowIndex);
+                    Long src = sourceIds.get(rowIndex);
+                    Long dst = targetIds.get(rowIndex);
+                    if (src == null || dst == null) {
+                        continue;
+                    }
                     long rank = row.containsKey("rank") ? bulkLong(row.get("rank"), "rank") : 0L;
                     Map<String, Object> properties = new LinkedHashMap<>();
                     Object nested = row.get("properties");
@@ -246,6 +250,9 @@ public final class QueryEngine {
                         }
                     }
                     writes.add(new Catalog.BulkEdge(rank, src, dst, properties));
+                }
+                if (writes.isEmpty()) {
+                    return QueryResult.changed(0);
                 }
                 int written = catalog.bulkInsertRels(graphId, typeName, writes, ignoreExisting);
                 return QueryResult.changed(written);

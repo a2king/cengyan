@@ -593,8 +593,11 @@ public final class Catalog {
         });
     }
 
-    /** 批量查找无类型端点 ID；不会为字符串 ID 创建新的目录映射。 */
-    public List<Long> findBulkUnqualifiedVertexIds(int graphId, List<?> values) {
+    /**
+     * 批量查找无类型端点 ID；不会为字符串 ID 创建新的目录映射。
+     * {@code skipMissing} 为真时，尚未注册的字符串 ID 在对应位置返回空，其余位置仍是内部编号。
+     */
+    public List<Long> findBulkUnqualifiedVertexIds(int graphId, List<?> values, boolean skipMissing) {
         if (values == null) {
             throw new IllegalArgumentException("ID 列表不能为空");
         }
@@ -610,6 +613,10 @@ public final class Catalog {
                 }
                 byte[] raw = session.get(Cf.CATALOG, KeyCodec.stringIdForwardKey(graphId, text));
                 if (raw == null) {
+                    if (skipMissing) {
+                        result.add(null);
+                        continue;
+                    }
                     throw new CengyanException(ErrorCode.TYPE_MISMATCH, "字符串节点 ID 尚未注册：" + text);
                 }
                 result.add(decodeLong(raw));

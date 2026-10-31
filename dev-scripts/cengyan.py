@@ -130,8 +130,12 @@ class Client:
             timeout_ms=timeout_ms,
         )
 
-    def bulk_insert(self, kind, type_name, rows, *, ignore_existing=False, timeout_ms=None):
-        """Atomically write one bounded node/edge batch on the server."""
+    def bulk_insert(self, kind, type_name, rows, *, ignore_existing=False, skip_missing=False, timeout_ms=None):
+        """Atomically write one bounded node/edge batch on the server.
+
+        ``skip_missing`` 只对边生效。为真时，端点字符串 ID 尚未注册的边会被跳过，
+        同批里其余边继续写入。默认关闭，缺端点时整批失败。
+        """
         if kind not in ("node", "edge", "rel"):
             raise ValueError("bulk kind must be node or edge")
         if not rows:
@@ -145,6 +149,7 @@ class Client:
                 "type": type_name,
                 "rows": rows,
                 "ignoreExisting": ignore_existing,
+                "skipMissing": skip_missing,
             },
             timeout_ms=timeout_ms,
         )

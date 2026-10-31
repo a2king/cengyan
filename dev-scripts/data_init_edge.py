@@ -283,9 +283,14 @@ def cengyan_udf(rows: Iterator[Any], *, config: Mapping[str, Any]) -> None:
                 )
                 for item in batch
             ]
-            _check(client.bulk_insert("edge", config["edge_type"], rows),
-                    f"bulkInsert edge rows={len(rows)}")
-            written += len(rows)
+            response = client.bulk_insert(
+                "edge",
+                config["edge_type"],
+                rows,
+                skip_missing=bool(config.get("skip_missing", False)),
+            )
+            _check(response, f"bulkInsert edge rows={len(rows)}")
+            written += int(response.get("rowsAffected", len(rows)))
             batch.clear()
 
         for row in chain((first,), iterator):
@@ -322,6 +327,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="边端点 ID 最大长度（STRING 按 UTF-8 字节，默认 19）")
     parser.add_argument("--rank-field", default="")
     parser.add_argument("--property-fields", "--properties", default="")
+    parser.add_argument("--skip-missing", action="store_true",
+                        help="端点字符串 ID 尚未注册时跳过该边，默认关闭")
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--repartition", type=int, default=0)
     parser.add_argument("--timeout-ms", type=int, default=int(os.environ.get("CENGYAN_TIMEOUT_MS", "0")),
@@ -385,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
             "property_fields": properties,
             "batch": args.batch,
             "timeout_ms": args.timeout_ms,
+            "skip_missing": args.skip_missing,
         }
         dataframe.foreachPartition(partial(cengyan_udf, config=config))
         return 0

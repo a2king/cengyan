@@ -200,10 +200,17 @@ class BulkManager:
             response = self.graph._raw({"op":"bulkInsert", "kind":"node", "type":type_name, "rows":rows[i:i+batch_size], "ignoreExisting":ignore_existing})
             total += response.get("rowsAffected", 0)
         return total
-    def insert_edges(self, type_name, rows, batch_size=1024, ignore_existing=False):
+    def insert_edges(self, type_name, rows, batch_size=1024, ignore_existing=False, skip_missing=False):
         total = 0
         for i in range(0, len(rows), batch_size):
-            response = self.graph._raw({"op":"bulkInsert", "kind":"edge", "type":type_name, "rows":rows[i:i+batch_size], "ignoreExisting":ignore_existing})
+            response = self.graph._raw({
+                "op": "bulkInsert",
+                "kind": "edge",
+                "type": type_name,
+                "rows": rows[i:i + batch_size],
+                "ignoreExisting": ignore_existing,
+                "skipMissing": skip_missing,
+            })
             total += response.get("rowsAffected", 0)
         return total
 

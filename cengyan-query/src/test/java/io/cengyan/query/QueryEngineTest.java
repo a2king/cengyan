@@ -64,6 +64,7 @@ class QueryEngineTest {
                             Map.of("id", 2L, "name", "two"),
                             Map.of("id", 3L, "name", "three")),
                     false,
+                    false,
                     null);
             assertEquals(3, nodes.rowsAffected());
             QueryResult edges = db.engine.bulkInsert(
@@ -73,6 +74,7 @@ class QueryEngineTest {
                     List.of(
                             Map.of("src", 1L, "dst", 2L, "rank", 0L, "score", 0.5d),
                             Map.of("src", 1L, "dst", 3L, "rank", 0L, "score", 0.25d)),
+                    false,
                     false,
                     null);
             assertEquals(2, edges.rowsAffected());
@@ -94,8 +96,52 @@ class QueryEngineTest {
                     "Person",
                     List.of(Map.of("id", 1L, "name", "ok"), Map.of("id", 2L)),
                     false,
+                    false,
                     null));
             assertEquals(0, run(db, "MATCH (a:Person) RETURN a.id").rows().size());
+        }
+    }
+
+    @Test
+    void 未注册端点默认失败开启后跳过() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH Org",
+                    "USE Org",
+                    "CREATE NODE TYPE org ID STRING(64) ()",
+                    "CREATE REL TYPE inv ()");
+            QueryResult nodes = db.engine.bulkInsert(
+                    db.session,
+                    "node",
+                    "org",
+                    List.of(Map.of("id", "e_known"), Map.of("id", "e_other")),
+                    false,
+                    false,
+                    null);
+            assertEquals(2, nodes.rowsAffected());
+            CengyanException missing = assertThrows(CengyanException.class, () -> db.engine.bulkInsert(
+                    db.session,
+                    "edge",
+                    "inv",
+                    List.of(Map.of("src", "e_known", "dst", "e_missing")),
+                    false,
+                    false,
+                    null));
+            assertEquals(ErrorCode.TYPE_MISMATCH, missing.code());
+            assertTrue(missing.getMessage().contains("尚未注册"));
+            assertEquals(0, run(db, "MATCH (a:org)-[:inv]->(b) RETURN b.id").rows().size());
+            QueryResult edges = db.engine.bulkInsert(
+                    db.session,
+                    "edge",
+                    "inv",
+                    List.of(
+                            Map.of("src", "e_known", "dst", "e_missing"),
+                            Map.of("src", "e_known", "dst", "e_other")),
+                    false,
+                    true,
+                    null);
+            assertEquals(1, edges.rowsAffected());
+            assertEquals(List.of("e_other"), column(run(db, "MATCH (a:org)-[:inv]->(b) RETURN b.id"), 0));
         }
     }
 
