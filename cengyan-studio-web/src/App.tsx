@@ -386,9 +386,15 @@ function LoginPage({ api, onLogin }: { api: CengyanApi; onLogin: (info: SessionI
           <Form form={form} layout="vertical" initialValues={{ user: 'root', password: 'cengyan' }} onFinish={(values) => void login(values)}>
             <Form.Item name="user" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}><Input size="large" prefix={<CircleUserRound size={17} />} autoComplete="username" /></Form.Item>
             <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}><Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="current-password" /></Form.Item>
-            {error && <Alert className="login-error" type="error" showIcon icon={<AlertCircle size={16} />} message={error} />}
+            <Alert
+              className={error ? 'login-status' : 'login-status is-empty'}
+              type={error.startsWith('连接正常') ? 'success' : 'error'}
+              showIcon
+              icon={error.startsWith('连接正常') ? <Check size={16} /> : <AlertCircle size={16} />}
+              message={error || ' '}
+            />
             <Button type="primary" htmlType="submit" size="large" block loading={loading}>登录并连接</Button>
-            <Button type="text" block loading={pinging} onClick={async () => { setPinging(true); setError(''); try { await api.ping(); setError('连接正常，可以登录'); } catch (reason) { setError(reason instanceof Error ? reason.message : '连接失败'); } finally { setPinging(false); } }}>检查连接</Button>
+            <Button className="login-check" type="text" block loading={pinging} onClick={async () => { setPinging(true); setError(''); try { await api.ping(); setError('连接正常，可以登录'); } catch (reason) { setError(reason instanceof Error ? reason.message : '连接失败'); } finally { setPinging(false); } }}>检查连接</Button>
           </Form>
         </Card>
       </div>
@@ -625,17 +631,20 @@ function TypesPanel({ api, graph, node, canWrite, onCopied }: { api: CengyanApi;
   };
 
   const columns: TableProps<TypeRow>['columns'] = [
-    { title: '名称', dataIndex: 'name', render: (value: string, row: TypeRow) => <Tooltip title={row.comment || ''}><span className="code-pill">{value}</span></Tooltip> },
+    { title: '名称', dataIndex: 'name', width: 200, fixed: 'left', ellipsis: true, render: (value: string, row: TypeRow) => <Tooltip title={row.comment || value}><span className="code-pill">{value}</span></Tooltip> },
     ...(node ? [
-      { title: 'ID 类型', dataIndex: 'idType', render: (value: string) => value || 'INT' },
-      { title: 'ID 长度', dataIndex: 'idLength', render: (value: number, record: TypeRow) => (String(record.idType || 'INT').toUpperCase() === 'STRING' ? value || '-' : '—') },
-      { title: '描述', dataIndex: 'comment', ellipsis: true, render: (value: string) => value || '—' },
-    ] : []),
-    { title: '编号', dataIndex: 'id' },
-    { title: '版本', dataIndex: 'schemaVersion' },
+      { title: 'ID 类型', dataIndex: 'idType', width: 120, render: (value: string) => value || 'INT' },
+      { title: 'ID 长度', dataIndex: 'idLength', width: 120, render: (value: number, record: TypeRow) => (String(record.idType || 'INT').toUpperCase() === 'STRING' ? value || '-' : '—') },
+      { title: '描述', dataIndex: 'comment', width: 240, ellipsis: true, render: (value: string) => value || '—' },
+    ] : [
+      { title: '边描述', dataIndex: 'comment', width: 240, ellipsis: true, render: (value: string) => value || '—' },
+    ]),
+    { title: '编号', dataIndex: 'id', width: 100 },
+    { title: '版本', dataIndex: 'schemaVersion', width: 100 },
     { title: '操作', key: 'actions', width: 200, render: (_, record) => <span className="table-actions"><Button type="link" size="small" onClick={() => void describe(record.name)}>查看列</Button><Button type="link" size="small" onClick={() => void exportType(record)}>导出结构</Button></span> },
   ];
-  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>{title}</Title></div><Space>{canWrite && <Button icon={<Plus size={15} />} onClick={() => setCreateOpen(true)}>新建{title}</Button>}<Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></Space></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}{detail && <Card size="small" className="detail-card" title={<span>{detail.name} 的属性</span>} extra={<Button type="text" icon={<X size={15} />} onClick={() => setDetail(null)} />}><Table size="small" pagination={false} rowKey="property" columns={[{ title: '属性', dataIndex: 'property' }, { title: '类型', dataIndex: 'type' }, { title: '可空', dataIndex: 'nullable', render: (value: boolean) => value ? <Tag color="blue">NULL</Tag> : <Tag>必填</Tag> }, { title: '注释', dataIndex: 'comment' }]} dataSource={detail.rows} /></Card>}{rows.length ? <Table rowKey="name" loading={loading} columns={columns} dataSource={rows} pagination={{ pageSize: 8, hideOnSinglePage: true }} /> : <Empty description={`还没有${title}`} />}
+  const tableScrollX = columns.reduce((total, column) => total + Number(column.width ?? 0), 0);
+  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>{title}</Title></div><Space>{canWrite && <Button icon={<Plus size={15} />} onClick={() => setCreateOpen(true)}>新建{title}</Button>}<Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></Space></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}{detail && <Card size="small" className="detail-card" title={<span>{detail.name} 的属性</span>} extra={<Button type="text" icon={<X size={15} />} onClick={() => setDetail(null)} />}><Table size="small" pagination={false} rowKey="property" columns={[{ title: '属性', dataIndex: 'property' }, { title: '类型', dataIndex: 'type' }, { title: '可空', dataIndex: 'nullable', render: (value: boolean) => value ? <Tag color="blue">NULL</Tag> : <Tag>必填</Tag> }, { title: '注释', dataIndex: 'comment' }]} dataSource={detail.rows} /></Card>}{rows.length ? <Table rowKey="name" loading={loading} columns={columns} dataSource={rows} scroll={{ x: tableScrollX }} pagination={{ pageSize: 8, hideOnSinglePage: true }} /> : <Empty description={`还没有${title}`} />}
     <Modal title={`新建${title}`} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText="创建" cancelText="取消"><Form form={createForm} layout="vertical" initialValues={{ idType: node ? 'INT' : undefined, idLength: 19, properties: [{ type: 'STRING', nullable: true }] }} onFinish={(values) => void create(values)}><Form.Item name="name" label="类型名称" rules={[{ required: true, message: '请输入类型名称' }]}><Input placeholder={node ? '例如 Person' : '例如 knows'} /></Form.Item>{node && <Row gutter={12}><Col span={12}><Form.Item name="idType" label="ID 类型" rules={[{ required: true, message: '请选择 ID 类型' }]}><Select options={NODE_ID_TYPES} onChange={(value: 'INT' | 'STRING') => createForm.setFieldValue('idLength', value === 'INT' ? 19 : 64)} /></Form.Item></Col><Col span={12}><Form.Item name="idLength" label="ID 长度" extra={idType === 'STRING' ? '字符串 ID 的最大字节长度，范围 1 到 4096' : '整数 ID 的十进制位数，范围 1 到 19'} rules={[{ validator: (_, value) => { const maxLength = idType === 'INT' ? 19 : 4096; return !Number.isInteger(Number(value)) || Number(value) < 1 || Number(value) > maxLength ? Promise.reject(new Error(`请输入 1 到 ${maxLength} 的整数`)) : Promise.resolve(); } }]}><InputNumber min={1} max={idType === 'INT' ? 19 : 4096} precision={0} style={{ width: '100%' }} /></Form.Item></Col></Row>}<Form.List name="properties">{(fields, { add, remove }) => <div className="property-list">{fields.map((field) => <div className="property-row" key={field.key}><Form.Item {...field} name={[field.name, 'name']}><Input placeholder="属性名" /></Form.Item><Form.Item {...field} name={[field.name, 'type']}><Select options={TYPES.map((type) => ({ value: type, label: type }))} /></Form.Item><Form.Item {...field} name={[field.name, 'nullable']} valuePropName="checked"><label className="checkbox-field"><input type="checkbox" />可空</label></Form.Item><Form.Item {...field} name={[field.name, 'comment']}><Input placeholder="字段注释" /></Form.Item><Button type="text" icon={<Trash2 size={15} />} onClick={() => remove(field.name)} /></div>)}<Button type="dashed" block icon={<Plus size={15} />} onClick={() => add({ type: 'STRING', nullable: true })}>添加属性</Button></div>}</Form.List></Form></Modal>
   </div>;
 }
@@ -672,14 +681,41 @@ function IndexesPanel({ api, graph, canWrite }: { api: CengyanApi; graph: string
 
 function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
   const [rows, setRows] = useState<StatsRow[]>([]);
+  const [countedAt, setCountedAt] = useState<number | null>(null);
   const [storageBytes, setStorageBytes] = useState<number | null>(null);
+  const [storageAt, setStorageAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const load = useCallback(async () => { setLoading(true); setError(''); try { const [stats, storage] = await Promise.all([api.admin('stats'), api.admin('storage').catch(() => null)]); setRows(rowsAsObjects<StatsRow>(stats)); const bytes = Number(storage?.rows?.[0]?.[0]); setStorageBytes(Number.isFinite(bytes) && bytes >= 0 ? bytes : null); } catch (reason) { setError(reason instanceof Error ? reason.message : '加载统计信息失败'); } finally { setLoading(false); } }, [api]);
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const [stats, storageResult] = await Promise.all([api.admin('stats'), api.admin('storage').catch(() => null)]);
+      setRows(rowsAsObjects<StatsRow>(stats));
+      setCountedAt(typeof stats.collectedAt === 'number' ? stats.collectedAt : null);
+      const bytes = Number(storageResult?.rows?.[0]?.[0]);
+      setStorageBytes(Number.isFinite(bytes) && bytes >= 0 ? bytes : null);
+      setStorageAt(typeof storageResult?.collectedAt === 'number' ? storageResult.collectedAt : null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '加载统计信息失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [api]);
   useEffect(() => { void load(); }, [load, graph]);
   const nodeCount = rows.filter((row) => row.target === 'NODE').reduce((sum, row) => sum + Number(row.count), 0);
   const edgeCount = rows.filter((row) => row.target === 'REL').reduce((sum, row) => sum + Number(row.count), 0);
-  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>统计信息</Title><Text type="secondary">{graph} 的实时数据概览，按类型统计。</Text></div><Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}<Row gutter={[16, 16]}><Col xs={24} md={12}><Card className="metric-card"><Statistic title="节点数量" value={nodeCount} prefix={<Boxes size={18} />} /></Card></Col><Col xs={24} md={12}><Card className="metric-card"><Statistic title="边数量" value={edgeCount} prefix={<GitBranch size={18} />} /></Card></Col></Row><Card className="storage-card"><div className="storage-icon"><Database size={19} /></div><div><Text strong>存储占用</Text><Text type="secondary">当前数据库目录中 RocksDB 文件的实际占用。</Text></div><Tag color="blue">{storageBytes == null ? '读取中' : formatBytes(storageBytes)}</Tag></Card>{rows.length ? <Table rowKey={(row) => `${row.target}-${row.name}`} loading={loading} columns={[{ title: '对象', dataIndex: 'target', render: (value: string) => <Tag>{value}</Tag> }, { title: '类型', dataIndex: 'name' }, { title: '数量', dataIndex: 'count' }]} dataSource={rows} pagination={false} /> : <Empty description="暂无统计信息" />}</div>;
+  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>统计信息</Title><Text type="secondary">{graph} 按类型统计。{countedAt == null ? '' : freshnessText('数量', countedAt)}</Text></div><Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}<Row gutter={[16, 16]}><Col xs={24} md={12}><Card className="metric-card"><Statistic title="节点数量" value={nodeCount} prefix={<Boxes size={18} />} /></Card></Col><Col xs={24} md={12}><Card className="metric-card"><Statistic title="边数量" value={edgeCount} prefix={<GitBranch size={18} />} /></Card></Col></Row><Card className="storage-card"><div className="storage-icon"><Database size={19} /></div><div><Text strong>存储占用</Text><Text type="secondary">{storageAt == null ? '当前数据库目录中 RocksDB 文件的实际占用。' : freshnessText('大小', storageAt)}</Text></div><Tag color="blue">{storageBytes == null ? '读取中' : formatBytes(storageBytes)}</Tag></Card>{rows.length ? <Table rowKey={(row) => `${row.target}-${row.name}`} loading={loading} columns={[{ title: '对象', dataIndex: 'target', render: (value: string) => <Tag>{value}</Tag> }, { title: '类型', dataIndex: 'name' }, { title: '数量', dataIndex: 'count' }]} dataSource={rows} pagination={false} /> : <Empty description="暂无统计信息" />}</div>;
+}
+
+function freshnessText(kind: string, collectedAt: number): string {
+  return `${kind}统计于 ${formatCollectedAt(collectedAt)}，30 分钟内不重新扫描。`;
+}
+
+function formatCollectedAt(millis: number): string {
+  const date = new Date(millis);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function formatBytes(bytes: number): string {
@@ -697,11 +733,7 @@ type RunningRow = { queryId: string; user: string; elapsedMs: number; query: str
 
 function formatElapsed(ms: number) {
   const safe = Number.isFinite(ms) ? Math.max(0, ms) : 0;
-  const totalSeconds = Math.floor(safe / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes > 0) return `${minutes} 分 ${seconds} 秒`;
-  return `${(safe / 1000).toFixed(1)} 秒`;
+  return `${Math.round(safe)} ms`;
 }
 
 function RunningQueries({ api }: { api: CengyanApi }) {
