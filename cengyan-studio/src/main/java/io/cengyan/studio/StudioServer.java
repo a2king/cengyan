@@ -31,12 +31,16 @@ public final class StudioServer implements AutoCloseable {
     private final HttpServer http;
     private final ExecutorService workers;
     private final int port;
+    private final int graphMaxNodes;
+    private final int tableMaxNodes;
 
-    private StudioServer(DbClient db, HttpServer http, ExecutorService workers, int port) {
+    private StudioServer(DbClient db, HttpServer http, ExecutorService workers, int port, int graphMaxNodes, int tableMaxNodes) {
         this.db = db;
         this.http = http;
         this.workers = workers;
         this.port = port;
+        this.graphMaxNodes = graphMaxNodes;
+        this.tableMaxNodes = tableMaxNodes;
     }
 
     public static void main(String[] args) throws Exception {
@@ -57,8 +61,9 @@ public final class StudioServer implements AutoCloseable {
         HttpServer http = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
         http.setExecutor(workers);
-        StudioServer server = new StudioServer(db, http, workers, http.getAddress().getPort());
+        StudioServer server = new StudioServer(db, http, workers, http.getAddress().getPort(), config.graphMaxNodes(), config.tableMaxNodes());
         http.createContext("/api/ping", server::ping);
+        http.createContext("/api/config", server::config);
         http.createContext("/api/login", server::login);
         http.createContext("/api/query", server::query);
         http.createContext("/api/queries", server::queries);
@@ -91,6 +96,18 @@ public final class StudioServer implements AutoCloseable {
             return;
         }
         forward(exchange, MAPPER.createObjectNode().put("op", "ping"), 3000);
+    }
+
+    private void config(HttpExchange exchange) {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            send(exchange, 405, error("SYNTAX", "只接受 GET"));
+            return;
+        }
+        ObjectNode response = MAPPER.createObjectNode();
+        response.put("code", "OK");
+        response.put("graphMaxNodes", graphMaxNodes);
+        response.put("tableMaxNodes", tableMaxNodes);
+        send(exchange, 200, response);
     }
 
     private void login(HttpExchange exchange) {

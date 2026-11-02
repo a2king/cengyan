@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Empty, Modal, Tag, Typography } from 'antd';
+import { Alert, Empty, Modal, Tag, Typography } from 'antd';
 import { Maximize2, Minimize2, Workflow } from 'lucide-react';
 import type { CengyanApi } from './api';
 
@@ -60,10 +60,12 @@ function nodesFromResponse(rows: unknown[][]) {
   return found;
 }
 
-function parseGraph(rows: unknown[][]) {
+function parseGraph(rows: unknown[][], maxNodes: number) {
+  if (rows.length > maxNodes) return { nodes: [], links: [], overflow: true };
   const nodes = new Map<string, GraphNode>();
   const links: GraphLink[] = [];
   const seen = new Set<string>();
+  let overflow = false;
   const ensure = (id: string, typeName: string, properties: Props) => {
     const name = typeName.trim();
     const existing = nodes.get(id);
@@ -74,6 +76,10 @@ function parseGraph(rows: unknown[][]) {
       }
       if (!Object.keys(existing.properties).length && Object.keys(properties).length) existing.properties = properties;
       return existing;
+    }
+    if (nodes.size >= maxNodes) {
+      overflow = true;
+      return undefined;
     }
     const node = { id, typeName: name, color: name ? typeColor(name) : '#C5C8D4', x: 0, y: 0, properties };
     nodes.set(id, node);
@@ -91,8 +97,9 @@ function parseGraph(rows: unknown[][]) {
       if (Array.isArray(item.edges)) item.edges.forEach(absorb);
     }
     if (item.src !== undefined && item.dst !== undefined && item.type) {
-      const source = ensure(String(item.src), String(item.srcType ?? ''), {});
-      const target = ensure(String(item.dst), String(item.dstType ?? ''), {});
+       const source = ensure(String(item.src), String(item.srcType ?? ''), {});
+       const target = ensure(String(item.dst), String(item.dstType ?? ''), {});
+       if (!source || !target) return;
       const id = `${item.type}-${item.rank ?? 0}-${source.id}-${target.id}`;
       if (!seen.has(id)) {
         seen.add(id);
@@ -103,7 +110,7 @@ function parseGraph(rows: unknown[][]) {
     if (item.id !== undefined) ensure(String(item.id), item.type !== undefined ? String(item.type) : '', asProps(item.properties));
   };
   rows.forEach((row) => row.forEach(absorb));
-  return { nodes: [...nodes.values()], links };
+  return { nodes: [...nodes.values()], links, overflow };
 }
 
 function hexSpiral(count: number): Array<[number, number]> {
@@ -701,8 +708,8 @@ function edgeDetail(link: GraphLink): Detail {
   return { kind: 'edge', id: link.id, label: link.label, source: link.source.id, target: link.target.id, rank: link.rank, properties: link.properties };
 }
 
-export function QueryGraph({ rows, api }: { rows: unknown[][]; api?: CengyanApi }) {
-  const graph = useMemo(() => parseGraph(rows), [rows]);
+export function QueryGraph({ rows, api, maxNodes }: { rows: unknown[][]; api?: CengyanApi; maxNodes: number }) {
+  const graph = useMemo(() => parseGraph(rows, maxNodes), [rows, maxNodes]);
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sceneRef = useRef<{ nodes: GraphNode[]; paint: () => void } | null>(null);
@@ -723,7 +730,7 @@ export function QueryGraph({ rows, api }: { rows: unknown[][]; api?: CengyanApi 
   }, [graph, resolved]);
 
   useEffect(() => {
-    if (!graph.nodes.length) return undefined;
+    if (graph.overflow || !graph.nodes.length) return undefined;
     let cancelled = false;
     let frame = 0;
     let tries = 0;
@@ -911,7 +918,7 @@ export function QueryGraph({ rows, api }: { rows: unknown[][]; api?: CengyanApi 
   }, [graph, expanded]);
 
   useEffect(() => {
-    if (!api) return undefined;
+    if (!api || graph.overflow) return undefined;
     const missing = graph.nodes.filter((node) => !node.typeName).map((node) => node.id);
     if (!missing.length) {
       setResolved(new Map());
@@ -969,6 +976,14 @@ export function QueryGraph({ rows, api }: { rows: unknown[][]; api?: CengyanApi 
     return () => { live = false; };
   }, [api, graph]);
 
+  if (graph.overflow) {
+    return (
+      <div className="graph-result">
+       <Alert type="warning" showIcon message="查询结果行数超出关系图可视化上限，不予渲染" />
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="关系图为空" />
+      </div>
+    );
+  }
   if (!graph.nodes.length) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前结果里没有点或边" />;
   const fields = detail ? Object.entries(detail.properties) : [];
   const stage = (
