@@ -13,6 +13,7 @@ import io.cengyan.query.QueryHandle;
 import io.cengyan.query.QueryLimits;
 import io.cengyan.query.QueryResult;
 import io.cengyan.query.SessionState;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelId;
 import org.slf4j.Logger;
@@ -74,8 +75,20 @@ final class ExecuteService {
             error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
+        SessionState state = sessions.open(session);
+        if (!state.authenticated()) {
+            error(ctx, session, null, ErrorCode.FORBIDDEN, "请先登录");
+            return;
+        }
+        QueryHandle handle = QueryHandle.start(timeoutMs);
+        handle.describe(state.user(), query);
+        queries.register(handle);
+        byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
+        QueryScheduler.SessionMode mode = QueryEngine.requiresExclusiveSession(query)
+                ? QueryScheduler.SessionMode.WRITE
+                : QueryScheduler.SessionMode.READ;
         dispatch(QueryScheduler.laneForQuery(query), session, timeoutMs,
-                () -> run(ctx, session, query, params, timeoutMs), ctx);
+                () -> run(ctx, session, query, params, handle), ctx, mode, () -> finish(ctx, handle));
     }
 
     void bulkInsert(ChannelHandlerContext ctx, JsonNode node) {
@@ -139,7 +152,8 @@ final class ExecuteService {
                 }
                 handle.describe(session.user(), "bulkInsert " + kind + " " + type + " rows=" + rows.size());
             }
-            QueryResult result = engine.bulkInsert(session, kind, type, rows, ignoreExisting, skipMissing, handle);
+            QueryResult result = engine.bulkInsert(
+                    session, kind, type, rows, ignoreExisting, skipMissing, handle, config.queryMemoryBytes());
             ObjectNode node = MAPPER.createObjectNode();
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);
@@ -346,48 +360,53 @@ final class ExecuteService {
         // 如果在这里清会话，登录刚成功，紧接着的查询就会拿到一个未登录的新会话。
     }
 
-    private void run(ChannelHandlerContext ctx, String sessionId, String query, Map<String, Object> params, long timeoutMs) {
-        QueryHandle handle = QueryHandle.start(timeoutMs);
-        boolean registered = false;
+    private void run(
+            ChannelHandlerContext ctx, String sessionId, String query, Map<String, Object> params, QueryHandle handle) {
+        ChannelFuture sent = null;
+        long startedNanos = System.nanoTime();
         try {
             SessionState session = sessions.open(sessionId);
-            synchronized (session) {
+            session.withReadLock(() -> {
                 if (!session.authenticated()) {
                     throw new CengyanException(ErrorCode.FORBIDDEN, "请先登录");
                 }
-                handle.describe(session.user(), query);
-            }
-            queries.register(handle);
-            registered = true;
-            byChannel.computeIfAbsent(ctx.channel().id(), ignored -> ConcurrentHashMap.newKeySet()).add(handle.id());
+                return null;
+            });
             QueryResult result = engine.execute(
                     session, query, params, new QueryLimits(
                             config.maxEdgesPerVertex(),
-                            config.maxFrontierPerHop(),
-                            config.maxHops(),
-                            config.maxPaths()),
+                    config.maxFrontierPerHop(),
+                    config.maxHops(),
+                    config.maxPaths(),
+                    config.queryMemoryBytes()),
                     handle);
             ObjectNode node = MAPPER.createObjectNode();
             node.put("code", ErrorCode.OK.name());
             node.put("session", sessionId);
             node.put("queryId", handle.id());
+            node.put("elapsedMs", elapsedMs(startedNanos));
             putResult(node, result);
-            write(ctx, node);
+            sent = enqueue(ctx, node);
         } catch (CengyanException ex) {
-            error(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
+            sent = enqueueError(ctx, sessionId, handle.id(), ex.code(), ex.getMessage());
         } catch (RuntimeException ex) {
             log.warn("执行查询失败：{}", ex.toString());
-            error(ctx, sessionId, handle.id(), ErrorCode.INTERNAL, "执行查询失败");
+            sent = enqueueError(ctx, sessionId, handle.id(), ErrorCode.INTERNAL, "执行查询失败");
         } finally {
-            if (registered) {
-                finish(ctx, handle);
+            if (sent != null) {
+                sent.awaitUninterruptibly();
             }
+            finish(ctx, handle);
         }
     }
 
     private void dispatch(
             QueryScheduler.Lane lane, String sessionId, long timeoutMs, Runnable task, ChannelHandlerContext ctx) {
-        dispatch(lane, sessionId, timeoutMs, task, ctx, true);
+        dispatch(lane, sessionId, timeoutMs, task, ctx, true, () -> { });
+    }
+
+    private static long elapsedMs(long startedNanos) {
+        return Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
     }
 
     private void dispatch(
@@ -397,9 +416,43 @@ final class ExecuteService {
             Runnable task,
             ChannelHandlerContext ctx,
             boolean exclusive) {
+        dispatch(lane, sessionId, timeoutMs, task, ctx,
+                exclusive ? QueryScheduler.SessionMode.WRITE : QueryScheduler.SessionMode.NONE,
+                () -> { });
+    }
+
+    private void dispatch(
+            QueryScheduler.Lane lane,
+            String sessionId,
+            long timeoutMs,
+            Runnable task,
+            ChannelHandlerContext ctx,
+            QueryScheduler.SessionMode mode,
+            Runnable onReject) {
         long sessionWaitMs = timeoutMs <= 0 ? config.queryQueueMs() : timeoutMs;
-        scheduler.submit(lane, sessionId, sessionWaitMs, task,
-                message -> error(ctx, sessionId, null, ErrorCode.BUSY, message), exclusive);
+        QueryScheduler.Busy busy = message -> {
+            onReject.run();
+            error(ctx, sessionId, null, ErrorCode.BUSY, message);
+        };
+        if (mode == QueryScheduler.SessionMode.READ) {
+            scheduler.submitRead(lane, sessionId, sessionWaitMs, task, busy);
+        } else {
+            scheduler.submit(lane, sessionId, sessionWaitMs, task, busy,
+                    mode == QueryScheduler.SessionMode.WRITE);
+        }
+    }
+
+    private void dispatch(
+            QueryScheduler.Lane lane,
+            String sessionId,
+            long timeoutMs,
+            Runnable task,
+            ChannelHandlerContext ctx,
+            boolean exclusive,
+            Runnable onReject) {
+        dispatch(lane, sessionId, timeoutMs, task, ctx,
+                exclusive ? QueryScheduler.SessionMode.WRITE : QueryScheduler.SessionMode.NONE,
+                onReject);
     }
 
     private void finish(ChannelHandlerContext ctx, QueryHandle handle) {
@@ -505,14 +558,36 @@ final class ExecuteService {
         if (result.collectedAt() != null) {
             node.put("collectedAt", result.collectedAt());
         }
+        if (result.elapsedMs() != null) {
+            node.put("elapsedMs", result.elapsedMs());
+        }
     }
 
     private void write(ChannelHandlerContext ctx, ObjectNode node) {
+        enqueue(ctx, node);
+    }
+
+    private ChannelFuture enqueueError(
+            ChannelHandlerContext ctx, String session, String queryId, ErrorCode code, String message) {
+        ObjectNode node = MAPPER.createObjectNode();
+        node.put("code", code.name());
+        node.put("message", message == null ? "" : message);
+        if (session != null) {
+            node.put("session", session);
+        }
+        if (queryId != null) {
+            node.put("queryId", queryId);
+        }
+        return enqueue(ctx, node);
+    }
+
+    private ChannelFuture enqueue(ChannelHandlerContext ctx, ObjectNode node) {
         try {
-            ctx.writeAndFlush(MAPPER.writeValueAsString(node) + "\n");
+            return ctx.writeAndFlush(MAPPER.writeValueAsString(node) + "\n");
         } catch (JsonProcessingException ex) {
             log.error("响应序列化失败", ex);
             ctx.close();
+            return null;
         }
     }
 }

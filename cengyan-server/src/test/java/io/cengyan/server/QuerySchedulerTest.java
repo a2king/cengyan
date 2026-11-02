@@ -107,6 +107,36 @@ class QuerySchedulerTest {
     }
 
     @Test
+    void 同一会话的只读查询可以并发但写入会等待() throws Exception {
+        QueryScheduler scheduler = open("""
+                query_threads=3
+                interactive_reserved=1
+                heavy_query_threads=1
+                query_queue_ms=1000
+                """);
+        CountDownLatch readsStarted = new CountDownLatch(2);
+        CountDownLatch releaseReads = new CountDownLatch(1);
+        CountDownLatch writeDone = new CountDownLatch(1);
+        try {
+            scheduler.submitRead(QueryScheduler.Lane.GENERAL, "same", 1000,
+                    () -> hold(readsStarted, releaseReads), message -> { throw new AssertionError(message); });
+            scheduler.submitRead(QueryScheduler.Lane.GENERAL, "same", 1000,
+                    () -> hold(readsStarted, releaseReads), message -> { throw new AssertionError(message); });
+            assertTrue(readsStarted.await(2, TimeUnit.SECONDS));
+
+            scheduler.submit(QueryScheduler.Lane.GENERAL, "same", 1000,
+                    writeDone::countDown, message -> { throw new AssertionError(message); });
+            assertTrue(!writeDone.await(150, TimeUnit.MILLISECONDS));
+
+            releaseReads.countDown();
+            assertTrue(writeDone.await(2, TimeUnit.SECONDS));
+        } finally {
+            releaseReads.countDown();
+            scheduler.close();
+        }
+    }
+
+    @Test
     void 语句和重查询会分到不同的池() {
         assertEquals(QueryScheduler.Lane.RESERVED, QueryScheduler.laneForQuery(" \n-- note\nSHOW GRAPHS"));
         assertEquals(QueryScheduler.Lane.RESERVED, QueryScheduler.laneForQuery("use demo"));
