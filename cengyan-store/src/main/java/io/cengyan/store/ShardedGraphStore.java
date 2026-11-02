@@ -846,11 +846,23 @@ public final class ShardedGraphStore implements GraphStore {
         @Override
         public void visitPrefix(
                 Cf family, byte[] prefix, CancelToken cancel, java.util.function.Consumer<byte[]> consumer) {
-            for (byte[] key : keysWithPrefix(family, prefix)) {
+            DataPlacement current = placement;
+            if (current == null) {
+                if (family != Cf.CATALOG && family != Cf.DEFAULT) {
+                    return;
+                }
+                session(system).visitPrefix(family, prefix, cancel, consumer);
+                return;
+            }
+            for (Path path : current.placePrefix(family, prefix)) {
                 if (cancel != null && cancel.cancelled()) {
                     throw new CengyanException(ErrorCode.QUERY_CANCELED, "query canceled");
                 }
-                consumer.accept(key);
+                GraphStore target = openAt(path, false);
+                if (target == null) {
+                    continue;
+                }
+                session(target).visitPrefix(family, prefix, cancel, consumer);
             }
         }
 
