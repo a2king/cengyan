@@ -65,7 +65,7 @@ java -jar cengyan-cli\target\cengyan-cli-1.0.0.jar
 java -jar cengyan-studio\target\cengyan-studio-1.0.0.jar
 ```
 
-打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--host`、`--port`、`--db-host`、`--db-port` 可改；部署包的 `config/studio.properties` 默认使用 `host=0.0.0.0`，内网用户可以通过服务器 IP 访问。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
+打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--host`、`--port`、`--db-host`、`--db-port`、`--graph-max-nodes`、`--table-max-nodes` 可改；部署包的 `config/studio.properties` 默认使用 `host=0.0.0.0`，内网用户可以通过服务器 IP 访问。`graph_max_nodes` 默认 2000，查询结果行数超过后关系图只提示不渲染；`table_max_nodes` 默认 2000，表格只分页展示前面的结果，不改变真实查询总量和查询耗时。结果页支持重新执行当前 GQL 导出全部 CSV，导出期间不能重复提交。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
 
 Studio 前端源码在 `cengyan-studio-web`，和 Java 转发服务分开维护。开发前端时：
 
@@ -347,7 +347,7 @@ TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`
 | `max_frontier_per_hop` | `0` | 每跳新点预算，`0` 表示不限 |
 | `max_hops` | `0` | 多跳、最短路、子图的跳数预算，`0` 表示不限 |
 | `max_paths` | `0` | 路径结果预算，`0` 表示不限 |
-| `query_memory_bytes` | `67108864` | 单条查询的内存预算 |
+| `query_memory_bytes` | `67108864` | 单条查询的 Java 中间结果预算；DuckDB 排序、去重和聚合使用同一上限并允许写临时目录，无法外排的中间结果超限会返回 `QUERY_MEMORY_EXCEEDED` |
 | `block_cache_bytes` | `268435456` | RocksDB 块缓存 |
 | `duckdb_memory` | `1GB` | 排序和聚合使用的 DuckDB 内存 |
 | `duckdb_temp_directory` | `tmp/duck` | DuckDB 临时目录 |

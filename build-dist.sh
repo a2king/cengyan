@@ -38,6 +38,7 @@ require_java21() {
 
 require_java21
 command -v mvn >/dev/null 2>&1 || { echo '[ERROR] 未找到 Maven。请安装 Maven，并将 mvn 加入 PATH。' >&2; exit 1; }
+command -v zip >/dev/null 2>&1 || { echo '[ERROR] 未找到 zip。请安装 zip 后重试。' >&2; exit 1; }
 
 VERSION="$(sed -n 's/.*<version>[[:space:]]*\([^<[:space:]]*\)[[:space:]]*<\/version>.*/\1/p' "$ROOT_DIR/pom.xml" | head -n 1)"
 if [[ -z "$VERSION" ]]; then
@@ -47,7 +48,7 @@ fi
 PACKAGE_NAME="cengyan-$VERSION"
 DIST_DIR="$ROOT_DIR/dist"
 PACKAGE_ROOT="$DIST_DIR/$PACKAGE_NAME"
-ARCHIVE_PATH="$DIST_DIR/$PACKAGE_NAME-linux.tar.gz"
+ARCHIVE_PATH="$DIST_DIR/$PACKAGE_NAME-linux.zip"
 
 echo '开始构建 cengyan-server 和 cengyan-studio ...'
 (cd "$ROOT_DIR" && mvn -DskipTests -pl cengyan-server,cengyan-studio -am clean package)
@@ -76,6 +77,6 @@ cp "$ROOT_DIR/packaging/lib/README.txt" "$PACKAGE_ROOT/lib/README.txt"
 chmod +x "$PACKAGE_ROOT/bin/"*.sh
 sed -i 's/\r$//' "$PACKAGE_ROOT/bin/"*.sh "$PACKAGE_ROOT/bin/java.env"
 
-tar -czf "$ARCHIVE_PATH" -C "$DIST_DIR" "$PACKAGE_NAME"
+zip -rq "$ARCHIVE_PATH" -D -C "$DIST_DIR" "$PACKAGE_NAME"
 echo "打包完成：$PACKAGE_ROOT"
 echo "压缩包：$ARCHIVE_PATH"

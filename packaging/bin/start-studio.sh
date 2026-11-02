@@ -17,6 +17,8 @@ STUDIO_HOST=0.0.0.0
 STUDIO_PORT=19670
 DB_HOST=127.0.0.1
 DB_PORT=19669
+GRAPH_MAX_NODES=2000
+TABLE_MAX_NODES=2000
 if [[ -f "$APP_HOME/config/studio.properties" ]]; then
     value_for() {
         awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" {sub(/^[[:space:]]*/, "", $2); sub(/[[:space:]]*$/, "", $2); print $2; exit}' "$APP_HOME/config/studio.properties"
@@ -25,6 +27,8 @@ if [[ -f "$APP_HOME/config/studio.properties" ]]; then
     [[ -n "$(value_for port)" ]] && STUDIO_PORT="$(value_for port)"
     [[ -n "$(value_for db_host)" ]] && DB_HOST="$(value_for db_host)"
     [[ -n "$(value_for db_port)" ]] && DB_PORT="$(value_for db_port)"
+    [[ -n "$(value_for graph_max_nodes)" ]] && GRAPH_MAX_NODES="$(value_for graph_max_nodes)"
+    [[ -n "$(value_for table_max_nodes)" ]] && TABLE_MAX_NODES="$(value_for table_max_nodes)"
 fi
 
 mkdir -p "$PID_DIR" "$LOG_DIR"
@@ -44,6 +48,8 @@ nohup "$JAVA_EXE" -jar "$APP_HOME/cengyan-studio.jar" \
     --port "$STUDIO_PORT" \
     --db-host "$DB_HOST" \
     --db-port "$DB_PORT" \
+    --graph-max-nodes "$GRAPH_MAX_NODES" \
+    --table-max-nodes "$TABLE_MAX_NODES" \
     >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$PID_FILE"
