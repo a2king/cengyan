@@ -23,7 +23,10 @@ public sealed interface Mutation {
         }
     }
 
-    record DeleteVertex(long vid) implements Mutation {
+    record DeleteVertex(long vid, boolean detach) implements Mutation {
+        public DeleteVertex(long vid) {
+            this(vid, false);
+        }
     }
 
     record DeleteEdge(String typeName, long rank, long outSrc, long outDst) implements Mutation {

@@ -1,5 +1,7 @@
 package io.cengyan.query;
 
+import io.cengyan.CengyanException;
+
 import java.nio.file.Path;
 import java.util.function.Consumer;
 
@@ -33,7 +35,53 @@ final class DuckSettings {
         return tempDirectory;
     }
 
+    DuckSettings forCurrentQuery() {
+        long queryBytes = QueryMemory.current().limit();
+        if (queryBytes <= 0) {
+            return this;
+        }
+        long configuredBytes = memoryBytes(memoryLimit);
+        long effective = Math.min(queryBytes, configuredBytes);
+        return new DuckSettings(formatBytes(effective), tempDirectory, beforeClose);
+    }
+
     Consumer<Path> beforeClose() {
         return beforeClose;
+    }
+
+    private static long memoryBytes(String value) {
+        String raw = value.trim().toUpperCase(java.util.Locale.ROOT);
+        long multiplier = 1L;
+        if (raw.endsWith("KB")) {
+            multiplier = 1024L;
+            raw = raw.substring(0, raw.length() - 2);
+        } else if (raw.endsWith("MB")) {
+            multiplier = 1024L * 1024L;
+            raw = raw.substring(0, raw.length() - 2);
+        } else if (raw.endsWith("GB")) {
+            multiplier = 1024L * 1024L * 1024L;
+            raw = raw.substring(0, raw.length() - 2);
+        } else if (raw.endsWith("TB")) {
+            multiplier = 1024L * 1024L * 1024L * 1024L;
+            raw = raw.substring(0, raw.length() - 2);
+        }
+        try {
+            return Math.multiplyExact(Long.parseLong(raw), multiplier);
+        } catch (NumberFormatException | ArithmeticException ex) {
+            throw new CengyanException(io.cengyan.ErrorCode.INTERNAL, "DuckDB 内存上限格式不正确");
+        }
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes % (1024L * 1024L * 1024L) == 0) {
+            return (bytes / (1024L * 1024L * 1024L)) + "GB";
+        }
+        if (bytes % (1024L * 1024L) == 0) {
+            return (bytes / (1024L * 1024L)) + "MB";
+        }
+        if (bytes % 1024L == 0) {
+            return (bytes / 1024L) + "KB";
+        }
+        return bytes + "B";
     }
 }

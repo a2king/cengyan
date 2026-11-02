@@ -867,8 +867,8 @@ public final class Catalog {
     }
 
     /**
-     * 批量写入边。当前要求边两端在同一分片；单机和单分片图可直接使用。
-     * 每个逻辑边的出边、入边、属性和索引都进入同一个 RocksDB WriteBatch。
+     * 批量写入边。同一分片的边一次提交出边、入边、属性和索引。
+     * 跨分片的边与单条插入相同：先提交出边、属性和补偿标记，再提交入边，最后删除标记。
      */
     public int bulkInsertRels(
             int graphId, String relTypeName, List<BulkEdge> rows, boolean ifNotExists) {
@@ -880,7 +880,9 @@ public final class Catalog {
             requireGraph(graphId);
             requireWritable(graphId);
             RelType type = relType(graphId, relTypeName);
+            List<IndexDef> edgeIndexes = indexesFor(graphId, false, type.id());
             StoreBatch batch = new StoreBatch();
+            Map<EdgeIdentity, CrossEdge> cross = new LinkedHashMap<>();
             Map<EdgeIdentity, byte[]> previous = new LinkedHashMap<>();
             try (ReadSession session = store.read()) {
                 for (BulkEdge row : rows) {
@@ -888,33 +890,47 @@ public final class Catalog {
                     int inPart = partOf(graphId, row.dst());
                     requirePart(graphId, outPart);
                     requirePart(graphId, inPart);
-                    if (outPart != inPart) {
-                        throw new CengyanException(ErrorCode.CROSS_PART_UNSUPPORTED,
-                                "批量边的两端必须位于同一分片");
-                    }
                     EdgeIdentity identity = new EdgeIdentity(row.rank(), row.src(), row.dst());
                     byte[] propKey = KeyCodec.propKey(graphId, type.id(), row.rank(), row.src(), row.dst());
-                    byte[] old = previous.containsKey(identity) ? previous.get(identity) : session.get(Cf.PROP, propKey);
+                    byte[] old = previous.containsKey(identity)
+                            ? previous.get(identity)
+                            : session.get(Cf.PROP, propKey);
                     if (ifNotExists && old != null) {
                         continue;
                     }
                     Map<String, Object> next = normalizeProperties(type.properties(), row.properties());
                     byte[] encoded = PropCodec.encode(type.schemaVersion(), type.properties(), next);
-                    batch.put(Cf.EDGE, KeyCodec.edgeKey(
-                            graphId, outPart, row.src(), type.id(), Direction.OUT.code(), row.rank(), row.dst()), EMPTY);
-                    batch.put(Cf.EDGE, KeyCodec.edgeKey(
-                            graphId, inPart, row.dst(), type.id(), Direction.IN.code(), row.rank(), row.src()), EMPTY);
-                    batch.put(Cf.PROP, propKey, encoded);
-                    IndexMaintenance.sync(
-                            session,
-                            batch,
-                            indexesFor(graphId, false, type.id()),
-                            type.properties(),
-                            old == null ? null : PropCodec.decode(type.properties(), type.schemaVersion(), old),
-                            PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
-                            graphId,
-                            KeyCodec.edgeIdentity(type.id(), row.rank(), row.src(), row.dst()));
+                    if (outPart == inPart) {
+                        batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                                graphId, outPart, row.src(), type.id(), Direction.OUT.code(), row.rank(), row.dst()), EMPTY);
+                        batch.put(Cf.EDGE, KeyCodec.edgeKey(
+                                graphId, inPart, row.dst(), type.id(), Direction.IN.code(), row.rank(), row.src()), EMPTY);
+                        batch.put(Cf.PROP, propKey, encoded);
+                        IndexMaintenance.sync(
+                                session,
+                                batch,
+                                edgeIndexes,
+                                type.properties(),
+                                old == null ? null : PropCodec.decode(type.properties(), type.schemaVersion(), old),
+                                PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
+                                graphId,
+                                KeyCodec.edgeIdentity(type.id(), row.rank(), row.src(), row.dst()));
+                    } else {
+                        CrossEdge prior = cross.get(identity);
+                        cross.put(identity, new CrossEdge(
+                                row.rank(),
+                                row.src(),
+                                row.dst(),
+                                outPart,
+                                inPart,
+                                propKey,
+                                encoded,
+                                prior == null ? old : prior.baseline()));
+                    }
                     previous.put(identity, encoded);
+                }
+                if (!cross.isEmpty()) {
+                    writeCrossBulk(session, graphId, type, edgeIndexes, List.copyOf(cross.values()));
                 }
                 if (!batch.isEmpty()) {
                     store.commitEdges(batch);
@@ -922,6 +938,82 @@ public final class Catalog {
             }
             return previous.size();
         });
+    }
+
+    /** 一批跨分片边：出边和补偿标记先落盘，入边成功后再清标记。失败时按单条补偿回滚。 */
+    private void writeCrossBulk(
+            ReadSession session,
+            int graphId,
+            RelType type,
+            List<IndexDef> edgeIndexes,
+            List<CrossEdge> rows) {
+        StoreBatch outBatch = new StoreBatch();
+        for (CrossEdge row : rows) {
+            outBatch.put(Cf.EDGE, KeyCodec.edgeKey(
+                    graphId, row.outPart(), row.src(), type.id(), Direction.OUT.code(), row.rank(), row.dst()), EMPTY);
+            outBatch.put(Cf.PROP, row.propKey(), row.encoded());
+            outBatch.put(Cf.TXN, crossTxnKey(graphId, type, row), ClusterCodec.txn(ClusterCodec.TXN_OUT, row.encoded()));
+            if (!edgeIndexes.isEmpty()) {
+                IndexMaintenance.sync(
+                        session,
+                        outBatch,
+                        edgeIndexes,
+                        type.properties(),
+                        row.baseline() == null
+                                ? null
+                                : PropCodec.decode(type.properties(), type.schemaVersion(), row.baseline()),
+                        PropCodec.decode(type.properties(), type.schemaVersion(), row.encoded()),
+                        graphId,
+                        KeyCodec.edgeIdentity(type.id(), row.rank(), row.src(), row.dst()));
+            }
+        }
+        try {
+            store.mutate(outBatch);
+            StoreBatch inBatch = new StoreBatch();
+            for (CrossEdge row : rows) {
+                inBatch.put(Cf.EDGE, KeyCodec.edgeKey(
+                        graphId, row.inPart(), row.dst(), type.id(), Direction.IN.code(), row.rank(), row.src()), EMPTY);
+            }
+            store.mutate(inBatch);
+        } catch (RuntimeException ex) {
+            RuntimeException rollbackError = null;
+            for (CrossEdge row : rows) {
+                try {
+                    rollbackTxn(
+                            graphId,
+                            type,
+                            row.rank(),
+                            row.src(),
+                            row.dst(),
+                            row.outPart(),
+                            row.encoded(),
+                            row.propKey(),
+                            crossTxnKey(graphId, type, row),
+                            edgeIndexes);
+                } catch (RuntimeException rollback) {
+                    if (rollbackError == null) {
+                        rollbackError = rollback;
+                    } else {
+                        rollbackError.addSuppressed(rollback);
+                    }
+                }
+            }
+            CengyanException failure = new CengyanException(
+                    ErrorCode.INTERNAL, "跨分片边写入失败：" + ex.getMessage(), ex);
+            if (rollbackError != null) {
+                failure.addSuppressed(rollbackError);
+            }
+            throw failure;
+        }
+        StoreBatch done = new StoreBatch();
+        for (CrossEdge row : rows) {
+            done.delete(Cf.TXN, crossTxnKey(graphId, type, row));
+        }
+        store.mutate(done);
+    }
+
+    private static byte[] crossTxnKey(int graphId, RelType type, CrossEdge row) {
+        return KeyCodec.txnKey(graphId, row.outPart(), type.id(), row.rank(), row.src(), row.dst());
     }
 
     public Map<String, Object> readVertex(int graphId, String typeName, long vid) {
@@ -1007,7 +1099,7 @@ public final class Catalog {
                         }
                     }
                     case Mutation.DeleteVertex delete -> {
-                        int removed = removeVertex(session, batch, graphId, delete.vid(), maxEdgesPerVertex);
+                        int removed = removeVertex(session, batch, graphId, delete.vid(), maxEdgesPerVertex, delete.detach());
                         if (removed > 0) {
                             affected++;
                         }
@@ -1107,7 +1199,7 @@ public final class Catalog {
 
     /** @return 0 没有这个点，1 只删了点，2 还删了边 */
     private int removeVertex(
-            ReadSession session, StoreBatch batch, int graphId, long vid, int maxEdgesPerVertex) {
+            ReadSession session, StoreBatch batch, int graphId, long vid, int maxEdgesPerVertex, boolean detach) {
         int part = partOf(graphId, vid);
         byte[] prefix = KeyCodec.vertexPrefix(graphId, part, vid);
         LinkedHashSet<EdgeRef> edges = new LinkedHashSet<>();
@@ -1120,6 +1212,9 @@ public final class Catalog {
                 throw new CengyanException(ErrorCode.VERTEX_DEGREE_EXCEEDED,
                         "点 " + vid + " 的边数为 " + edges.size() + "，超过上限 " + maxEdgesPerVertex);
             }
+        }
+        if (!detach && !edges.isEmpty()) {
+            throw new CengyanException(ErrorCode.CONSTRAINT, "点上还有边，需要 DETACH DELETE");
         }
         List<byte[]> vertices = session.keysWithPrefix(Cf.VERTEX, prefix);
         if (edges.isEmpty() && vertices.isEmpty()) {
@@ -1305,7 +1400,7 @@ public final class Catalog {
     public List<StatsRow> stats(int graphId, CancelToken cancel) {
         requireGraph(graphId);
         Map<Integer, Long> relCount = new HashMap<>();
-        Map<Integer, Set<Long>> vids = new HashMap<>();
+        Map<Integer, Long> nodeCount = new HashMap<>();
         try (ReadSession session = store.read()) {
             session.visitPrefix(Cf.EDGE, KeyCodec.graphIdPrefix(graphId), cancel, key -> {
                 if (key.length != KeyCodec.EDGE_KEY_LENGTH) {
@@ -1321,13 +1416,12 @@ public final class Catalog {
                 if (key.length != KeyCodec.VERTEX_KEY_LENGTH) {
                     return;
                 }
-                vids.computeIfAbsent(KeyCodec.tagIdOf(key), id -> new HashSet<>()).add(KeyCodec.vidOf(key));
+                nodeCount.merge(KeyCodec.tagIdOf(key), 1L, Long::sum);
             });
         }
         List<StatsRow> rows = new ArrayList<>();
         for (NodeType type : nodeTypes(graphId)) {
-            Set<Long> ids = vids.getOrDefault(type.id(), Set.of());
-            rows.add(new StatsRow("NODE", type.name(), ids.size()));
+            rows.add(new StatsRow("NODE", type.name(), nodeCount.getOrDefault(type.id(), 0L)));
         }
         for (RelType type : relTypes(graphId)) {
             rows.add(new StatsRow("REL", type.name(), relCount.getOrDefault(type.id(), 0L)));
@@ -1562,6 +1656,120 @@ public final class Catalog {
                         schemaVersion, typeName, decoded.properties(), decoded.idType(), decoded.idLength(), current.comment()));
                 store.mutate(batch);
                 return remember(typeKey, decoded);
+            }
+        });
+    }
+
+    public void renameProperty(int graphId, boolean node, String typeName, String from, String to) {
+        rewriteProperty(graphId, node, typeName, from, to);
+    }
+
+    public void dropProperty(int graphId, boolean node, String typeName, String name) {
+        rewriteProperty(graphId, node, typeName, name, "\u0000" + name);
+    }
+
+    private void rewriteProperty(int graphId, boolean node, String typeName, String from, String to) {
+        checkIdentifier(typeName);
+        checkIdentifier(from);
+        if (!to.startsWith("\u0000")) {
+            checkIdentifier(to);
+        }
+        int kind = node ? NODE_KIND : REL_KIND;
+        store.withWriteLock(() -> {
+            requireWritable(graphId);
+            try (ReadSession session = store.read()) {
+                KeyCodec.TypeKey typeKey = findTypeKey(session, graphId, kind, typeName);
+                if (typeKey == null) {
+                    throw typeMissing(kind, typeName);
+                }
+                CatalogCodec.DecodedType current = CatalogCodec.decodeType(
+                        session.get(Cf.CATALOG, KeyCodec.typeKey(graphId, kind, typeKey.typeId())));
+                List<PropDef> next = new ArrayList<>();
+                boolean found = false;
+                for (PropDef property : current.properties()) {
+                    if (property.name().equals(from)) {
+                        found = true;
+                        next.add(new PropDef(to, property.type(), true, property.comment()));
+                    } else if (property.name().equals(to)) {
+                        throw new CengyanException(ErrorCode.NAME_CONFLICT, "属性名已存在：" + to);
+                    } else {
+                        next.add(property);
+                    }
+                }
+                if (!found) {
+                    throw new CengyanException(ErrorCode.TYPE_MISMATCH, "未知属性 " + from);
+                }
+                for (IndexDef index : indexes(graphId)) {
+                    if (index.node() == node && index.typeId() == typeKey.typeId()) {
+                        throw new CengyanException(ErrorCode.CONSTRAINT, "先删除引用这个类型的索引");
+                    }
+                }
+                CatalogCodec.DecodedType decoded = new CatalogCodec.DecodedType(
+                        current.schemaVersion(), typeName, List.copyOf(next),
+                        current.idType(), current.idLength(), current.comment());
+                StoreBatch batch = new StoreBatch();
+                batch.put(Cf.CATALOG, KeyCodec.typeKey(graphId, kind, typeKey.typeId()),
+                        CatalogCodec.typeRecord(decoded.schemaVersion(), typeName, decoded.properties(),
+                                decoded.idType(), decoded.idLength(), decoded.comment()));
+                store.mutate(batch);
+                if (node) {
+                    nodeTypes.getOrDefault(graphId, new ConcurrentHashMap<>()).remove(typeName);
+                } else {
+                    relTypes.getOrDefault(graphId, new ConcurrentHashMap<>()).remove(typeName);
+                }
+                remember(typeKey, decoded);
+                return null;
+            }
+        });
+    }
+
+    public void dropType(int graphId, boolean node, String name, boolean ifExists) {
+        checkIdentifier(name);
+        int kind = node ? NODE_KIND : REL_KIND;
+        store.withWriteLock(() -> {
+            requireWritable(graphId);
+            try (ReadSession session = store.read()) {
+                KeyCodec.TypeKey typeKey = findTypeKey(session, graphId, kind, name);
+                if (typeKey == null) {
+                    if (ifExists) {
+                        return null;
+                    }
+                    throw typeMissing(kind, name);
+                }
+                List<String> indexNames = new ArrayList<>();
+                for (IndexDef index : indexes(graphId)) {
+                    if (index.node() == node && index.typeId() == typeKey.typeId()) {
+                        indexNames.add(index.name());
+                    }
+                }
+                for (String indexName : indexNames) {
+                    dropIndex(graphId, indexName);
+                }
+                StoreBatch batch = new StoreBatch();
+                batch.delete(Cf.CATALOG, KeyCodec.typeKey(graphId, kind, typeKey.typeId()));
+                int typeId = typeKey.typeId();
+                if (node) {
+                    session.visitPrefix(Cf.VERTEX, KeyCodec.graphIdPrefix(graphId), null, key -> {
+                        if (key.length == KeyCodec.VERTEX_KEY_LENGTH && KeyCodec.tagIdOf(key) == typeId) {
+                            batch.delete(Cf.VERTEX, key);
+                        }
+                    });
+                } else {
+                    session.visitPrefix(Cf.EDGE, KeyCodec.graphIdPrefix(graphId), null, key -> {
+                        if (key.length == KeyCodec.EDGE_KEY_LENGTH && KeyCodec.decodeEdge(key).edgeTypeId() == typeId) {
+                            batch.delete(Cf.EDGE, key);
+                        }
+                    });
+                    byte[] propPrefix = Arrays.copyOf(KeyCodec.propKey(graphId, typeId, 0L, 0L, 0L), 7);
+                    session.visitPrefix(Cf.PROP, propPrefix, null, key -> batch.delete(Cf.PROP, key));
+                }
+                store.mutate(batch);
+                if (node) {
+                    nodeTypes.getOrDefault(graphId, new ConcurrentHashMap<>()).remove(name);
+                } else {
+                    relTypes.getOrDefault(graphId, new ConcurrentHashMap<>()).remove(name);
+                }
+                return null;
             }
         });
     }
@@ -1837,9 +2045,24 @@ public final class Catalog {
         return List.copyOf(copied);
     }
 
+    private static boolean letterStart(String name) {
+        int first = name.codePointAt(0);
+        if (!Character.isLetter(first)) {
+            return false;
+        }
+        for (int index = Character.charCount(first); index < name.length(); ) {
+            int point = name.codePointAt(index);
+            if (!Character.isLetter(point) && !Character.isDigit(point) && point != '_') {
+                return false;
+            }
+            index += Character.charCount(point);
+        }
+        return true;
+    }
+
     static void checkIdentifier(String name) {
-        if (name == null || !IDENTIFIER.matcher(name).matches()) {
-            throw new CengyanException(ErrorCode.SYNTAX, "名字只能是英文、数字和下划线，并且不能以数字或下划线开头");
+        if (name == null || name.isEmpty() || !letterStart(name)) {
+            throw new CengyanException(ErrorCode.SYNTAX, "名字只能是字母、数字和下划线，并且不能以数字或下划线开头");
         }
         if (name.getBytes(StandardCharsets.UTF_8).length > 128) {
             throw new CengyanException(ErrorCode.SYNTAX, "名字最长 128 字节");
@@ -2367,6 +2590,17 @@ public final class Catalog {
     }
 
     private record EdgeIdentity(long rank, long src, long dst) {
+    }
+
+    private record CrossEdge(
+            long rank,
+            long src,
+            long dst,
+            int outPart,
+            int inPart,
+            byte[] propKey,
+            byte[] encoded,
+            byte[] baseline) {
     }
 
     private record VertexPut(int tagId, long vid, byte[] value) {

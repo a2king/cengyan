@@ -86,11 +86,18 @@ class ExecuteTest {
                 JsonNode shown = send(writer, reader, session, "SHOW INDEXES");
                 assertEquals("OK", shown.get("code").asText(), shown.toString());
                 assertEquals(true, shown.get("rows").get(0).get(5).asBoolean());
-                JsonNode stats = admin(writer, reader, session, "stats", "");
+                JsonNode cached = admin(writer, reader, session, "stats", "");
+                assertEquals("OK", cached.get("code").asText(), cached.toString());
+                assertEquals(0, cached.get("rows").size());
+                assertFalse(cached.has("collectedAt"));
+                JsonNode stats = admin(writer, reader, session, "stats", "", true);
                 assertEquals("OK", stats.get("code").asText(), stats.toString());
                 assertEquals("NODE", stats.get("rows").get(0).get(0).asText());
                 assertEquals(1, stats.get("rows").get(0).get(2).asInt());
                 assertTrue(stats.get("collectedAt").asLong() > 0);
+                JsonNode again = admin(writer, reader, session, "stats", "");
+                assertEquals(stats.get("collectedAt").asLong(), again.get("collectedAt").asLong());
+                assertEquals(1, again.get("rows").get(0).get(2).asInt());
                 JsonNode created = adminUser(writer, reader, session, "createUser", "reader", "secret", "read");
                 assertEquals("OK", created.get("code").asText(), created.toString());
                 session = login(writer, reader, session, "reader", "secret");
@@ -234,11 +241,24 @@ class ExecuteTest {
 
     private static JsonNode admin(
             BufferedWriter writer, BufferedReader reader, String session, String command, String index) throws Exception {
+        return admin(writer, reader, session, command, index, false);
+    }
+
+    private static JsonNode admin(
+            BufferedWriter writer,
+            BufferedReader reader,
+            String session,
+            String command,
+            String index,
+            boolean refresh) throws Exception {
         ObjectNode request = MAPPER.createObjectNode();
         request.put("op", "admin");
         request.put("session", session);
         request.put("command", command);
         request.put("index", index);
+        if (refresh) {
+            request.put("refresh", true);
+        }
         writer.write(MAPPER.writeValueAsString(request));
         writer.write('\n');
         writer.flush();

@@ -5,6 +5,7 @@ import io.cengyan.ErrorCode;
 import io.cengyan.catalog.Catalog;
 import io.cengyan.catalog.VertexWrite;
 import io.cengyan.store.GraphStore;
+import io.cengyan.store.KeyCodec;
 import io.cengyan.store.PerfReport;
 import io.cengyan.store.StoreOptions;
 import org.junit.jupiter.api.Tag;
@@ -16,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -142,6 +144,49 @@ class QueryEngineTest {
                     null);
             assertEquals(1, edges.rowsAffected());
             assertEquals(List.of("e_other"), column(run(db, "MATCH (a:org)-[:inv]->(b) RETURN b.id"), 0));
+        }
+    }
+
+    @Test
+    void 批量边可以跨分片写入() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH Multi PARTS 2",
+                    "USE Multi",
+                    "CREATE NODE TYPE Person ()",
+                    "CREATE REL TYPE knows (score DOUBLE NULL)");
+            assertEquals(2, db.catalog.partCount(db.session.current().graphId()));
+            assertTrue(KeyCodec.partOf(1L, 2) != KeyCodec.partOf(2L, 2));
+            assertEquals(KeyCodec.partOf(1L, 2), KeyCodec.partOf(3L, 2));
+            db.engine.bulkInsert(
+                    db.session,
+                    "node",
+                    "Person",
+                    List.of(Map.of("id", 1L), Map.of("id", 2L), Map.of("id", 3L)),
+                    false,
+                    false,
+                    null);
+            QueryResult edges = db.engine.bulkInsert(
+                    db.session,
+                    "edge",
+                    "knows",
+                    List.of(
+                            Map.of("src", 1L, "dst", 2L, "score", 0.5d),
+                            Map.of("src", 1L, "dst", 3L, "score", 0.25d)),
+                    false,
+                    false,
+                    null);
+            assertEquals(2, edges.rowsAffected());
+            List<Object> targets = new ArrayList<>(column(
+                    run(db, "MATCH (a:Person {id:1})-[e:knows]->(b) RETURN b.id"), 0));
+            targets.sort(Comparator.comparing(value -> ((Number) value).longValue()));
+            assertEquals(List.of(2L, 3L), targets);
+            assertEquals(List.of(0.5d), column(
+                    run(db, "MATCH (a:Person {id:1})-[e:knows]->(b:Person {id:2}) RETURN e.score"), 0));
+            assertEquals(List.of(1L), column(
+                    run(db, "MATCH (a:Person {id:2})<-[:knows]-(b) RETURN b.id"), 0));
+            assertEquals(List.of(1L), column(
+                    run(db, "MATCH (a:Person {id:3})<-[:knows]-(b) RETURN b.id"), 0));
         }
     }
 
@@ -347,14 +392,12 @@ class QueryEngineTest {
             assertEquals(1, deleted.rowsAffected());
             assertEquals(null, db.catalog.readRel(graphId, "holder", 0L, 1L, 2L));
             assertEquals(0.2d, db.catalog.readRel(graphId, "holder", 0L, 1L, 3L).get("ratio"));
-            QueryResult removed = run(db, "MATCH (a:Company {id:1}) DELETE a");
+            QueryResult removed = run(db, "MATCH (a:Company {id:1}) DETACH DELETE a");
             assertEquals(1, removed.rowsAffected());
             assertEquals(null, db.catalog.readVertex(graphId, "Company", 1L));
             assertEquals(null, db.catalog.readRel(graphId, "holder", 0L, 1L, 3L));
-            CengyanException multi = assertThrows(CengyanException.class, () -> run(db,
-                    "MATCH (a:Company {id:1})-[:holder]->{1,2}(b) DELETE b"));
-            assertEquals(ErrorCode.SYNTAX, multi.code());
-            assertTrue(multi.getMessage().contains("一跳"));
+            QueryResult multi = run(db, "MATCH (a:Company {id:1})-[:holder]->{1,2}(b) DELETE b");
+            assertEquals(0, multi.rowsAffected());
         }
     }
 
@@ -402,10 +445,9 @@ class QueryEngineTest {
                     "MATCH (a:Company {id:1})-[e:holder]->(b) WHERE b.id = 9 RETURN count(*) AS n, sum(e.ratio) AS total");
             assertEquals(0L, empty.rows().get(0).get(0));
             assertEquals(null, empty.rows().get(0).get(1));
-            CengyanException mixed = assertThrows(CengyanException.class, () -> run(db,
-                    "MATCH (a:Company {id:1})-[e:holder]->(b) RETURN count(*), b.id"));
-            assertEquals(ErrorCode.SYNTAX, mixed.code());
-            assertTrue(mixed.getMessage().contains("聚合"));
+            QueryResult grouped = run(db,
+                    "MATCH (a:Company {id:1})-[e:holder]->(b) RETURN count(*) AS n, b.id AS id");
+            assertEquals(Set.of(List.of(2L, 2L), List.of(1L, 3L)), new java.util.HashSet<>(grouped.rows()));
         }
     }
 

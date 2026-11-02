@@ -165,6 +165,27 @@ class StudioServerTest {
             assertEquals("stats", sent.get("command").asText());
             assertEquals("s1", sent.get("session").asText());
             assertEquals(StudioServer.STATS_TIMEOUT_MS, sent.get("timeoutMs").asInt());
+            assertFalse(sent.path("refresh").asBoolean(false));
+        }
+    }
+
+    @Test
+    void stats刷新标记会转发() throws Exception {
+        try (ServerSocket db = new ServerSocket(0)) {
+            AtomicReference<String> seen = new AtomicReference<>();
+            Thread worker = new Thread(() -> reply(db, seen, """
+                    {"code":"OK","session":"s1","columns":["target","name","count"],"rows":[],"rowsAffected":0}
+                    """));
+            worker.start();
+            try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", db.getLocalPort()))) {
+                HttpResponse<String> response = post(studio.port(), "/api/admin",
+                        "{\"command\":\"stats\",\"refresh\":true}", "s1");
+                assertEquals(200, response.statusCode());
+            }
+            worker.join(3000);
+            JsonNode sent = MAPPER.readTree(seen.get());
+            assertEquals("stats", sent.get("command").asText());
+            assertTrue(sent.get("refresh").asBoolean());
         }
     }
 

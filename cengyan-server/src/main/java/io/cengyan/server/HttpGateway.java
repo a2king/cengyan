@@ -18,8 +18,6 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 /** HTTP JSON facade for the same one-line protocol used by TCP clients. */
 final class HttpGateway implements AutoCloseable {
@@ -30,7 +28,6 @@ final class HttpGateway implements AutoCloseable {
     private final ExecutorService workers;
     private final String tcpHost;
     private final int tcpPort;
-    private final ConcurrentMap<String, TcpConnection> sessions = new ConcurrentHashMap<>();
 
     private HttpGateway(HttpServer server, ExecutorService workers, String tcpHost, int tcpPort) {
         this.server = server;
@@ -89,8 +86,6 @@ final class HttpGateway implements AutoCloseable {
     @Override
     public void close() {
         server.stop(0);
-        sessions.values().forEach(TcpConnection::close);
-        sessions.clear();
         workers.shutdownNow();
     }
 
@@ -141,25 +136,15 @@ final class HttpGateway implements AutoCloseable {
     }
 
     private String proxy(String request, String operation, String sessionId) throws IOException {
-        boolean persistent = !sessionId.isBlank() || "login".equals(operation);
-        TcpConnection connection = persistent && !sessionId.isBlank() ? sessions.get(sessionId) : new TcpConnection(tcpHost, tcpPort);
-        boolean stored = false;
+        // Session state lives in the server and is carried in JSON, not in a TCP connection.
+        // A request must use its own connection because the line protocol has no request id
+        // with which one socket could safely multiplex concurrent HTTP responses.
+        TcpConnection connection = new TcpConnection(tcpHost, tcpPort);
         try {
             String line = connection.exchange(request);
-            JsonNode response = MAPPER.readTree(line);
-            String returnedSession = response.path("session").asText("");
-            if ("login".equals(operation) && "OK".equals(response.path("code").asText()) && !returnedSession.isBlank()) {
-                sessions.put(returnedSession, connection);
-                stored = true;
-            }
-            if ("logout".equals(operation) && !sessionId.isBlank()) {
-                sessions.remove(sessionId, connection);
-            }
             return line;
         } finally {
-            if (!stored && (!persistent || "logout".equals(operation))) {
-                connection.close();
-            }
+            connection.close();
         }
     }
 

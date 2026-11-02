@@ -5,12 +5,41 @@ import io.cengyan.ErrorCode;
 import io.cengyan.catalog.Auth;
 import io.cengyan.catalog.GraphName;
 
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
+
 /** 一个连接上的当前图和登录用户。进程退出后消失。 */
 public final class SessionState {
     private GraphName current;
     private volatile String user;
     private volatile int role;
-    private int computeNode;
+    private volatile int computeNode;
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
+
+    /** 读查询可以共享；USE、登录和写入通过写锁独占会话状态。 */
+    public <T> T withReadLock(Supplier<T> action) {
+        if (action == null) {
+            throw new IllegalArgumentException("会话动作不能为空");
+        }
+        lock.readLock().lock();
+        try {
+            return action.get();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public <T> T withWriteLock(Supplier<T> action) {
+        if (action == null) {
+            throw new IllegalArgumentException("会话动作不能为空");
+        }
+        lock.writeLock().lock();
+        try {
+            return action.get();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
 
     public void use(GraphName graph) {
         if (graph == null) {
@@ -59,7 +88,7 @@ public final class SessionState {
     }
 
     /** 第一次 execute 绑上计算节点后，后面的语句还在这台。 */
-    public void pinCompute(int nodeId) {
+    public synchronized void pinCompute(int nodeId) {
         if (computeNode == 0 && nodeId != 0) {
             computeNode = nodeId;
         }

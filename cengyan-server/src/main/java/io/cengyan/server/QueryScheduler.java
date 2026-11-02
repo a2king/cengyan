@@ -15,12 +15,13 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * 把一条语句送进对应的线程池。
  * 保留名额只给登录和元数据，重查询用单独的池。
- * 同一会话同时只跑一条语句，排队发生在领线程之前。
+ * 会改会话的语句同时只跑一条，排队发生在领线程之前。
+ * 统计和存储占用不占会话，避免挡住同一会话上的登录和查询。
  */
 final class QueryScheduler implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(QueryScheduler.class);
@@ -47,6 +48,12 @@ final class QueryScheduler implements AutoCloseable {
         HEAVY
     }
 
+    enum SessionMode {
+        NONE,
+        READ,
+        WRITE
+    }
+
     @FunctionalInterface
     interface Busy {
         void rejected(String message);
@@ -60,7 +67,7 @@ final class QueryScheduler implements AutoCloseable {
     private final Semaphore reserved;
     private final Semaphore general;
     private final Semaphore heavy;
-    private final ConcurrentMap<String, ReentrantLock> turns = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, ReentrantReadWriteLock> turns = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
 
     private QueryScheduler(
@@ -143,28 +150,61 @@ final class QueryScheduler implements AutoCloseable {
      * @param sessionWaitMs 等同会话上一条语句还没结束时，最多再等多久。这段等待不占查询线程。
      */
     void submit(Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy) {
+        submit(lane, sessionId, sessionWaitMs, task, busy, SessionMode.WRITE);
+    }
+
+    /** 兼容旧调用：{@code exclusive=false} 表示不占会话锁。 */
+    void submit(Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy, boolean exclusive) {
+        submit(lane, sessionId, sessionWaitMs, task, busy,
+                exclusive ? SessionMode.WRITE : SessionMode.NONE);
+    }
+
+    void submitRead(Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy) {
+        submit(lane, sessionId, sessionWaitMs, task, busy, SessionMode.READ);
+    }
+
+    private void submit(
+            Lane lane,
+            String sessionId,
+            long sessionWaitMs,
+            Runnable task,
+            Busy busy,
+            SessionMode mode) {
         if (closed.get()) {
             reject(busy, "查询线程已满");
             return;
         }
         try {
-            admission.execute(() -> admit(lane, sessionId, Math.max(0, sessionWaitMs), task, busy));
+            admission.execute(() -> admit(lane, sessionId, Math.max(0, sessionWaitMs), task, busy, mode));
         } catch (RejectedExecutionException ex) {
             reject(busy, "查询线程已满");
         }
     }
 
-    private void admit(Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy) {
+    private void admit(
+            Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy, boolean exclusive) {
+        admit(lane, sessionId, sessionWaitMs, task, busy,
+                exclusive ? SessionMode.WRITE : SessionMode.NONE);
+    }
+
+    private void admit(
+            Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy, SessionMode mode) {
         Lane effective = effective(lane);
-        ReentrantLock turn = turns.computeIfAbsent(sessionId, id -> new ReentrantLock(true));
+        ReentrantReadWriteLock turn = mode == SessionMode.NONE
+                ? null
+                : turns.computeIfAbsent(sessionId, id -> new ReentrantReadWriteLock(true));
         boolean locked = false;
         boolean permitted = false;
         Semaphore permits = permits(effective);
         try {
-            locked = turn.tryLock(sessionWaitMs, TimeUnit.MILLISECONDS);
-            if (!locked) {
-                reject(busy, "会话正忙");
-                return;
+            if (turn != null) {
+                locked = (mode == SessionMode.WRITE
+                        ? turn.writeLock().tryLock(sessionWaitMs, TimeUnit.MILLISECONDS)
+                        : turn.readLock().tryLock(sessionWaitMs, TimeUnit.MILLISECONDS));
+                if (!locked) {
+                    reject(busy, "会话正忙");
+                    return;
+                }
             }
             permitted = permits.tryAcquire(queueMs, TimeUnit.MILLISECONDS);
             if (!permitted) {
@@ -199,7 +239,11 @@ final class QueryScheduler implements AutoCloseable {
                 permits.release();
             }
             if (locked) {
-                turn.unlock();
+                if (mode == SessionMode.WRITE) {
+                    turn.writeLock().unlock();
+                } else {
+                    turn.readLock().unlock();
+                }
             }
         }
     }

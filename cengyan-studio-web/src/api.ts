@@ -1,4 +1,4 @@
-import type { QueryResponse, SessionInfo } from './types';
+import type { QueryResponse, SessionInfo, StudioConfig } from './types';
 
 const SESSION_KEY = 'cengyan.studio.session';
 const USER_KEY = 'cengyan.studio.user';
@@ -66,8 +66,13 @@ export class CengyanApi {
     return this.request('/api/cancel', { queryId });
   }
 
-  async admin(command: string, index = '', timeoutMs?: number): Promise<QueryResponse> {
-    return this.request('/api/admin', { command, index, ...(timeoutMs ? { timeoutMs } : {}) });
+  async admin(command: string, index = '', timeoutMs?: number, refresh = false): Promise<QueryResponse> {
+    return this.request('/api/admin', {
+      command,
+      index,
+      ...(timeoutMs ? { timeoutMs } : {}),
+      ...(refresh ? { refresh: true } : {}),
+    });
   }
 
   async showMembers(graph: string): Promise<QueryResponse> {
@@ -80,6 +85,15 @@ export class CengyanApi {
 
   async ping(): Promise<QueryResponse> {
     return this.request('/api/ping', {});
+  }
+
+  async config(): Promise<StudioConfig> {
+    const response = await fetch('/api/config');
+    const data = await response.json() as QueryResponse & Partial<StudioConfig>;
+    if (!response.ok || data.code !== 'OK' || !Number.isFinite(data.graphMaxNodes) || !Number.isFinite(data.tableMaxNodes)) {
+      throw new Error('Studio 配置读取失败');
+    }
+    return { graphMaxNodes: Number(data.graphMaxNodes), tableMaxNodes: Number(data.tableMaxNodes) };
   }
 
   private async request(path: string, body: Record<string, unknown>): Promise<QueryResponse> {

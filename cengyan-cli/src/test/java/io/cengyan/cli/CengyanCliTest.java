@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CengyanCliTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -28,6 +30,12 @@ class CengyanCliTest {
         assertEquals("login", login.get("op").asText());
         assertEquals("root", login.get("user").asText());
         assertEquals("cengyan", login.get("password").asText());
+        JsonNode stats = MAPPER.readTree(cli.request(":stats"));
+        assertEquals("stats", stats.get("command").asText());
+        assertFalse(stats.path("refresh").asBoolean(false));
+        JsonNode refreshed = MAPPER.readTree(cli.request(":stats refresh"));
+        assertEquals("stats", refreshed.get("command").asText());
+        assertTrue(refreshed.get("refresh").asBoolean());
         JsonNode created = MAPPER.readTree(cli.request(":createUser reader secret read"));
         assertEquals("admin", created.get("op").asText());
         assertEquals("createUser", created.get("command").asText());

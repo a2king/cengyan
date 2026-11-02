@@ -1,7 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import 'antd/dist/reset.css';
-import '@xyflow/react/dist/style.css';
 import './styles.css';
 import { App } from './App';
 

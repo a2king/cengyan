@@ -15,6 +15,12 @@ export interface QueryResponse {
   rowsAffected?: number;
   queryId?: string;
   collectedAt?: number;
+  elapsedMs?: number;
+}
+
+export interface StudioConfig {
+  graphMaxNodes: number;
+  tableMaxNodes: number;
 }
 
 export interface GraphSpace {

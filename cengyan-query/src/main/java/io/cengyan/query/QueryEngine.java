@@ -17,6 +17,7 @@ import io.cengyan.catalog.RelType;
 import io.cengyan.catalog.StatsRow;
 import io.cengyan.catalog.ValueType;
 import io.cengyan.catalog.VertexWrite;
+import io.cengyan.parser.Expr;
 import io.cengyan.parser.Gql;
 import io.cengyan.parser.ParseException;
 import io.cengyan.parser.Stmt;
@@ -42,6 +43,7 @@ public final class QueryEngine {
     private final MatchExecutor match;
     private final MutateExecutor mutate;
     private final ProcedureExecutor procedures;
+    private final GraphQuery graphs;
     private final StatsCache statsCache = new StatsCache();
 
     public QueryEngine(Catalog catalog, GraphStore store) {
@@ -69,6 +71,7 @@ public final class QueryEngine {
         this.match = new MatchExecutor(catalog, store, duck);
         this.mutate = new MutateExecutor(catalog, store);
         this.procedures = new ProcedureExecutor(catalog, store);
+        this.graphs = new GraphQuery(catalog, store, duck, procedures);
     }
 
     public void bind(Membership bound) {
@@ -90,24 +93,83 @@ public final class QueryEngine {
         if (limits == null) {
             throw new IllegalArgumentException("查询上限不能为空");
         }
-        synchronized (session) {
+        long startedNanos = System.nanoTime();
+        try (QueryMemory.Scope ignored = QueryMemory.open(limits.queryMemoryBytes())) {
+            boolean exclusive = requiresExclusiveSession(gql);
+            QueryResult result = exclusive
+                    ? session.withWriteLock(() -> executeLocked(session, gql, params, limits, cancel))
+                    : session.withReadLock(() -> executeLocked(session, gql, params, limits, cancel));
+            return withElapsed(result, startedNanos);
+        }
+    }
+
+    private static QueryResult withElapsed(QueryResult result, long startedNanos) {
+        return new QueryResult(result.columns(), result.rows(), result.rowsAffected(), result.collectedAt(),
+                Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L));
+    }
+
+    private QueryResult executeLocked(
+            SessionState session,
+            String gql,
+            Map<String, Object> params,
+            QueryLimits limits,
+            CancelToken cancel) {
             int computeNode = bindCompute(session);
             try {
-            Stmt stmt;
+            List<Stmt> statements;
             try {
-                stmt = Gql.parse(gql);
+                statements = Gql.parseAll(gql);
             } catch (ParseException ex) {
                 throw new CengyanException(ErrorCode.SYNTAX, ex.getMessage(), ex);
             }
-            if (cancel != null && cancel.cancelled()) {
-                throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
-            }
-            if (session.readOnly() && writes(stmt)) {
-                throw new CengyanException(ErrorCode.FORBIDDEN, "只读会话不能修改数据");
-            }
             Map<String, Object> values = normalize(params);
-            return switch (stmt) {
+            QueryResult last = QueryResult.changed(0);
+            for (Stmt stmt : statements) {
+                if (cancel != null && cancel.cancelled()) {
+                    throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
+                }
+                if (session.readOnly() && writes(stmt)) {
+                    throw new CengyanException(ErrorCode.FORBIDDEN, "只读会话不能修改数据");
+                }
+                last = executeOne(session, stmt, values, limits, cancel);
+            }
+            return last;
+            } finally {
+                if (computeNode != 0) {
+                    membership.leave(computeNode);
+                }
+            }
+    }
+
+    public static boolean requiresExclusiveSession(String gql) {
+        List<Stmt> statements;
+        try {
+            statements = Gql.parseAll(gql);
+        } catch (ParseException ex) {
+            // 解析错误仍然需要进入独占路径，避免并发修改状态时产生不一致的诊断行为。
+            return true;
+        }
+        return statements.stream().anyMatch(stmt -> stmt instanceof Stmt.Use || writes(stmt));
+    }
+
+    private QueryResult executeOne(
+            SessionState session,
+            Stmt stmt,
+            Map<String, Object> values,
+            QueryLimits limits,
+            CancelToken cancel) {
+        return switch (stmt) {
                 case Stmt.CreateGraph create -> {
+                    if (create.ifNotExists()) {
+                        try {
+                            catalog.graph(create.name());
+                            yield QueryResult.changed(0);
+                        } catch (CengyanException ex) {
+                            if (ex.code() != ErrorCode.GRAPH_NOT_FOUND) {
+                                throw ex;
+                            }
+                        }
+                    }
                      int created = catalog.createGraph(create.name(), create.parts(), create.comment());
                     if (membership != null) {
                         membership.ensureVotes(created);
@@ -123,11 +185,15 @@ public final class QueryEngine {
                     yield QueryResult.changed(1);
                 }
                 case Stmt.DropAlias drop -> {
-                    catalog.dropAlias(drop.name());
+                    if (!drop.ifExists() || aliasExists(drop.name())) {
+                        catalog.dropAlias(drop.name());
+                    }
                     yield QueryResult.changed(1);
                 }
                 case Stmt.DropGraph drop -> {
-                    catalog.dropGraph(drop.name());
+                    if (!drop.ifExists() || graphExists(drop.name())) {
+                        catalog.dropGraph(drop.name());
+                    }
                     yield QueryResult.changed(1);
                 }
                 case Stmt.Show show -> show(session, show);
@@ -144,7 +210,9 @@ public final class QueryEngine {
                     yield QueryResult.changed(1);
                 }
                 case Stmt.DropIndex drop -> {
-                    catalog.dropIndex(graphId(session), drop.name());
+                    if (!drop.ifExists() || indexExists(graphId(session), drop.name())) {
+                        catalog.dropIndex(graphId(session), drop.name());
+                    }
                     yield QueryResult.changed(1);
                 }
                 case Stmt.AlterType alter -> {
@@ -158,15 +226,25 @@ public final class QueryEngine {
                 case Stmt.Set set -> QueryResult.changed(mutate.set(set, graphId(session), values, limits, cancel));
                 case Stmt.Delete delete -> QueryResult.changed(
                         mutate.delete(delete, graphId(session), values, limits, cancel));
-                case Stmt.Match query -> match.run(query, graphId(session), values, limits, cancel);
+                case Stmt.Match query -> match.needsExpand(query, values)
+                        ? graphs.runMatch(query, graphId(session), values, limits, cancel)
+                        : match.run(query, graphId(session), values, limits, cancel);
                 case Stmt.Call call -> procedures.call(call, graphId(session), values, limits, cancel);
-            };
-            } finally {
-                if (computeNode != 0) {
-                    membership.leave(computeNode);
+                case Stmt.ExplainQuery explain -> graphs.explain(explain.statement());
+                case Stmt.Select select -> graphs.select(select, graphId(session), values, limits, cancel);
+                case Stmt.Composite composite -> graphs.composite(composite, graphId(session), values, limits, cancel);
+                case Stmt.Next next -> graphs.next(next, graphId(session), values, limits, cancel);
+                case Stmt.InsertGraph insert -> QueryResult.changed(
+                        graphs.insertGraph(insert.elements(), graphId(session), values, Map.of()));
+                case Stmt.InsertUsing insert -> QueryResult.changed(
+                        graphs.insertUsing(insert, graphId(session), values, limits, cancel));
+                case Stmt.Mutate mutate -> QueryResult.changed(
+                        graphs.mutate(mutate, graphId(session), values, limits, cancel));
+                case Stmt.DropType drop -> {
+                    graphs.dropType(graphId(session), drop);
+                    yield QueryResult.changed(1);
                 }
-            }
-        }
+            };
     }
 
     /**
@@ -181,10 +259,23 @@ public final class QueryEngine {
             boolean ignoreExisting,
             boolean skipMissing,
             CancelToken cancel) {
+        return bulkInsert(session, kind, typeName, rows, ignoreExisting, skipMissing, cancel, 0L);
+    }
+
+    public QueryResult bulkInsert(
+            SessionState session,
+            String kind,
+            String typeName,
+            List<Map<String, Object>> rows,
+            boolean ignoreExisting,
+            boolean skipMissing,
+            CancelToken cancel,
+            long queryMemoryBytes) {
         if (session == null || rows == null || kind == null || typeName == null) {
             throw new IllegalArgumentException("批量导入参数不能为空");
         }
-        synchronized (session) {
+        try (QueryMemory.Scope ignored = QueryMemory.open(queryMemoryBytes)) {
+            return session.withWriteLock(() -> {
             if (session.readOnly()) {
                 throw new CengyanException(ErrorCode.FORBIDDEN, "只读会话不能修改数据");
             }
@@ -259,6 +350,7 @@ public final class QueryEngine {
                 return QueryResult.changed(written);
             }
             throw new CengyanException(ErrorCode.SYNTAX, "bulkInsert 的 kind 只能是 node 或 edge");
+            });
         }
     }
 
@@ -348,7 +440,7 @@ public final class QueryEngine {
         if (auth == null) {
             throw new CengyanException(ErrorCode.INTERNAL, "还没有打开用户管理");
         }
-        synchronized (session) {
+        return session.withWriteLock(() -> {
             Auth.User found = auth.authenticate(user, password);
             if (found == null) {
                 throw new CengyanException(ErrorCode.FORBIDDEN, "用户或密码不正确");
@@ -356,7 +448,7 @@ public final class QueryEngine {
             session.bind(found.name(), found.role());
             String roleName = found.role() == Auth.ROLE_READ ? "read" : "write";
             return new QueryResult(List.of("user", "role"), List.of(List.of(found.name(), roleName)), 0);
-        }
+        });
     }
 
     public QueryResult admin(SessionState session, String command, String index, CancelToken cancel) {
@@ -389,7 +481,10 @@ public final class QueryEngine {
         if (command == null || command.isBlank()) {
             throw new CengyanException(ErrorCode.SYNTAX, "缺少 command");
         }
-        synchronized (session) {
+        if ("stats".equals(command) || "storage".equals(command)) {
+            return backgroundRead(session, call, cancel);
+        }
+        return session.withWriteLock(() -> {
             if (cancel != null && cancel.cancelled()) {
                 throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
             }
@@ -400,20 +495,6 @@ public final class QueryEngine {
                         throw new CengyanException(ErrorCode.SYNTAX, "缺少索引名");
                     }
                     yield QueryResult.changed(catalog.rebuildIndex(graphId(session), index, cancel));
-                }
-                case "stats" -> {
-                    int graphId = graphId(session);
-                    StatsCache.Snapshot<List<StatsRow>> sample = statsCache.counts(
-                            graphId, () -> catalog.stats(graphId, cancel));
-                    List<List<Object>> rows = new ArrayList<>();
-                    for (StatsRow row : sample.value()) {
-                        rows.add(List.of(row.target(), row.name(), row.count()));
-                    }
-                    yield new QueryResult(List.of("target", "name", "count"), rows, 0, sample.collectedAt());
-                }
-                case "storage" -> {
-                    StatsCache.Snapshot<Long> sample = statsCache.storage(store::storageSizeBytes);
-                    yield new QueryResult(List.of("bytes"), List.of(List.of(sample.value())), 0, sample.collectedAt());
                 }
                 case "flush" -> {
                     requireWrite(session);
@@ -511,7 +592,33 @@ public final class QueryEngine {
                 case "showMembers" -> showMembers(session, call.graph());
                 default -> throw new CengyanException(ErrorCode.SYNTAX, "无法识别的管理命令");
             };
+        });
+    }
+
+    /** 统计和存储占用只在锁里核对登录和图，扫描本身不占会话。 */
+    private QueryResult backgroundRead(SessionState session, AdminCall call, CancelToken cancel) {
+        int selected = session.withReadLock(() -> {
+            if (cancel != null && cancel.cancelled()) {
+                throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
+            }
+            return "stats".equals(call.command()) ? graphId(session) : 0;
+        });
+        final int graphId = selected;
+        if ("stats".equals(call.command())) {
+            StatsCache.Snapshot<List<StatsRow>> sample = call.refresh()
+                    ? statsCache.refreshCounts(graphId, () -> catalog.stats(graphId, cancel))
+                    : statsCache.cachedCounts(graphId);
+            if (sample == null) {
+                return new QueryResult(List.of("target", "name", "count"), List.of(), 0, null);
+            }
+            List<List<Object>> rows = new ArrayList<>();
+            for (StatsRow row : sample.value()) {
+                rows.add(List.of(row.target(), row.name(), row.count()));
+            }
+            return new QueryResult(List.of("target", "name", "count"), rows, 0, sample.collectedAt());
         }
+        StatsCache.Snapshot<Long> sample = statsCache.storage(store::storageSizeBytes);
+        return new QueryResult(List.of("bytes"), List.of(List.of(sample.value())), 0, sample.collectedAt());
     }
 
     private void requireAuth() {
@@ -564,7 +671,12 @@ public final class QueryEngine {
                 || stmt instanceof Stmt.Show
                 || stmt instanceof Stmt.Describe
                 || stmt instanceof Stmt.Match
-                || stmt instanceof Stmt.Call);
+                || stmt instanceof Stmt.Call
+                || stmt instanceof Stmt.Explain
+                || stmt instanceof Stmt.ExplainQuery
+                || stmt instanceof Stmt.Select
+                || stmt instanceof Stmt.Composite
+                || stmt instanceof Stmt.Next);
     }
 
     private static int parseRole(String role) {
@@ -601,6 +713,9 @@ public final class QueryEngine {
                 : catalog.relType(graphId, describe.name()).properties();
         List<List<Object>> rows = new ArrayList<>();
         for (PropDef property : properties) {
+            if (property.name().startsWith("\u0000")) {
+                continue;
+            }
             rows.add(nullableRow(property.name(), property.type().name(), property.nullable(), property.comment()));
         }
         return new QueryResult(List.of("property", "type", "nullable", "comment"), rows, 0);
@@ -610,6 +725,20 @@ public final class QueryEngine {
         List<PropDef> properties = new ArrayList<>();
         for (Stmt.Field field : create.fields()) {
             properties.add(new PropDef(field.name(), valueType(field.valueType()), field.nullable(), field.comment()));
+        }
+        if (create.ifNotExists()) {
+            try {
+                if (create.node()) {
+                    catalog.nodeType(graphId, create.name());
+                } else {
+                    catalog.relType(graphId, create.name());
+                }
+                return;
+            } catch (CengyanException ex) {
+                if (ex.code() != ErrorCode.TYPE_NOT_FOUND) {
+                    throw ex;
+                }
+            }
         }
         if (create.node()) {
             IdType idType;
@@ -634,8 +763,7 @@ public final class QueryEngine {
         if (!match.orderBy().isEmpty()) rows.add(List.of("Sort", "ORDER BY"));
         if (match.distinct()) rows.add(List.of("Distinct", "RETURN DISTINCT"));
         if (match.skip() != null || match.limit() != null) {
-            rows.add(List.of("Window", "skip=" + (match.skip() == null ? 0 : match.skip())
-                    + " limit=" + (match.limit() == null ? "none" : match.limit())));
+            rows.add(List.of("Window", "skip=" + countText(match.skip()) + " limit=" + countText(match.limit())));
         }
         rows.add(List.of("Projection", Integer.toString(match.items().size()) + " columns"));
         return new QueryResult(List.of("operator", "detail"), rows, 0);
@@ -645,7 +773,25 @@ public final class QueryEngine {
         return new ArrayList<>(java.util.Arrays.asList(values));
     }
 
+    private static String countText(Expr expr) {
+        if (expr == null) {
+            return "none";
+        }
+        if (expr instanceof Expr.Literal literal) {
+            return String.valueOf(literal.value());
+        }
+        return "expr";
+    }
+
     private void alterType(int graphId, Stmt.AlterType alter) {
+        if ("DROP".equals(alter.action())) {
+            graphs.dropProperty(graphId, alter.node(), alter.typeName(), alter.property());
+            return;
+        }
+        if ("RENAME".equals(alter.action())) {
+            graphs.renameProperty(graphId, alter.node(), alter.typeName(), alter.property(), alter.newName());
+            return;
+        }
         PropDef property = new PropDef(alter.property(), valueType(alter.valueType()), true, alter.comment());
         if (alter.node()) {
             catalog.addNodeProperty(graphId, alter.typeName(), property);
@@ -729,6 +875,32 @@ public final class QueryEngine {
             values.put(prop.name(), value);
         }
         return values;
+    }
+
+    private boolean graphExists(String name) {
+        try {
+            return catalog.graph(name).kind() == GraphName.GRAPH;
+        } catch (CengyanException ex) {
+            if (ex.code() == ErrorCode.GRAPH_NOT_FOUND) {
+                return false;
+            }
+            throw ex;
+        }
+    }
+
+    private boolean aliasExists(String name) {
+        try {
+            return catalog.graph(name).kind() == GraphName.ALIAS;
+        } catch (CengyanException ex) {
+            if (ex.code() == ErrorCode.GRAPH_NOT_FOUND) {
+                return false;
+            }
+            throw ex;
+        }
+    }
+
+    private boolean indexExists(int graphId, String name) {
+        return catalog.indexes(graphId).stream().anyMatch(index -> index.name().equals(name));
     }
 
     private static int graphId(SessionState session) {

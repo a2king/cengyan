@@ -33,6 +33,8 @@ $studioHost = '0.0.0.0'
 $studioPort = '19670'
 $dbHost = '127.0.0.1'
 $dbPort = '19669'
+$graphMaxNodes = '2000'
+$tableMaxNodes = '2000'
 $config = Join-Path $appHome 'config\studio.properties'
 if (Test-Path -LiteralPath $config) {
     foreach ($line in Get-Content -LiteralPath $config) {
@@ -42,6 +44,8 @@ if (Test-Path -LiteralPath $config) {
                 'port' { $studioPort = $Matches[2] }
                 'db_host' { $dbHost = $Matches[2] }
                 'db_port' { $dbPort = $Matches[2] }
+                'graph_max_nodes' { $graphMaxNodes = $Matches[2] }
+                'table_max_nodes' { $tableMaxNodes = $Matches[2] }
             }
         }
     }
@@ -56,7 +60,7 @@ if (Test-Path -LiteralPath $pidFile) {
 }
 
 $process = Start-Process -FilePath $javaExe `
-    -ArgumentList @('-jar', $jar, '--host', $studioHost, '--port', $studioPort, '--db-host', $dbHost, '--db-port', $dbPort) `
+    -ArgumentList @('-jar', $jar, '--host', $studioHost, '--port', $studioPort, '--db-host', $dbHost, '--db-port', $dbPort, '--graph-max-nodes', $graphMaxNodes, '--table-max-nodes', $tableMaxNodes) `
     -WorkingDirectory $appHome `
     -RedirectStandardOutput $logFile `
     -RedirectStandardError $errorFile `

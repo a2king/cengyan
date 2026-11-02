@@ -11,27 +11,38 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class StatsCacheTest {
     @Test
-    void 三十分钟内数量和大小都不再扫描() {
+    void 数量只在手动刷新时重新扫描() {
         AtomicLong now = new AtomicLong(1_000_000L);
         StatsCache cache = new StatsCache(StatsCache.FRESH_MILLIS, now::get);
-        AtomicInteger countLoads = new AtomicInteger();
-        AtomicInteger sizeLoads = new AtomicInteger();
+        AtomicInteger loads = new AtomicInteger();
+        assertEquals(null, cache.cachedCounts(1));
 
-        StatsCache.Snapshot<List<StatsRow>> first = cache.counts(1, () -> {
-            countLoads.incrementAndGet();
+        StatsCache.Snapshot<List<StatsRow>> first = cache.refreshCounts(1, () -> {
+            loads.incrementAndGet();
             return List.of(new StatsRow("NODE", "Company", 3));
         });
-        StatsCache.Snapshot<List<StatsRow>> second = cache.counts(1, () -> {
-            countLoads.incrementAndGet();
+        now.addAndGet(StatsCache.FRESH_MILLIS + 1);
+        assertEquals(first, cache.cachedCounts(1));
+        assertEquals(1, loads.get());
+
+        assertEquals(9L, cache.refreshCounts(1, () -> {
+            loads.incrementAndGet();
             return List.of(new StatsRow("NODE", "Company", 9));
-        });
-        assertEquals(first, second);
-        assertEquals(1, countLoads.get());
-        assertEquals(List.of(), cache.counts(2, () -> {
-            countLoads.incrementAndGet();
+        }).value().get(0).count());
+        assertEquals(2, loads.get());
+        assertEquals(9L, cache.cachedCounts(1).value().get(0).count());
+        assertEquals(List.of(), cache.refreshCounts(2, () -> {
+            loads.incrementAndGet();
             return List.of();
         }).value());
-        assertEquals(2, countLoads.get());
+        assertEquals(null, cache.cachedCounts(3));
+    }
+
+    @Test
+    void 三十分钟内大小不再扫描() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        StatsCache cache = new StatsCache(StatsCache.FRESH_MILLIS, now::get);
+        AtomicInteger sizeLoads = new AtomicInteger();
 
         assertEquals(100L, cache.storage(() -> {
             sizeLoads.incrementAndGet();
@@ -45,15 +56,10 @@ class StatsCacheTest {
         assertEquals(1, sizeLoads.get());
 
         now.addAndGet(1);
-        assertEquals(9L, cache.counts(1, () -> {
-            countLoads.incrementAndGet();
-            return List.of(new StatsRow("NODE", "Company", 9));
-        }).value().get(0).count());
         assertEquals(200L, cache.storage(() -> {
             sizeLoads.incrementAndGet();
             return 200L;
         }).value());
-        assertEquals(3, countLoads.get());
         assertEquals(2, sizeLoads.get());
     }
 

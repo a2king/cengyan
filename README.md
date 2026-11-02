@@ -65,7 +65,7 @@ java -jar cengyan-cli\target\cengyan-cli-1.0.0.jar
 java -jar cengyan-studio\target\cengyan-studio-1.0.0.jar
 ```
 
-打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--host`、`--port`、`--db-host`、`--db-port` 可改；部署包的 `config/studio.properties` 默认使用 `host=0.0.0.0`，内网用户可以通过服务器 IP 访问。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
+打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--host`、`--port`、`--db-host`、`--db-port`、`--graph-max-nodes`、`--table-max-nodes` 可改；部署包的 `config/studio.properties` 默认使用 `host=0.0.0.0`，内网用户可以通过服务器 IP 访问。`graph_max_nodes` 默认 2000，查询结果行数超过后关系图只提示不渲染；`table_max_nodes` 默认 2000，表格只分页展示前面的结果，不改变真实查询总量和查询耗时。结果页支持重新执行当前 GQL 导出全部 CSV，导出期间不能重复提交。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
 
 Studio 前端源码在 `cengyan-studio-web`，和 Java 转发服务分开维护。开发前端时：
 
@@ -211,9 +211,9 @@ spark-submit --py-files dev-scripts/cengyan.py dev-scripts/data_init_edge.py \
 }
 ```
 
-一个批次在服务端对应一次 RocksDB `WriteBatch`。节点的字符串 ID 映射、节点属性和索引也在同一个批次中提交；任意一行校验失败时整批失败。
+节点批次在服务端对应一次 RocksDB `WriteBatch`。字符串 ID 映射、节点属性和索引也在同一个批次中提交；任意一行校验失败时整批失败。同一分片的边同样一次提交。跨分片的边先写出边、属性和补偿标记，再写入边，最后删除标记。
 
-10 亿级数据不能放进一个请求，应该由 Spark 分区或外部导入器切成 512～10000 行的批次，并通过多个分区并行提交。当前边批量接口要求边的两端在同一分片；默认单机单分片满足此条件，跨分片边要等分布式写入阶段实现。
+10 亿级数据不能放进一个请求，应该由 Spark 分区或外部导入器切成 512～10000 行的批次，并通过多个分区并行提交。批量边可以连接不同分片上的端点。
 
 ## 目录
 
@@ -233,16 +233,19 @@ DROP GRAPH Company
 
 ## 多跳、最短路、子图
 
-变长跳写在箭头后面。`{3}` 是正好第 3 跳的点，`{1,3}` 是第 1 到第 3 跳新到达的点，每个点只出现一次。
+变长跳写在箭头后面。`{3}` 是正好第 3 跳的点，`{1,3}` 是第 1 到第 3 跳新到达的点，每个点只出现一次。要整条路，绑定路径变量并写 `LIMIT`。
 
 ```text
 MATCH (a:Company {id:1})-[:holder]->{1,3}(b) RETURN b.id
+MATCH p = (a:Company {id:1})-[:holder]->{1,3}(b) RETURN p LIMIT 10000
+MATCH p = (a {id:1})-[:holder]->{1,3}(b {id:4}) RETURN p LIMIT 10000
 CALL path.shortest({start: 1, end: 2, rel: "holder", hops: 10}) YIELD length, vids
+CALL path.all({start: 1, rel: "holder", min: 1, max: 3, limit: 10000}) YIELD path
 CALL subgraph.bounded({start: 1, rel: "holder", hops: 3}) YIELD vid
 CALL ownership.largest_holder({start: 1, rel: "holder", ratioProp: "ratio", hops: 10}) YIELD vid, ratio
 ```
 
-多跳 `MATCH` 的 `WHERE` 目前只能比较边的 `rank` 和终点 `id`。`*` 表示所有路径，会直接报语法错误。
+`p` 每行是 `{length, nodes:[{id, type, properties}], edges:[{type, rank, src, dst, properties}]}`。一条路上的点不重复，再多一条超过 `LIMIT` 就失败。多跳 `MATCH` 的 `WHERE` 目前只能比较边的 `rank` 和终点 `id`。`*` 表示无上界路径，会直接报语法错误。
 
 子图从起点沿这种边的出边和入边一起扩，结果包含起点，只返回 `vid`。`hops: 0` 只返回起点。
 
@@ -260,7 +263,7 @@ DROP INDEX by_name
 
 `CREATE INDEX` 只登记目录，此时查询还不会用它。执行 `:rebuildIndex 索引名`，`SHOW INDEXES` 里 `ready` 变成 true 之后，等值和数值范围才会走索引。索引建好之前的新写入仍会维护索引键。
 
-字符串只支持等值，范围条件不会走索引。`INT64`、`DOUBLE`、`DATETIME` 可以做范围。`NULL` 不进索引，多条 `NULL` 不算冲突。唯一索引冲突时报 `UNIQUE_VIOLATION`。`:stats` 需要先 `USE`，返回每种点、每种边的数量和最大度数。
+字符串只支持等值，范围条件不会走索引。`INT64`、`DOUBLE`、`DATETIME` 可以做范围。`NULL` 不进索引，多条 `NULL` 不算冲突。唯一索引冲突时报 `UNIQUE_VIOLATION`。`:stats` 需要先 `USE`。默认返回上次缓存的每种点、每种边数量和统计时间，不重新扫描。`:stats refresh` 才重新统计并更新缓存。
 
 ## 用户和角色
 
@@ -284,7 +287,7 @@ DROP INDEX by_name
 | `:flush` | 把内存表刷到磁盘 |
 | `:compact` | 压缩全部列族。查询可以继续按快照读 |
 | `:rebuildIndex 索引名` | 重建索引并标记为可用 |
-| `:stats` | 按类型看点数、边数和最大度数 |
+| `:stats` | 返回上次缓存的点数和边数。`:stats refresh` 重新统计 |
 | `:createUser 用户 密码 read\|write` | 建用户 |
 | `:setPassword 用户 密码` | 改密码 |
 | `:setRole 用户 read\|write` | 改角色 |
@@ -344,12 +347,14 @@ TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`
 | `max_frontier_per_hop` | `0` | 每跳新点预算，`0` 表示不限 |
 | `max_hops` | `0` | 多跳、最短路、子图的跳数预算，`0` 表示不限 |
 | `max_paths` | `0` | 路径结果预算，`0` 表示不限 |
-| `query_memory_bytes` | `67108864` | 单条查询的内存预算 |
+| `query_memory_bytes` | `67108864` | 单条查询的 Java 中间结果预算；DuckDB 排序、去重和聚合使用同一上限并允许写临时目录，无法外排的中间结果超限会返回 `QUERY_MEMORY_EXCEEDED` |
 | `block_cache_bytes` | `268435456` | RocksDB 块缓存 |
 | `duckdb_memory` | `1GB` | 排序和聚合使用的 DuckDB 内存 |
 | `duckdb_temp_directory` | `tmp/duck` | DuckDB 临时目录 |
-| ocksdb_background_jobs | 6 | RocksDB background flush/compaction jobs |
-| ocksdb_write_buffer_bytes | 134217728 | MemTable write buffer per Column Family, in bytes |
+| 
+ocksdb_background_jobs | 6 | RocksDB background flush/compaction jobs |
+| 
+ocksdb_write_buffer_bytes | 134217728 | MemTable write buffer per Column Family, in bytes |
 
 这些预算是执行策略，不是 GQL 语义。默认值为 `0`，不会因为固定的 64 条边、10 跳或 100 条路径拒绝查询；不受信任的部署可以显式设置正数。
 

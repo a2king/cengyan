@@ -19,3 +19,4 @@ tmp/
 cengyan-studio-web/node_modules/
 cengyan-studio-web/.npm-cache/
 cengyan-studio-web/dist/
+cengyan-python-tests/

@@ -127,6 +127,11 @@ public final class CengyanCli {
                         node.put("parts", parseInt(part(parts, 2)));
                     }
                     case "showMembers" -> node.put("graph", part(parts, 1));
+                    case "stats" -> {
+                        if ("refresh".equalsIgnoreCase(part(parts, 1))) {
+                            node.put("refresh", true);
+                        }
+                    }
                     default -> {
                     }
                 }

@@ -107,6 +107,7 @@ class GraphSession:
         return response
 
     def execute(self, query, params=None, timeout_ms=None):
+        """执行一条或一段 GQL。分号分隔的多条语句由服务端顺序执行，返回最后一条的结果。"""
         if query.strip().upper().startswith("USE "):
             raise GraphContextError("use graph() to change graph context", "GRAPH_CONTEXT_ERROR")
         return Result(self._raw({"op":"execute", "query":query, "params":params or {}, "timeoutMs":timeout_ms or 0}, timeout_ms / 1000 if timeout_ms else None))
@@ -225,7 +226,11 @@ class AdminManager:
     def __init__(self, graph): self.graph = graph
     def flush(self): return self.graph._raw({"op":"admin", "command":"flush"})
     def compact(self): return self.graph._raw({"op":"admin", "command":"compact"})
-    def stats(self): return self.graph._raw({"op":"admin", "command":"stats"})
+    def stats(self, refresh=False):
+        payload = {"op": "admin", "command": "stats"}
+        if refresh:
+            payload["refresh"] = True
+        return self.graph._raw(payload)
 
     def storage(self): return self.graph._raw({"op":"admin", "command":"storage"})
     def rebuild_index(self, name): return self.graph._raw({"op":"admin", "command":"rebuildIndex", "index": name})

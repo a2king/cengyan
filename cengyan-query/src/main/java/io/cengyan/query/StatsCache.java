@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
-/** 数量和存储占用的生鲜结果。过期前重复读取不再扫描。 */
+/** 数量统计一直保留上次结果，直到手动刷新。存储占用仍按生鲜期复用。 */
 final class StatsCache {
     static final long FRESH_MILLIS = 30L * 60 * 1000;
 
@@ -33,16 +33,15 @@ final class StatsCache {
         this.clock = clock;
     }
 
-    Snapshot<List<StatsRow>> counts(int graphId, Supplier<List<StatsRow>> load) {
-        Snapshot<List<StatsRow>> found = fresh(counts.get(graphId));
-        if (found != null) {
-            return found;
+    Snapshot<List<StatsRow>> cachedCounts(int graphId) {
+        return counts.get(graphId);
+    }
+
+    Snapshot<List<StatsRow>> refreshCounts(int graphId, Supplier<List<StatsRow>> load) {
+        if (load == null) {
+            throw new IllegalArgumentException("加载不能为空");
         }
         synchronized (countGate) {
-            found = fresh(counts.get(graphId));
-            if (found != null) {
-                return found;
-            }
             Snapshot<List<StatsRow>> loaded = new Snapshot<>(List.copyOf(load.get()), clock.getAsLong());
             counts.put(graphId, loaded);
             return loaded;

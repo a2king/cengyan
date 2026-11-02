@@ -30,6 +30,9 @@ Linux（命令会后台启动，日志写入 logs/）：
   ./bin/stop-all.sh         停止全部服务
   bin/java.env              可选的 JDK 21 路径配置
 
+Linux ZIP 已保留 bin/*.sh 的可执行权限，解压后可直接运行上述命令，通常不需要再执行 chmod。
+如果使用了不保留 Unix 权限的解压工具，请改用 unzip，或执行：chmod 755 bin/*.sh
+
 PID 文件：
   pid/server.pid
   pid/studio.pid
@@ -43,6 +46,8 @@ Windows 启动脚本的标准错误另外写入：
 
 服务端配置：config/cengyan.properties
 Studio 配置：config/studio.properties
+其中 graph_max_nodes 控制关系图可视化上限，默认 2000；超过后页面只提示不渲染。
+table_max_nodes 控制表格前端最多展示的行数，默认 2000；不会改变查询实际返回总量和查询耗时。
 Studio 配置中的 host 控制 Web 控制台监听地址，部署到内网时通常填写：
   host=0.0.0.0
 然后通过服务器实际内网 IP 和端口访问，例如：http://192.168.1.20:19670
