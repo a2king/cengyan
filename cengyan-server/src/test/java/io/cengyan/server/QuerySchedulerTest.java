@@ -78,6 +78,35 @@ class QuerySchedulerTest {
     }
 
     @Test
+    void 统计不占会话时同一会话仍能查询() throws Exception {
+        QueryScheduler scheduler = open("""
+                query_threads=2
+                interactive_reserved=1
+                heavy_query_threads=1
+                query_queue_ms=500
+                """);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            scheduler.submit(QueryScheduler.Lane.HEAVY, "studio", 1000, () -> hold(started, release),
+                    message -> { throw new AssertionError(message); }, false);
+            assertTrue(started.await(2, TimeUnit.SECONDS));
+
+            CountDownLatch queryDone = new CountDownLatch(1);
+            AtomicReference<String> busy = new AtomicReference<>();
+            scheduler.submit(QueryScheduler.Lane.GENERAL, "studio", 1000, queryDone::countDown, busy::set);
+            assertTrue(queryDone.await(800, TimeUnit.MILLISECONDS), () -> "同一会话的查询被挡住：" + busy.get());
+
+            CountDownLatch loginDone = new CountDownLatch(1);
+            scheduler.submit(QueryScheduler.Lane.RESERVED, "login", 1000, loginDone::countDown, busy::set);
+            assertTrue(loginDone.await(800, TimeUnit.MILLISECONDS), () -> "新登录被挡住：" + busy.get());
+        } finally {
+            release.countDown();
+            scheduler.close();
+        }
+    }
+
+    @Test
     void 语句和重查询会分到不同的池() {
         assertEquals(QueryScheduler.Lane.RESERVED, QueryScheduler.laneForQuery(" \n-- note\nSHOW GRAPHS"));
         assertEquals(QueryScheduler.Lane.RESERVED, QueryScheduler.laneForQuery("use demo"));

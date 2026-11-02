@@ -69,11 +69,10 @@ class GqlSyntaxTest {
     }
 
     @Test
-    void 所有路径直接拒绝() {
-        ParseException all = assertThrows(ParseException.class,
-                () -> Gql.parse("MATCH (a:Company {id:1})-[:holder]->*(b) RETURN b.id"));
-        assertTrue(all.getMessage().contains("无上界"));
-        assertTrue(all.getMessage().contains("LIMIT"));
+    void 无上界路径可以写星号和加号() {
+        assertTrue(Gql.tree("MATCH (a:Company {id:1})-[:holder]->*(b) RETURN b.id").contains("{0,}"));
+        assertTrue(Gql.tree("MATCH (a:Company {id:1})-[:holder]->+(b) RETURN b.id").contains("{1,}"));
+        assertTrue(Gql.tree("MATCH (a {id:1})-[:holder]->{2,}(b) RETURN b.id").contains("{2,}"));
         ParseException emptyIndex = assertThrows(ParseException.class,
                 () -> Gql.parse("CREATE INDEX idx ON NODE TYPE Company ()"));
         assertTrue(emptyIndex.getMessage().contains("至少要有一列"));
@@ -104,6 +103,19 @@ class GqlSyntaxTest {
                 () -> Gql.parse("MATCH (a {id:1})-[:holder|:holder]->(b) RETURN a"));
         assertTrue(duplicated.getMessage().contains("边类型重复"));
         assertInstanceOf(Stmt.Insert.class, Gql.parse("INSERT (a {id:1})-[e]->(b {id:2})"));
+    }
+
+    @Test
+    void 科学计数法是浮点() {
+        Stmt stmt = Gql.parse("INSERT (a:org {id:1, regcap:1e8})");
+        Stmt.NodePat node = stmt instanceof Stmt.Insert insert ? insert.source() : ((Stmt.InsertGraph) stmt).elements().get(0) instanceof Stmt.Element.Node found ? found.node() : null;
+        Object value = null;
+        for (Stmt.Prop prop : node.properties()) {
+            if ("regcap".equals(prop.name()) && prop.value() instanceof Expr.Literal literal) {
+                value = literal.value();
+            }
+        }
+        assertTrue(value instanceof Double, String.valueOf(value));
     }
 
     @Test

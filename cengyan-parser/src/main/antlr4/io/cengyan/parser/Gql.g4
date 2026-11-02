@@ -2,7 +2,8 @@ grammar Gql;
 
 // 关键字不区分大小写，标识符区分大小写。标识符只允许英文、数字和下划线。
 
-script: statement ';'? EOF;
+// 手写解析器在 GqlReader。本文件只作对照，构建时不生成。
+script: statement (';' statement)* ';'? EOF;
 
 statement
     : EXPLAIN MATCH node (edge node)? whereClause? returnClause orderClause? skipClause? limitClause? #explainMatch

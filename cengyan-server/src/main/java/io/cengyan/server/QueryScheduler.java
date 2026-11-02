@@ -20,7 +20,8 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * 把一条语句送进对应的线程池。
  * 保留名额只给登录和元数据，重查询用单独的池。
- * 同一会话同时只跑一条语句，排队发生在领线程之前。
+ * 会改会话的语句同时只跑一条，排队发生在领线程之前。
+ * 统计和存储占用不占会话，避免挡住同一会话上的登录和查询。
  */
 final class QueryScheduler implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(QueryScheduler.class);
@@ -143,28 +144,36 @@ final class QueryScheduler implements AutoCloseable {
      * @param sessionWaitMs 等同会话上一条语句还没结束时，最多再等多久。这段等待不占查询线程。
      */
     void submit(Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy) {
+        submit(lane, sessionId, sessionWaitMs, task, busy, true);
+    }
+
+    /** {@code exclusive} 为假时不占会话锁。统计和存储占用用这个入口。 */
+    void submit(Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy, boolean exclusive) {
         if (closed.get()) {
             reject(busy, "查询线程已满");
             return;
         }
         try {
-            admission.execute(() -> admit(lane, sessionId, Math.max(0, sessionWaitMs), task, busy));
+            admission.execute(() -> admit(lane, sessionId, Math.max(0, sessionWaitMs), task, busy, exclusive));
         } catch (RejectedExecutionException ex) {
             reject(busy, "查询线程已满");
         }
     }
 
-    private void admit(Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy) {
+    private void admit(
+            Lane lane, String sessionId, long sessionWaitMs, Runnable task, Busy busy, boolean exclusive) {
         Lane effective = effective(lane);
-        ReentrantLock turn = turns.computeIfAbsent(sessionId, id -> new ReentrantLock(true));
+        ReentrantLock turn = exclusive ? turns.computeIfAbsent(sessionId, id -> new ReentrantLock(true)) : null;
         boolean locked = false;
         boolean permitted = false;
         Semaphore permits = permits(effective);
         try {
-            locked = turn.tryLock(sessionWaitMs, TimeUnit.MILLISECONDS);
-            if (!locked) {
-                reject(busy, "会话正忙");
-                return;
+            if (turn != null) {
+                locked = turn.tryLock(sessionWaitMs, TimeUnit.MILLISECONDS);
+                if (!locked) {
+                    reject(busy, "会话正忙");
+                    return;
+                }
             }
             permitted = permits.tryAcquire(queueMs, TimeUnit.MILLISECONDS);
             if (!permitted) {

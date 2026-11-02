@@ -167,6 +167,27 @@ class HopMatchTest {
         }
     }
 
+    @Test
+    void 多跳返回终点时带上实际类型的属性() throws Exception {
+        try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
+            script(db,
+                    "CREATE GRAPH Company",
+                    "USE Company",
+                    "CREATE NODE TYPE Company (name STRING NULL)",
+                    "CREATE NODE TYPE Person (name STRING NULL)",
+                    "CREATE REL TYPE holder ()",
+                    "INSERT (a:Company {id:1, name:'root'})-[:holder]->(b:Company {id:2, name:'mid'})",
+                    "INSERT (a:Company {id:2, name:'mid'})-[:holder]->(b:Person {id:3, name:'end'})");
+            QueryResult two = run(db, "MATCH (a:Company {id:1})-[:holder]->{2}(b) RETURN b");
+            assertEquals(1, two.rows().size());
+            assertEquals(java.util.Map.of("id", 3L, "type", "Person", "properties", java.util.Map.of("name", "end")),
+                    two.rows().get(0).get(0));
+            QueryResult one = run(db, "MATCH (a:Company {id:1})-[:holder]->(b) RETURN b");
+            assertEquals(java.util.Map.of("id", 2L, "type", "Company", "properties", java.util.Map.of("name", "mid")),
+                    one.rows().get(0).get(0));
+        }
+    }
+
     private static long spine(int layer, int index) {
         return layer * 1000L + index;
     }

@@ -41,6 +41,25 @@ public final class PathAll {
             int limit,
             LongPredicate rank,
             CancelToken cancel) {
+        return find(session, graphId, edgeTypeIds, directions, start, end, minHop, maxHop,
+                maxHops, maxEdgesPerVertex, limit, rank, cancel, true);
+    }
+
+    public static List<Found> find(
+            ReadSession session,
+            int graphId,
+            Set<Integer> edgeTypeIds,
+            List<Direction> directions,
+            long start,
+            Long end,
+            int minHop,
+            int maxHop,
+            int maxHops,
+            int maxEdgesPerVertex,
+            int limit,
+            LongPredicate rank,
+            CancelToken cancel,
+            boolean strict) {
         if (session == null) {
             throw new IllegalArgumentException("快照不能为空");
         }
@@ -72,9 +91,12 @@ public final class PathAll {
                 int depth = stack.size() - 1;
                 if (depth >= minHop && (end == null || frame.vid == end)) {
                     if (found.size() == limit) {
-                        throw new CengyanException(
-                                ErrorCode.PATH_LIMIT_EXCEEDED,
-                                "路径结果有 " + (limit + 1) + " 条，超过上限 " + limit);
+                        if (strict) {
+                            throw new CengyanException(
+                                    ErrorCode.PATH_LIMIT_EXCEEDED,
+                                    "路径结果有 " + (limit + 1) + " 条，超过上限 " + limit);
+                        }
+                        return found;
                     }
                     found.add(new Found(depth, List.copyOf(vids), List.copyOf(walked)));
                 }

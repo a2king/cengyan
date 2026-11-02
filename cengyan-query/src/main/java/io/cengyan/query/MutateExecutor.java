@@ -44,14 +44,14 @@ final class MutateExecutor {
         rejectQuantifier(statement.edge());
         return store.withWriteLock(() -> change(
                 graphId, statement.source(), statement.edge(), statement.target(), statement.where(),
-                statement.assignments(), null, params, limits.maxEdgesPerVertex(), cancel));
+                statement.assignments(), null, params, limits.maxEdgesPerVertex(), cancel, false));
     }
 
     int delete(Stmt.Delete statement, int graphId, Map<String, Object> params, QueryLimits limits, CancelToken cancel) {
         rejectQuantifier(statement.edge());
         return store.withWriteLock(() -> change(
                 graphId, statement.source(), statement.edge(), statement.target(), statement.where(),
-                null, statement.variables(), params, limits.maxEdgesPerVertex(), cancel));
+                null, statement.variables(), params, limits.maxEdgesPerVertex(), cancel, statement.detach()));
     }
 
     private int change(
@@ -64,13 +64,14 @@ final class MutateExecutor {
             List<String> variables,
             Map<String, Object> params,
             int maxEdges,
-            CancelToken cancel) {
+            CancelToken cancel,
+            boolean detach) {
         Bound bound = bind(graphId, source, edge, target, where, assignments, variables);
         ExprEval eval = new ExprEval(params, false);
         try (ReadSession session = store.read()) {
             List<Mutation> mutations = edge == null
-                    ? nodes(session, graphId, bound, where, assignments, variables, eval, maxEdges, cancel)
-                    : edges(session, graphId, bound, where, assignments, variables, eval, maxEdges, cancel);
+                    ? nodes(session, graphId, bound, where, assignments, variables, eval, maxEdges, cancel, detach)
+                    : edges(session, graphId, bound, where, assignments, variables, eval, maxEdges, cancel, detach);
             if (mutations.isEmpty()) {
                 return 0;
             }
@@ -87,7 +88,8 @@ final class MutateExecutor {
             List<String> variables,
             ExprEval eval,
             int maxEdges,
-            CancelToken cancel) {
+            CancelToken cancel,
+            boolean detach) {
         List<Long> starts = starts(session, graphId, bound, eval, maxEdges, cancel);
         Map<Long, VertexUpdate> vertices = new LinkedHashMap<>();
         LinkedHashSet<Long> deleted = new LinkedHashSet<>();
@@ -113,7 +115,7 @@ final class MutateExecutor {
                 deleted.add(vid);
             }
         }
-        return mutations(vertices, Map.of(), deleted, List.of(), bound);
+        return mutations(vertices, Map.of(), deleted, List.of(), bound, detach);
     }
 
     private List<Mutation> edges(
@@ -125,7 +127,8 @@ final class MutateExecutor {
             List<String> variables,
             ExprEval eval,
             int maxEdges,
-            CancelToken cancel) {
+            CancelToken cancel,
+            boolean detach) {
         List<Long> starts = starts(session, graphId, bound, eval, maxEdges, cancel);
         Long targetId = id(graphId, bound.target, bound.targetType, eval);
         Map<Long, VertexUpdate> vertices = new LinkedHashMap<>();
@@ -158,7 +161,7 @@ final class MutateExecutor {
                 }
             }
         }
-        return mutations(vertices, edges, deletedVertices, deletedEdges, bound);
+        return mutations(vertices, edges, deletedVertices, deletedEdges, bound, detach);
     }
 
     private void take(
@@ -278,12 +281,13 @@ final class MutateExecutor {
             Map<EdgeRef, EdgeUpdate> edges,
             LinkedHashSet<Long> deletedVertices,
             java.util.Collection<EdgeRef> deletedEdges,
-            Bound bound) {
+            Bound bound,
+            boolean detach) {
         List<Mutation> mutations = new ArrayList<>();
         if (!deletedVertices.isEmpty() || !deletedEdges.isEmpty()) {
             if (!deletedVertices.isEmpty()) {
                 for (long vid : deletedVertices) {
-                    mutations.add(new Mutation.DeleteVertex(vid));
+                    mutations.add(new Mutation.DeleteVertex(vid, detach));
                 }
             } else {
                 for (EdgeRef edge : deletedEdges) {
@@ -465,6 +469,11 @@ final class MutateExecutor {
                 }
             }
             case Expr.IsNull isNull -> checkExpr(isNull.value(), bound);
+            default -> {
+                for (Expr child : Expr.children(expr)) {
+                    checkExpr(child, bound);
+                }
+            }
         }
     }
 

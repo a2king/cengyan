@@ -107,6 +107,12 @@ public final class PropCodec {
         for (int i = 0; i < storedCount; i++) {
             PropDef property = current.get(i);
             boolean missing = (bitmap[i / 8] & (1 << (i % 8))) != 0;
+            if (property.name().startsWith("\u0000")) {
+                if (!missing) {
+                    readValue(buffer, property.type());
+                }
+                continue;
+            }
             if (missing) {
                 values.put(property.name(), null);
             } else {

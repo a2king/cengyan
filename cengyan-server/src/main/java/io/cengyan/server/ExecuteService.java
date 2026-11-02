@@ -173,7 +173,11 @@ final class ExecuteService {
             error(ctx, session, null, ErrorCode.SYNTAX, "超时时间不能为负，0 表示不限");
             return;
         }
-        QueryScheduler.Lane lane = QueryScheduler.laneForAdmin(command);
+        boolean refresh = node.path("refresh").asBoolean(false);
+        boolean backgroundRead = "stats".equals(command) || "storage".equals(command);
+        QueryScheduler.Lane lane = backgroundRead && "stats".equals(command) && !refresh
+                ? QueryScheduler.Lane.GENERAL
+                : QueryScheduler.laneForAdmin(command);
         long effective = lane == QueryScheduler.Lane.HEAVY
                 ? QueryScheduler.capTimeout(timeoutMs, config.heavyMaxExecutionTimeMs())
                 : timeoutMs;
@@ -187,8 +191,9 @@ final class ExecuteService {
                 node.path("nodeId").asInt(0),
                 node.path("graph").asText(""),
                 node.path("replicas").asInt(0),
-                node.path("parts").asInt(0));
-        dispatch(lane, session, effective, () -> runAdmin(ctx, session, call, effective), ctx);
+                node.path("parts").asInt(0),
+                refresh);
+        dispatch(lane, session, effective, () -> runAdmin(ctx, session, call, effective), ctx, !backgroundRead);
     }
 
     void login(ChannelHandlerContext ctx, JsonNode node) {
@@ -382,9 +387,19 @@ final class ExecuteService {
 
     private void dispatch(
             QueryScheduler.Lane lane, String sessionId, long timeoutMs, Runnable task, ChannelHandlerContext ctx) {
+        dispatch(lane, sessionId, timeoutMs, task, ctx, true);
+    }
+
+    private void dispatch(
+            QueryScheduler.Lane lane,
+            String sessionId,
+            long timeoutMs,
+            Runnable task,
+            ChannelHandlerContext ctx,
+            boolean exclusive) {
         long sessionWaitMs = timeoutMs <= 0 ? config.queryQueueMs() : timeoutMs;
         scheduler.submit(lane, sessionId, sessionWaitMs, task,
-                message -> error(ctx, sessionId, null, ErrorCode.BUSY, message));
+                message -> error(ctx, sessionId, null, ErrorCode.BUSY, message), exclusive);
     }
 
     private void finish(ChannelHandlerContext ctx, QueryHandle handle) {

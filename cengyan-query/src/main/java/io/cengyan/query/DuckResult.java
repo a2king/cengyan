@@ -17,6 +17,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -92,10 +93,20 @@ final class DuckResult {
         if (kinds == null || kinds.length == 0) {
             throw new CengyanException(ErrorCode.INTERNAL, "聚合列不能为空");
         }
+        boolean grouped = false;
+        for (String kind : kinds) {
+            if ("group".equals(kind)) {
+                grouped = true;
+                break;
+            }
+        }
         if (rows.isEmpty()) {
+            if (grouped) {
+                return List.of();
+            }
             List<Object> row = new ArrayList<>();
             for (String kind : kinds) {
-                row.add("sum".equals(kind) ? null : 0L);
+                row.add("sum".equals(kind) || "avg".equals(kind) || "min".equals(kind) || "max".equals(kind) ? null : 0L);
             }
             return List.of(row);
         }
@@ -296,15 +307,41 @@ final class DuckResult {
             if (i > 0) {
                 sql.append(", ");
             }
-            switch (kinds[i]) {
-                case "star" -> sql.append("count(*)");
-                case "count" -> sql.append("count(c").append(i).append(')');
-                case "sum" -> sql.append("sum(c").append(i).append(')');
-                default -> throw new CengyanException(ErrorCode.INTERNAL, "无法识别的聚合 " + kinds[i]);
-            }
+            sql.append(aggregateCall(kinds[i], i));
         }
         sql.append(" FROM t");
+        StringBuilder group = new StringBuilder();
+        for (int i = 0; i < kinds.length; i++) {
+            if ("group".equals(kinds[i])) {
+                if (!group.isEmpty()) {
+                    group.append(", ");
+                }
+                group.append('c').append(i);
+            }
+        }
+        if (!group.isEmpty()) {
+            sql.append(" GROUP BY ").append(group);
+        }
         return sql.toString();
+    }
+
+    private static String aggregateCall(String kind, int index) {
+        return switch (kind) {
+            case "group" -> "c" + index;
+            case "star" -> "count(*)";
+            case "count" -> "count(c" + index + ")";
+            case "count_distinct" -> "count(DISTINCT c" + index + ")";
+            case "sum" -> "sum(c" + index + ")";
+            case "avg" -> "avg(c" + index + ")";
+            case "min" -> "min(c" + index + ")";
+            case "max" -> "max(c" + index + ")";
+            case "collect_list" -> "list(c" + index + ")";
+            case "stddev_samp" -> "stddev_samp(c" + index + ")";
+            case "stddev_pop" -> "stddev_pop(c" + index + ")";
+            case "percentile_cont" -> "percentile_cont(0.5) WITHIN GROUP (ORDER BY c" + index + ")";
+            case "percentile_disc" -> "percentile_disc(0.5) WITHIN GROUP (ORDER BY c" + index + ")";
+            default -> throw new CengyanException(ErrorCode.INTERNAL, "无法识别的聚合 " + kind);
+        };
     }
 
     private static List<List<Object>> read(
@@ -334,21 +371,30 @@ final class DuckResult {
         try (Statement statement = connection.createStatement()) {
             Runnable hook = watch(statement, cancel);
             try (ResultSet result = statement.executeQuery(sql)) {
-            if (!result.next()) {
+            List<List<Object>> rows = new ArrayList<>();
+            while (result.next()) {
+                List<Object> row = new ArrayList<>();
+                for (int i = 0; i < kinds.length; i++) {
+                    Object value = result.getObject(i + 1);
+                    if (value == null || result.wasNull()) {
+                        row.add(null);
+                    } else if ("group".equals(kinds[i]) || "min".equals(kinds[i]) || "max".equals(kinds[i])) {
+                        row.add(plainAggregate(value));
+                    } else if ("avg".equals(kinds[i]) || "stddev_samp".equals(kinds[i]) || "stddev_pop".equals(kinds[i])
+                            || kinds[i].startsWith("percentile") || ("sum".equals(kinds[i]) && !integral[i])) {
+                        row.add(toDouble(value));
+                    } else if ("collect_list".equals(kinds[i])) {
+                        row.add(asList(value));
+                    } else {
+                        row.add(toLong(value));
+                    }
+                }
+                rows.add(row);
+            }
+            if (rows.isEmpty()) {
                 throw new CengyanException(ErrorCode.INTERNAL, "聚合没有结果");
             }
-            List<Object> row = new ArrayList<>();
-            for (int i = 0; i < kinds.length; i++) {
-                Object value = result.getObject(i + 1);
-                if (value == null || result.wasNull()) {
-                    row.add(null);
-                } else if ("sum".equals(kinds[i]) && !integral[i]) {
-                    row.add(toDouble(value));
-                } else {
-                    row.add(toLong(value));
-                }
-            }
-            return List.of(row);
+            return rows;
             } finally {
                 unwatch(cancel, hook);
             }
@@ -452,6 +498,36 @@ final class DuckResult {
             }
         }
         return true;
+    }
+
+    private static Object plainAggregate(Object value) {
+        if (value instanceof Integer number) {
+            return number.longValue();
+        }
+        if (value instanceof BigDecimal decimal) {
+            return decimal.scale() <= 0 ? decimal.longValue() : decimal.doubleValue();
+        }
+        return value;
+    }
+
+    private static List<Object> asList(Object value) {
+        try {
+            if (value instanceof java.sql.Array array) {
+                Object raw = array.getArray();
+                if (raw instanceof Object[] items) {
+                    return new ArrayList<>(Arrays.asList(items));
+                }
+            }
+        } catch (SQLException ex) {
+            throw new CengyanException(ErrorCode.INTERNAL, "无法读取列表聚合", ex);
+        }
+        if (value instanceof List<?> list) {
+            return new ArrayList<>(list);
+        }
+        if (value instanceof Object[] items) {
+            return new ArrayList<>(Arrays.asList(items));
+        }
+        return List.of(value);
     }
 
     private static long toLong(Object value) {

@@ -245,7 +245,7 @@ CALL subgraph.bounded({start: 1, rel: "holder", hops: 3}) YIELD vid
 CALL ownership.largest_holder({start: 1, rel: "holder", ratioProp: "ratio", hops: 10}) YIELD vid, ratio
 ```
 
-`p` 每行是 `{length, nodes:[{id}], edges:[{type, rank, src, dst}]}`。一条路上的点不重复，再多一条超过 `LIMIT` 就失败。多跳 `MATCH` 的 `WHERE` 目前只能比较边的 `rank` 和终点 `id`。`*` 表示无上界路径，会直接报语法错误。
+`p` 每行是 `{length, nodes:[{id, type, properties}], edges:[{type, rank, src, dst, properties}]}`。一条路上的点不重复，再多一条超过 `LIMIT` 就失败。多跳 `MATCH` 的 `WHERE` 目前只能比较边的 `rank` 和终点 `id`。`*` 表示无上界路径，会直接报语法错误。
 
 子图从起点沿这种边的出边和入边一起扩，结果包含起点，只返回 `vid`。`hops: 0` 只返回起点。
 
@@ -263,7 +263,7 @@ DROP INDEX by_name
 
 `CREATE INDEX` 只登记目录，此时查询还不会用它。执行 `:rebuildIndex 索引名`，`SHOW INDEXES` 里 `ready` 变成 true 之后，等值和数值范围才会走索引。索引建好之前的新写入仍会维护索引键。
 
-字符串只支持等值，范围条件不会走索引。`INT64`、`DOUBLE`、`DATETIME` 可以做范围。`NULL` 不进索引，多条 `NULL` 不算冲突。唯一索引冲突时报 `UNIQUE_VIOLATION`。`:stats` 需要先 `USE`，返回每种点、每种边的数量和最大度数。
+字符串只支持等值，范围条件不会走索引。`INT64`、`DOUBLE`、`DATETIME` 可以做范围。`NULL` 不进索引，多条 `NULL` 不算冲突。唯一索引冲突时报 `UNIQUE_VIOLATION`。`:stats` 需要先 `USE`。默认返回上次缓存的每种点、每种边数量和统计时间，不重新扫描。`:stats refresh` 才重新统计并更新缓存。
 
 ## 用户和角色
 
@@ -287,7 +287,7 @@ DROP INDEX by_name
 | `:flush` | 把内存表刷到磁盘 |
 | `:compact` | 压缩全部列族。查询可以继续按快照读 |
 | `:rebuildIndex 索引名` | 重建索引并标记为可用 |
-| `:stats` | 按类型看点数、边数和最大度数 |
+| `:stats` | 返回上次缓存的点数和边数。`:stats refresh` 重新统计 |
 | `:createUser 用户 密码 read\|write` | 建用户 |
 | `:setPassword 用户 密码` | 改密码 |
 | `:setRole 用户 read\|write` | 改角色 |
@@ -351,8 +351,10 @@ TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`
 | `block_cache_bytes` | `268435456` | RocksDB 块缓存 |
 | `duckdb_memory` | `1GB` | 排序和聚合使用的 DuckDB 内存 |
 | `duckdb_temp_directory` | `tmp/duck` | DuckDB 临时目录 |
-| ocksdb_background_jobs | 6 | RocksDB background flush/compaction jobs |
-| ocksdb_write_buffer_bytes | 134217728 | MemTable write buffer per Column Family, in bytes |
+| 
+ocksdb_background_jobs | 6 | RocksDB background flush/compaction jobs |
+| 
+ocksdb_write_buffer_bytes | 134217728 | MemTable write buffer per Column Family, in bytes |
 
 这些预算是执行策略，不是 GQL 语义。默认值为 `0`，不会因为固定的 64 条边、10 跳或 100 条路径拒绝查询；不受信任的部署可以显式设置正数。
 

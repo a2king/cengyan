@@ -88,12 +88,18 @@ class Phase7Test {
             assertTrue(db.store.indexReads() > reads);
 
             script(db, "INSERT (a {id:1})-[:holder@1 {ratio:0.1}]->(b {id:1})");
-            QueryResult stats = db.engine.admin(db.session, "stats", "", null);
+            QueryResult cached = db.engine.admin(db.session, "stats", "", null);
+            assertEquals(List.of(), cached.rows());
+            assertNull(cached.collectedAt());
+            QueryResult stats = db.engine.admin(
+                    db.session, AdminCall.simple("stats", "", "", "", "").refresh(true), null);
             assertEquals(List.of("target", "name", "count"), stats.columns());
             assertEquals(List.of("NODE", "Company", 3L), stats.rows().get(0));
             assertEquals(List.of("REL", "holder", 4L), stats.rows().get(1));
             assertNotNull(stats.collectedAt());
-            assertEquals(stats.collectedAt(), db.engine.admin(db.session, "stats", "", null).collectedAt());
+            QueryResult again = db.engine.admin(db.session, "stats", "", null);
+            assertEquals(stats.collectedAt(), again.collectedAt());
+            assertEquals(stats.rows(), again.rows());
 
             run(db, "MATCH (a:Company {id:1}) SET a.name = 'gamma'");
             vertices = db.store.verticesExamined();
@@ -101,7 +107,7 @@ class Phase7Test {
             assertEquals(List.of(1L, 1L), ids(run(db, "MATCH (a:Company)-[:holder]->(b) WHERE a.name = 'gamma' RETURN a.id")));
             assertEquals(vertices, db.store.verticesExamined());
 
-            run(db, "MATCH (a:Company {id:2}) DELETE a");
+            run(db, "MATCH (a:Company {id:2}) DETACH DELETE a");
             assertNull(db.catalog.readVertex(db.session.current().graphId(), "Company", 2L));
             vertices = db.store.verticesExamined();
             assertEquals(List.of(3L), ids(run(db, "MATCH (a:Company)-[:holder]->(b) WHERE a.capital >= 0 RETURN a.id")));

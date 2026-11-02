@@ -115,6 +115,46 @@ class PathAllTest {
     }
 
     @Test
+    void 路径上的点带上类型和属性() throws Exception {
+        try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
+            script(db,
+                    "CREATE GRAPH Company",
+                    "USE Company",
+                    "CREATE NODE TYPE Company (name STRING NULL)",
+                    "CREATE NODE TYPE Person (name STRING NULL)",
+                    "CREATE REL TYPE holder ()",
+                    "INSERT (a:Company {id:1, name:'root'})-[:holder]->(b:Person {id:2, name:'end'})");
+            QueryResult paths = run(db, """
+                    MATCH p = (a:Company {id:1})-[:holder]->{1}(b) RETURN p LIMIT 5
+                    """);
+            assertEquals(Set.of(path(1,
+                    List.of(node(1L, "Company", Map.of("name", "root")), node(2L, "Person", Map.of("name", "end"))),
+                    List.of(edge("holder", 0, 1L, 2L)))), bodies(paths, 0));
+        }
+    }
+
+    @Test
+    void 路径上的边带上属性() throws Exception {
+        try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
+            script(db,
+                    "CREATE GRAPH Company",
+                    "USE Company",
+                    "CREATE NODE TYPE Company ()",
+                    "CREATE REL TYPE holder (ratio DOUBLE NULL, note STRING NULL)",
+                    "INSERT (a:Company {id:1})-[:holder {ratio:0.5}]->(b:Company {id:2})");
+            QueryResult paths = run(db, """
+                    MATCH p = (a:Company {id:1})-[:holder]->{1}(b) RETURN p LIMIT 5
+                    """);
+            Map<String, Object> properties = new LinkedHashMap<>();
+            properties.put("ratio", 0.5d);
+            properties.put("note", null);
+            assertEquals(Set.of(path(1,
+                    List.of(node(1L), node(2L)),
+                    List.of(edge("holder", 0, 1L, 2L, properties)))), bodies(paths, 0));
+        }
+    }
+
+    @Test
     void 路径变量返回同样的对象并且终点写在模式里() throws Exception {
         try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
             script(db,
@@ -148,16 +188,14 @@ class PathAllTest {
                     path(1, List.of(node(1L), node(2L)), List.of(edge("holder", 0, 1L, 2L))),
                     path(1, List.of(node(1L), node(4L)), List.of(edge("holder", 0, 1L, 4L)))),
                     bodies(oneHop, 0));
-            CengyanException missing = assertThrows(CengyanException.class, () -> run(db, """
+            QueryResult unlimited = run(db, """
                     MATCH p = (a:Company {id:1})-[:holder]->{1,3}(b) RETURN p
-                    """));
-            assertEquals(ErrorCode.SYNTAX, missing.code());
-            assertTrue(missing.getMessage().contains("需要写 LIMIT"));
-            CengyanException tooMany = assertThrows(CengyanException.class, () -> run(db, """
+                    """);
+            assertEquals(nodeIds(outward), nodeIds(unlimited));
+            QueryResult one = run(db, """
                     MATCH p = (a:Company {id:1})-[:holder]->{1,3}(b) RETURN p LIMIT 1
-                    """));
-            assertEquals(ErrorCode.PATH_LIMIT_EXCEEDED, tooMany.code());
-            assertTrue(tooMany.getMessage().contains("超过上限 1"));
+                    """);
+            assertEquals(1, one.rows().size());
         }
     }
 
@@ -202,17 +240,29 @@ class PathAllTest {
     }
 
     private static Map<String, Object> node(Object id) {
+        return node(id, "Company", Map.of());
+    }
+
+    private static Map<String, Object> node(Object id, String type, Map<String, Object> properties) {
         Map<String, Object> node = new LinkedHashMap<>();
         node.put("id", id);
+        node.put("type", type);
+        node.put("properties", properties);
         return node;
     }
 
     private static Map<String, Object> edge(String type, long rank, Object src, Object dst) {
+        return edge(type, rank, src, dst, Map.of());
+    }
+
+    private static Map<String, Object> edge(
+            String type, long rank, Object src, Object dst, Map<String, Object> properties) {
         Map<String, Object> edge = new LinkedHashMap<>();
         edge.put("type", type);
         edge.put("rank", rank);
         edge.put("src", src);
         edge.put("dst", dst);
+        edge.put("properties", properties);
         return edge;
     }
 

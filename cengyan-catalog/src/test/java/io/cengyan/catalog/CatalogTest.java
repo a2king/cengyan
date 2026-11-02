@@ -242,8 +242,8 @@ class CatalogTest {
     @Test
     void 名字规则和默认覆盖() throws Exception {
         try (Db db = new Db()) {
-            CengyanException chinese = assertThrows(CengyanException.class, () -> db.catalog.createGraph("股东"));
-            assertEquals(ErrorCode.SYNTAX, chinese.code());
+            int chinese = db.catalog.createGraph("股东");
+            assertTrue(chinese > 0);
             assertEquals(ErrorCode.SYNTAX, assertThrows(CengyanException.class,
                     () -> db.catalog.createGraph("1company")).code());
             assertEquals(ErrorCode.SYNTAX, assertThrows(CengyanException.class,

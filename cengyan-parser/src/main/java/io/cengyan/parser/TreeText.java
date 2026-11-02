@@ -54,17 +54,28 @@ final class TreeText {
                     text.append(')');
                 }
                 if (match.skip() != null) {
-                    text.append(" (skip ").append(match.skip()).append(')');
+                    text.append(" (skip ").append(countText(match.skip())).append(')');
                 }
                 if (match.limit() != null) {
-                    text.append(" (limit ").append(match.limit()).append(')');
+                    text.append(" (limit ").append(countText(match.limit())).append(')');
                 }
                 text.append(')');
                 yield text.toString();
             }
             case Stmt.Explain explain -> "(explain " + of(explain.query()) + ")";
+            case Stmt.ExplainQuery explain -> "(explain " + of(explain.statement()) + ")";
             case Stmt.Set set -> assignment(set.source(), set.edge(), set.target(), set.where(), set.assignments(), null);
             case Stmt.Delete delete -> assignment(delete.source(), delete.edge(), delete.target(), delete.where(), null, delete.variables());
+            case Stmt.DropType drop -> "(dropType " + (drop.node() ? "node " : "rel ") + drop.name()
+                    + (drop.ifExists() ? " ifExists" : "") + ")";
+            case Stmt.Select select -> "(select " + select.clauses().size() + " " + tail(select.tail()) + ")";
+            case Stmt.Composite composite -> "(" + composite.op() + (composite.all() ? " all " : " ")
+                    + of(composite.left()) + " " + of(composite.right()) + ")";
+            case Stmt.Next next -> "(next " + of(next.left()) + " " + of(next.right()) + ")";
+            case Stmt.InsertGraph insert -> "(insertGraph " + insert.elements().size() + ")";
+            case Stmt.InsertUsing insert -> "(insertUsing " + insert.elements().size() + ")";
+            case Stmt.Mutate mutate -> "(mutate deletes=" + mutate.deletes().size()
+                    + " detach=" + mutate.detach() + ")";
             case Stmt.Call call -> {
                 StringBuilder text = new StringBuilder("(call ");
                 text.append(call.name());
@@ -162,7 +173,9 @@ final class TreeText {
         }
         if (edge.minHop() != null) {
             text.append('{').append(edge.minHop());
-            if (!edge.minHop().equals(edge.maxHop())) {
+            if (edge.maxHop() != null && edge.maxHop() < 0) {
+                text.append(",}");
+            } else if (!edge.minHop().equals(edge.maxHop())) {
                 text.append(',').append(edge.maxHop());
             }
             text.append('}');
@@ -185,7 +198,34 @@ final class TreeText {
             case Expr.Binary binary -> "(" + binary.op() + " " + expr(binary.left()) + " " + expr(binary.right()) + ")";
             case Expr.In in -> "(" + (in.negated() ? "not-in " : "in ") + expr(in.value()) + args(in.options()) + ")";
             case Expr.IsNull isNull -> "(" + (isNull.negated() ? "is-not-null " : "is-null ") + expr(isNull.value()) + ")";
+            case Expr.Member member -> "(" + (member.negated() ? "not-in " : "in ") + expr(member.value())
+                    + " " + expr(member.collection()) + ")";
+            case Expr.ListLit list -> args(list.items());
+            case Expr.MapLit map -> "map" + args(map.values());
+            case Expr.Index index -> "(" + expr(index.value()) + "[" + expr(index.start())
+                    + (index.end() == null ? "" : ":" + expr(index.end())) + "])";
+            case Expr.Cast cast -> "(cast " + expr(cast.value()) + " " + cast.type() + ")";
+            case Expr.CaseExpr item -> "(case " + (item.scrutinee() == null ? "" : expr(item.scrutinee()) + " ")
+                    + item.whens().size() + ")";
+            case Expr.Exists ignored -> "(exists)";
+            case Expr.Typed typed -> "(typed " + expr(typed.value()) + ")";
+            case Expr.Labeled labeled -> "(labeled " + expr(labeled.value()) + ")";
+            case Expr.EndpointOf endpoint -> "(endpoint " + expr(endpoint.node()) + ")";
+            case Expr.Same same -> "(same " + same.values().size() + ")";
+            case Expr.PropExists prop -> "(prop-exists " + expr(prop.value()) + ")";
         };
+    }
+
+    private static String countText(Expr expr) {
+        if (expr instanceof Expr.Literal literal && literal.value() instanceof Long number) {
+            return number.toString();
+        }
+        return expr(expr);
+    }
+
+    private static String tail(Stmt.Tail tail) {
+        return (tail.star() ? "*" : String.valueOf(tail.items().size()))
+                + (tail.limit() == null ? "" : " limit " + countText(tail.limit()));
     }
 
     private static String args(java.util.List<Expr> args) {

@@ -9,10 +9,12 @@ import io.cengyan.catalog.RelType;
 import io.cengyan.catalog.ValueType;
 import io.cengyan.parser.Stmt;
 import io.cengyan.store.Direction;
+import io.cengyan.store.EdgeRef;
 import io.cengyan.store.GraphStore;
 import io.cengyan.store.ReadSession;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -102,9 +104,9 @@ final class ProcedureExecutor {
         if (start == Catalog.MISSING_VERTEX_ID || (end != null && end == Catalog.MISSING_VERTEX_ID)) {
             return new QueryResult(columns, List.of(), 0);
         }
-        List<PathAll.Found> found;
+        List<List<Object>> rows;
         try (ReadSession session = store.read()) {
-            found = PathAll.find(
+            List<PathAll.Found> found = PathAll.find(
                     session,
                     graphId,
                     edgeTypes(graphId, args),
@@ -118,15 +120,17 @@ final class ProcedureExecutor {
                     limit,
                     null,
                     cancel);
-        }
-        Map<Integer, String> typeNames = PathValue.typeNames(catalog, graphId);
-        List<List<Object>> rows = new ArrayList<>(found.size());
-        for (PathAll.Found path : found) {
-            Map<String, Object> body = PathValue.of(catalog, graphId, typeNames, path);
-            Map<String, Object> values = Map.of(
-                    "length", (long) path.length(),
-                    "path", body);
-            rows.add(row(columns, values));
+            Map<Integer, String> typeNames = PathValue.typeNames(catalog, graphId);
+            Map<Long, Map<String, Object>> nodeCache = new HashMap<>();
+            Map<EdgeRef, Map<String, Object>> edgeCache = new HashMap<>();
+            rows = new ArrayList<>(found.size());
+            for (PathAll.Found path : found) {
+                Map<String, Object> body = PathValue.of(catalog, session, graphId, typeNames, path, nodeCache, edgeCache);
+                Map<String, Object> values = Map.of(
+                        "length", (long) path.length(),
+                        "path", body);
+                rows.add(row(columns, values));
+            }
         }
         return new QueryResult(columns, rows, 0);
     }
@@ -211,6 +215,22 @@ final class ProcedureExecutor {
     private static Map<String, Object> arguments(Stmt.Call call, Map<String, Object> params) {
         ExprEval eval = new ExprEval(params, false);
         Map<String, Object> values = new LinkedHashMap<>();
+        if (!call.args().isEmpty() && call.args().get(0).name().isEmpty()) {
+            List<String> order = switch (call.name()) {
+                case "path.shortest" -> List.of("start", "end", "rel", "hops");
+                case "path.all" -> List.of("start", "end", "rel", "min", "max", "direction", "limit");
+                case "subgraph.bounded" -> List.of("start", "rel", "hops");
+                case "ownership.largest_holder" -> List.of("start", "rel", "ratioProp", "hops");
+                default -> throw new CengyanException(ErrorCode.SYNTAX, "未知过程 " + call.name());
+            };
+            if (call.args().size() > order.size()) {
+                throw new CengyanException(ErrorCode.SYNTAX, "参数个数不对");
+            }
+            for (int i = 0; i < call.args().size(); i++) {
+                values.put(order.get(i), eval.eval(call.args().get(i).value()));
+            }
+            return values;
+        }
         for (Stmt.Arg arg : call.args()) {
             values.put(arg.name(), eval.eval(arg.value()));
         }

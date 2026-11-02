@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -391,14 +392,12 @@ class QueryEngineTest {
             assertEquals(1, deleted.rowsAffected());
             assertEquals(null, db.catalog.readRel(graphId, "holder", 0L, 1L, 2L));
             assertEquals(0.2d, db.catalog.readRel(graphId, "holder", 0L, 1L, 3L).get("ratio"));
-            QueryResult removed = run(db, "MATCH (a:Company {id:1}) DELETE a");
+            QueryResult removed = run(db, "MATCH (a:Company {id:1}) DETACH DELETE a");
             assertEquals(1, removed.rowsAffected());
             assertEquals(null, db.catalog.readVertex(graphId, "Company", 1L));
             assertEquals(null, db.catalog.readRel(graphId, "holder", 0L, 1L, 3L));
-            CengyanException multi = assertThrows(CengyanException.class, () -> run(db,
-                    "MATCH (a:Company {id:1})-[:holder]->{1,2}(b) DELETE b"));
-            assertEquals(ErrorCode.SYNTAX, multi.code());
-            assertTrue(multi.getMessage().contains("一跳"));
+            QueryResult multi = run(db, "MATCH (a:Company {id:1})-[:holder]->{1,2}(b) DELETE b");
+            assertEquals(0, multi.rowsAffected());
         }
     }
 
@@ -446,10 +445,9 @@ class QueryEngineTest {
                     "MATCH (a:Company {id:1})-[e:holder]->(b) WHERE b.id = 9 RETURN count(*) AS n, sum(e.ratio) AS total");
             assertEquals(0L, empty.rows().get(0).get(0));
             assertEquals(null, empty.rows().get(0).get(1));
-            CengyanException mixed = assertThrows(CengyanException.class, () -> run(db,
-                    "MATCH (a:Company {id:1})-[e:holder]->(b) RETURN count(*), b.id"));
-            assertEquals(ErrorCode.SYNTAX, mixed.code());
-            assertTrue(mixed.getMessage().contains("聚合"));
+            QueryResult grouped = run(db,
+                    "MATCH (a:Company {id:1})-[e:holder]->(b) RETURN count(*) AS n, b.id AS id");
+            assertEquals(Set.of(List.of(2L, 2L), List.of(1L, 3L)), new java.util.HashSet<>(grouped.rows()));
         }
     }
 
