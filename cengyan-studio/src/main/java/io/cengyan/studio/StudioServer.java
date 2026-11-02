@@ -180,6 +180,9 @@ public final class StudioServer implements AutoCloseable {
         if (replicas != null && replicas.isNumber()) {
             request.put("replicas", replicas.asInt());
         }
+        if (body.path("refresh").asBoolean(false)) {
+            request.put("refresh", true);
+        }
         int cap = command.equals("rebuildIndex") || command.equals("addReplica")
                 ? REBUILD_TIMEOUT_MS : STATS_TIMEOUT_MS;
         int timeoutMs = clampTimeout(body, cap, cap);

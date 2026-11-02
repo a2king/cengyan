@@ -52,16 +52,13 @@ import {
   RefreshCw,
   Search,
   Server,
-  Settings2,
   Table2,
   Trash2,
   Workflow,
   X,
 } from 'lucide-react';
-import { Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow, applyNodeChanges } from '@xyflow/react';
-import type { Edge, Node, NodeChange, NodeProps } from '@xyflow/react';
 import { CengyanApi, escapeIdent, graphFromRows, rowsAsObjects, storage } from './api';
-import { splitGqlScript } from './statements';
+import { QueryGraph } from './QueryGraph';
 import type { GraphSpace, IndexRow, QueryResponse, SessionInfo, StatsRow, TypeProperty, TypeRow } from './types';
 
 const { Header, Sider, Content } = Layout;
@@ -73,7 +70,6 @@ const NODE_ID_TYPES = [
   { value: 'STRING', label: 'STRING（字符串）' },
 ];
 const DEFAULT_QUERY = "MATCH (a:Person)-[e:knows]->(b) RETURN a, e, b";
-const QUERY_HISTORY_KEY = 'cengyan.studio.query-history';
 // Keep the Studio interaction limits explicit for the table and graph result views.
 const MAX_TABLE_ROWS = 200;
 const MAX_GRAPH_NODES = 200;
@@ -150,7 +146,7 @@ export function App() {
     } catch (error) {
       const messageText = error instanceof Error ? error.message : '无法读取图空间';
       setBootError(messageText);
-      if (messageText.includes('FORBIDDEN') || messageText.includes('会话')) {
+      if (messageText.includes('FORBIDDEN') || messageText.includes('请先登录')) {
         handleLogout();
       }
     } finally {
@@ -686,11 +682,14 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
   const [storageAt, setStorageAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const load = useCallback(async () => {
+  const load = useCallback(async (refresh: boolean) => {
     setLoading(true);
     setError('');
     try {
-      const [stats, storageResult] = await Promise.all([api.admin('stats'), api.admin('storage').catch(() => null)]);
+      const [stats, storageResult] = await Promise.all([
+        api.admin('stats', '', undefined, refresh),
+        api.admin('storage').catch(() => null),
+      ]);
       setRows(rowsAsObjects<StatsRow>(stats));
       setCountedAt(typeof stats.collectedAt === 'number' ? stats.collectedAt : null);
       const bytes = Number(storageResult?.rows?.[0]?.[0]);
@@ -702,10 +701,11 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
       setLoading(false);
     }
   }, [api]);
-  useEffect(() => { void load(); }, [load, graph]);
+  useEffect(() => { void load(false); }, [load, graph]);
   const nodeCount = rows.filter((row) => row.target === 'NODE').reduce((sum, row) => sum + Number(row.count), 0);
   const edgeCount = rows.filter((row) => row.target === 'REL').reduce((sum, row) => sum + Number(row.count), 0);
-  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>统计信息</Title><Text type="secondary">{graph} 按类型统计。{countedAt == null ? '' : freshnessText('数量', countedAt)}</Text></div><Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}<Row gutter={[16, 16]}><Col xs={24} md={12}><Card className="metric-card"><Statistic title="节点数量" value={nodeCount} prefix={<Boxes size={18} />} /></Card></Col><Col xs={24} md={12}><Card className="metric-card"><Statistic title="边数量" value={edgeCount} prefix={<GitBranch size={18} />} /></Card></Col></Row><Card className="storage-card"><div className="storage-icon"><Database size={19} /></div><div><Text strong>存储占用</Text><Text type="secondary">{storageAt == null ? '当前数据库目录中 RocksDB 文件的实际占用。' : freshnessText('大小', storageAt)}</Text></div><Tag color="blue">{storageBytes == null ? '读取中' : formatBytes(storageBytes)}</Tag></Card>{rows.length ? <Table rowKey={(row) => `${row.target}-${row.name}`} loading={loading} columns={[{ title: '对象', dataIndex: 'target', render: (value: string) => <Tag>{value}</Tag> }, { title: '类型', dataIndex: 'name' }, { title: '数量', dataIndex: 'count' }]} dataSource={rows} pagination={false} /> : <Empty description="暂无统计信息" />}</div>;
+  const countValue = countedAt == null ? '—' : undefined;
+  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>统计信息</Title><Text type="secondary">{graph} 按类型统计。打开页面只读取上次缓存。</Text><div className="stats-cache-time"><Text type="secondary">缓存记录时间：{loading && countedAt == null ? '读取中' : countedAt == null ? '尚未统计' : formatCollectedAt(countedAt)}</Text></div></div><Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load(true)} loading={loading}>刷新</Button></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}<Row gutter={[16, 16]}><Col xs={24} md={12}><Card className="metric-card"><Statistic title="节点数量" value={countValue ?? nodeCount} prefix={<Boxes size={18} />} /></Card></Col><Col xs={24} md={12}><Card className="metric-card"><Statistic title="边数量" value={countValue ?? edgeCount} prefix={<GitBranch size={18} />} /></Card></Col></Row><Card className="storage-card"><div className="storage-icon"><Database size={19} /></div><div><Text strong>存储占用</Text><Text type="secondary">{storageAt == null ? '当前数据库目录中 RocksDB 文件的实际占用。' : freshnessText('大小', storageAt)}</Text></div><Tag color="blue">{storageBytes == null ? (loading ? '读取中' : '未能读取') : formatBytes(storageBytes)}</Tag></Card>{rows.length ? <Table rowKey={(row) => `${row.target}-${row.name}`} loading={loading} columns={[{ title: '对象', dataIndex: 'target', render: (value: string) => <Tag>{value}</Tag> }, { title: '类型', dataIndex: 'name' }, { title: '数量', dataIndex: 'count' }]} dataSource={rows} pagination={false} /> : <Empty description={countedAt == null ? '还没有统计缓存，点击刷新开始统计' : '暂无统计信息'} />}</div>;
 }
 
 function freshnessText(kind: string, collectedAt: number): string {
@@ -715,7 +715,7 @@ function freshnessText(kind: string, collectedAt: number): string {
 function formatCollectedAt(millis: number): string {
   const date = new Date(millis);
   const pad = (value: number) => String(value).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function formatBytes(bytes: number): string {
@@ -736,29 +736,47 @@ function formatElapsed(ms: number) {
   return `${Math.round(safe)} ms`;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
 function RunningQueries({ api }: { api: CengyanApi }) {
   const { message: messageApi, modal } = AntApp.useApp();
   const [rows, setRows] = useState<RunningRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [killing, setKilling] = useState('');
+  const [stoppingIds, setStoppingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const stoppingRef = useRef(new Set<string>());
   const alive = useRef(true);
 
-  const load = useCallback(async (quiet: boolean) => {
+  const rememberStopping = (queryId: string, active: boolean) => {
+    const next = new Set(stoppingRef.current);
+    if (active) next.add(queryId);
+    else next.delete(queryId);
+    stoppingRef.current = next;
+    setStoppingIds(next);
+  };
+
+  const load = useCallback(async (quiet: boolean): Promise<RunningRow[] | null> => {
     if (!quiet) setLoading(true);
     try {
       const response = await api.queries();
-      if (!alive.current) return;
-      setRows(rowsAsObjects<RunningRow>(response).map((row) => ({
+      if (!alive.current) return null;
+      const next = rowsAsObjects<RunningRow>(response).map((row) => ({
         queryId: String(row.queryId ?? ''),
         user: String(row.user ?? ''),
         elapsedMs: Number(row.elapsedMs ?? 0),
         query: String(row.query ?? ''),
-      })));
+      }));
+      setRows(next);
       setError('');
+      return next;
     } catch (reason) {
-      if (!alive.current) return;
+      if (!alive.current) return null;
       setError(reason instanceof Error ? reason.message : '读取正在执行的查询失败');
+      return null;
     } finally {
       if (alive.current && !quiet) setLoading(false);
     }
@@ -774,24 +792,48 @@ function RunningQueries({ api }: { api: CengyanApi }) {
     };
   }, [load]);
 
+  const beginKill = (queryId: string) => {
+    if (stoppingRef.current.has(queryId)) return;
+    rememberStopping(queryId, true);
+    void (async () => {
+      try {
+        await api.cancelQuery(queryId);
+      } catch (reason) {
+        if (!alive.current) return;
+        const listed = await load(true);
+        if (!alive.current) return;
+        rememberStopping(queryId, false);
+        if (listed && !listed.some((item) => item.queryId === queryId)) {
+          messageApi.success('已终止');
+          return;
+        }
+        messageApi.error(reason instanceof Error ? reason.message : '终止失败');
+        return;
+      }
+      while (alive.current && stoppingRef.current.has(queryId)) {
+        await sleep(1000);
+        if (!alive.current || !stoppingRef.current.has(queryId)) return;
+        const listed = await load(true);
+        if (!alive.current || !stoppingRef.current.has(queryId)) return;
+        if (listed && !listed.some((item) => item.queryId === queryId)) {
+          rememberStopping(queryId, false);
+          messageApi.success('已终止');
+          return;
+        }
+      }
+    })();
+  };
+
   const kill = (row: RunningRow) => {
+    if (stoppingRef.current.has(row.queryId)) return;
     modal.confirm({
       title: '终止这条查询',
       content: `${row.user || '该用户'} 正在执行的语句会被取消。`,
       okText: '终止',
       okButtonProps: { danger: true },
       cancelText: '取消',
-      onOk: async () => {
-        setKilling(row.queryId);
-        try {
-          await api.cancelQuery(row.queryId);
-          messageApi.success('已终止');
-          await load(true);
-        } catch (reason) {
-          messageApi.error(reason instanceof Error ? reason.message : '终止失败');
-        } finally {
-          setKilling('');
-        }
+      onOk: () => {
+        beginKill(row.queryId);
       },
     });
   };
@@ -819,10 +861,23 @@ function RunningQueries({ api }: { api: CengyanApi }) {
             { title: 'GQL', dataIndex: 'query', render: (query: string) => <pre className="running-gql">{query}</pre> },
             {
               title: '操作',
-              width: 110,
-              render: (_value: unknown, row: RunningRow) => (
-                <Button danger size="small" loading={killing === row.queryId} onClick={() => kill(row)}>终止</Button>
-              ),
+              width: 168,
+              render: (_value: unknown, row: RunningRow) => {
+                const stopping = stoppingIds.has(row.queryId);
+                return (
+                  <Button
+                    danger
+                    size="small"
+                    className={stopping ? 'kill-stopping' : undefined}
+                    disabled={stopping}
+                    aria-busy={stopping}
+                    icon={stopping ? <RefreshCw size={13} className="kill-spin" /> : undefined}
+                    onClick={() => kill(row)}
+                  >
+                    {stopping ? '执行终止中' : '终止'}
+                  </Button>
+                );
+              },
             },
           ]}
         />
@@ -834,42 +889,43 @@ function RunningQueries({ api }: { api: CengyanApi }) {
 type ScriptResult = { statement: string; response: QueryResponse; elapsedMs: number };
 
 function GqlPage({ api, graph, canWrite, active, onGraphChanged }: { api: CengyanApi; graph: string; canWrite: boolean; active: boolean; onGraphChanged: (name: string) => void }) {
+  const { notification: notificationApi } = AntApp.useApp();
   const [query, setQuery] = useState(() => localStorage.getItem('cengyan.studio.last-query') || DEFAULT_QUERY);
   const [result, setResult] = useState<ScriptResult[] | null>(null);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState('');
-  const [error, setError] = useState('');
   const [editorReady, setEditorReady] = useState(false);
-  const [history, setHistory] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem(QUERY_HISTORY_KEY) || '[]'); } catch { return []; } });
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const runQueryRef = useRef<() => void>(() => {});
+  const reportQueryError = (text: string) => {
+    notificationApi.error({
+      title: '查询失败',
+      description: text,
+      placement: 'topRight',
+      duration: false,
+      closable: true,
+    });
+  };
   const runQuery = async () => {
     const text = editorRef.current?.getValue() ?? query;
-    if (!graph) { setError('请先在右上角选择图空间'); return; }
-    let statements: string[];
-    try { statements = splitGqlScript(text); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '语句无法拆分'); return; }
-    if (!statements.length) { setError('GQL 语句不能为空'); return; }
-    setRunning(true); setError('');
+    if (!graph) { reportQueryError('请先在右上角选择图空间'); return; }
+    const statements = [text.trim()];
+    if (!statements[0]) { reportQueryError('GQL 语句不能为空'); return; }
+    setRunning(true);
     const done: ScriptResult[] = [];
     try {
-      for (let index = 0; index < statements.length; index++) {
-        setProgress(statements.length > 1 ? `正在执行第 ${index + 1} / ${statements.length} 条` : '');
-        const startedAt = performance.now();
-        const response = await api.query(statements[index], 30000);
-        done.push({ statement: statements[index], response, elapsedMs: Math.round(performance.now() - startedAt) });
-        setResult([...done]);
-        const useMatch = statements[index].trim().match(/^USE\s+([A-Za-z][A-Za-z0-9_]*)\s*;?$/i);
-        if (useMatch) onGraphChanged(useMatch[1]);
-      }
+      setProgress(text.includes(';') ? '正在执行脚本，返回最后一条语句的结果' : '');
+      const startedAt = performance.now();
+      const response = await api.query(text, 30000);
+      done.push({ statement: text.trim(), response, elapsedMs: Math.round(performance.now() - startedAt) });
+      setResult([...done]);
+      const uses = [...text.matchAll(/\bUSE\s+([A-Za-z][A-Za-z0-9_]*)/gi)];
+      if (uses.length) onGraphChanged(uses[uses.length - 1][1]);
       localStorage.setItem('cengyan.studio.last-query', text);
-      const next = [text.trim(), ...history.filter((item) => item !== text.trim())].slice(0, 12);
-      setHistory(next);
-      localStorage.setItem(QUERY_HISTORY_KEY, JSON.stringify(next));
     } catch (reason) {
       if (done.length) setResult([...done]);
       const message = reason instanceof Error ? reason.message : '查询失败';
-      setError(statements.length > 1 ? `第 ${done.length + 1} 条执行失败：${message}` : message);
+      reportQueryError(message);
     } finally {
       setRunning(false);
       setProgress('');
@@ -879,16 +935,16 @@ function GqlPage({ api, graph, canWrite, active, onGraphChanged }: { api: Cengya
   const editorMount: OnMount = (editor) => { editorRef.current = editor; editor.addCommand(2048 | 3, () => { runQueryRef.current(); }); };
   useEffect(() => { let live = true; void import('./monaco').then(() => { if (live) setEditorReady(true); }); return () => { live = false; }; }, []);
   useEffect(() => { if (active) editorRef.current?.layout(); }, [active]);
-  return <div className="query-page"><Row gutter={[18, 18]}><Col xs={24} xl={15}><Card className="editor-card" bordered={false}><div className="editor-toolbar"><div className="editor-file"><Tag color="geekblue">GQL</Tag></div><Button type="text" size="small" icon={<Trash2 size={14} />} onClick={() => { setQuery(''); editorRef.current?.setValue(''); }}>清空</Button></div>{editorReady ? <Editor height="350px" language="sql" theme="vs" value={query} onChange={(value) => setQuery(value || '')} onMount={editorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineNumbers: 'on', padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false, wordWrap: 'on', roundedSelection: false, automaticLayout: true, tabSize: 2 }} /> : <div className="editor-pending">正在打开编辑器…</div>}<div className="editor-footer"><Text type="secondary">{progress || '多行输入，分号分隔后按顺序执行 · Ctrl + Enter'}</Text><Space size={8}>{canWrite && <Tag color="green">读写权限</Tag>}<Button type="primary" icon={<Code2 size={15} />} onClick={() => void runQuery()} loading={running} disabled={!graph}>执行查询 <Text className="shortcut">Ctrl ↵</Text></Button></Space></div></Card>{(result || running) && <ScriptResults results={result || []} loading={running} />}{error && <Alert className="query-error" type="error" showIcon message={error} closable onClose={() => setError('')} />}</Col><Col xs={24} xl={9}><Card className="history-card" bordered={false} title={<span className="card-title"><Activity size={16} />查询历史</span>} extra={<Button type="text" size="small" onClick={() => { setHistory([]); localStorage.removeItem(QUERY_HISTORY_KEY); }}>清空</Button>}>{history.length ? <div className="history-list">{history.map((item, index) => <button key={`${item}-${index}`} type="button" onClick={() => setQuery(item)}><span>{item}</span><ChevronRight size={15} /></button>)}</div> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="执行过的查询会显示在这里" />}</Card><Card className="tips-card" bordered={false}><div className="tips-title"><Settings2 size={16} />常用提示</div><div className="tip-item"><span>表格结果</span><Text type="secondary">适合查看属性和聚合数据</Text></div><div className="tip-item"><span>关系图</span><Text type="secondary">RETURN 完整点或边对象</Text></div><div className="tip-item"><span>性能</span><Text type="secondary">每条语句最长运行 30 秒</Text></div></Card></Col></Row></div>;
+  return <div className="query-page"><Row gutter={[18, 18]}><Col span={24}><Card className="editor-card" bordered={false}><div className="editor-toolbar"><div className="editor-file"><Tag color="geekblue">GQL</Tag></div><Button type="text" size="small" icon={<Trash2 size={14} />} onClick={() => { setQuery(''); editorRef.current?.setValue(''); }}>清空</Button></div>{editorReady ? <Editor height="350px" language="gql" theme="vs" value={query} onChange={(value) => setQuery(value || '')} onMount={editorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineNumbers: 'on', padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false, wordWrap: 'on', roundedSelection: false, automaticLayout: true, tabSize: 2 }} /> : <div className="editor-pending">正在打开编辑器…</div>}<div className="editor-footer"><Text type="secondary">{progress || '多条语句用分号分隔，服务端顺序执行并返回最后一条 · Ctrl + Enter'}</Text><Space size={8}>{canWrite && <Tag color="green">读写权限</Tag>}<Button type="primary" icon={<Code2 size={15} />} onClick={() => void runQuery()} loading={running} disabled={!graph}>执行查询 <Text className="shortcut">Ctrl ↵</Text></Button></Space></div></Card>{(result || running) && <ScriptResults api={api} results={result || []} loading={running} />}</Col></Row></div>;
 }
 
-function ScriptResults({ results, loading }: { results: ScriptResult[]; loading: boolean }) {
+function ScriptResults({ api, results, loading }: { api: CengyanApi; results: ScriptResult[]; loading: boolean }) {
   if (!results.length) return <Card className="result-card result-loading-card" bordered={false}><Spin size="small" /><Text type="secondary">正在执行查询…</Text></Card>;
-  if (results.length === 1) return <QueryResult response={results[0].response} elapsedMs={results[0].elapsedMs} loading={loading} />;
-  return <>{results.map((item, index) => <div className="script-result" key={`${index}-${item.statement}`}><div className="script-result-label"><Text type="secondary">第 {index + 1} 条 · {item.elapsedMs} ms</Text><pre>{item.statement}</pre></div><QueryResult response={item.response} elapsedMs={item.elapsedMs} loading={loading && index === results.length - 1} /></div>)}</>;
+  if (results.length === 1) return <QueryResult api={api} response={results[0].response} elapsedMs={results[0].elapsedMs} loading={loading} />;
+  return <>{results.map((item, index) => <div className="script-result" key={`${index}-${item.statement}`}><div className="script-result-label"><Text type="secondary">第 {index + 1} 条 · {item.elapsedMs} ms</Text><pre>{item.statement}</pre></div><QueryResult api={api} response={item.response} elapsedMs={item.elapsedMs} loading={loading && index === results.length - 1} /></div>)}</>;
 }
 
-function QueryResult({ response, elapsedMs, loading }: { response: QueryResponse; elapsedMs: number; loading?: boolean }) {
+function QueryResult({ api, response, elapsedMs, loading }: { api: CengyanApi; response: QueryResponse; elapsedMs: number; loading?: boolean }) {
   const columns = response.columns || [];
   const rows = response.rows || [];
   const [view, setView] = useState('table');
@@ -896,25 +952,10 @@ function QueryResult({ response, elapsedMs, loading }: { response: QueryResponse
   const tableColumns: TableProps<Record<string, unknown>>['columns'] = columns.map((column, index) => ({ title: column, dataIndex: column, key: column, render: (value: unknown) => <JsonValue value={value} /> }));
   const data = rows.map((row, rowIndex) => Object.fromEntries(columns.map((column, index) => [column, row[index]]).concat([['key', rowIndex]])));
   const tabs: TabsProps['items'] = [
-    { key: 'table', label: '表格', children: <Table size="small" scroll={{ x: 650, y: 380 }} columns={tableColumns} dataSource={data} pagination={{ pageSize: 10, showSizeChanger: false }} /> },
-    { key: 'graph', label: '关系图', children: view === 'graph' ? <QueryGraph rows={rows} /> : null },
+    { key: 'table', label: '表格', children: <Table size="small" scroll={{ x: 650 }} columns={tableColumns} dataSource={data} pagination={{ pageSize: 10, showSizeChanger: false }} /> },
+    { key: 'graph', label: '关系图', children: view === 'graph' ? <QueryGraph api={api} rows={rows} /> : null },
   ];
   return <Card className="result-card" bordered={false}><div className="result-heading"><div><Title level={4}>查询结果</Title><Text type="secondary">{loading && <Spin size="small" />} {columns.length ? `${rows.length} 行 · ${elapsedMs} ms` : `完成，影响 ${response.rowsAffected || 0} 行 · ${elapsedMs} ms`}</Text></div></div>{columns.length ? <Tabs className="result-tabs" activeKey={view} onChange={setView} destroyOnHidden items={tabs} /> : <div className="success-result"><Check size={20} /><span>语句执行成功</span></div>}</Card>;
-}
-
-function QueryGraph({ rows }: { rows: unknown[][] }) {
-  const graph = useMemo(() => buildGraph(rows), [rows]);
-  const [nodes, setNodes] = useState<Node[]>(graph.nodes);
-  const [edges, setEdges] = useState<Edge[]>(graph.edges);
-  useEffect(() => {
-    setNodes(graph.nodes);
-    setEdges(graph.edges);
-  }, [graph]);
-  const onNodesChange = useCallback((changes: NodeChange[]) => {
-    setNodes((current) => applyNodeChanges(changes, current));
-  }, []);
-  if (!graph.nodes.length) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前结果里没有点或边" />;
-  return <div className="graph-result"><div className="graph-result-title"><Text type="secondary">可拖动点查看关系</Text><Tag color="purple" icon={<Workflow size={13} />}>{graph.nodes.length} 点 · {graph.edges.length} 边</Tag></div><div className="flow-wrap"><ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} nodeTypes={GRAPH_NODE_TYPES} fitView fitViewOptions={{ padding: 0.2 }} nodesDraggable nodesConnectable={false} elementsSelectable><MiniMap pannable zoomable /><Controls /><Background color="#d7dbea" gap={18} /></ReactFlow></div></div>;
 }
 
 function JsonValue({ value }: { value: unknown }) {
@@ -934,66 +975,3 @@ function ValueDetail({ value }: { value: unknown }) {
     </Modal>
   </>;
 }
-
-const GRAPH_NODE_TYPES = { vertex: VertexNode };
-
-function VertexNode({ data }: NodeProps) {
-  const nodeType = typeof data.nodeType === 'string' ? data.nodeType : '';
-  const label = typeof data.label === 'string' ? data.label : '';
-  return (
-    <div className="flow-node">
-      <Handle type="target" position={Position.Left} />
-      {nodeType ? <span className="flow-node-type">{nodeType}</span> : null}
-      <span className="flow-node-id">{label}</span>
-      <Handle type="source" position={Position.Right} />
-    </div>
-  );
-}
-
-function buildGraph(rows: unknown[][]): { nodes: Node[]; edges: Edge[] } {
-  const nodes = new Map<string, Node>();
-  const edges: Edge[] = [];
-  const seenEdges = new Set<string>();
-  const addNode = (id: string, nodeType: string) => {
-    const typeName = nodeType.trim();
-    const existing = nodes.get(id);
-    if (existing) {
-      const current = existing.data as { nodeType?: string };
-      if (!current.nodeType && typeName) existing.data = { ...existing.data, nodeType: typeName };
-      return;
-    }
-    nodes.set(id, {
-      id,
-      type: 'vertex',
-      draggable: true,
-      data: { label: id, nodeType: typeName },
-      position: { x: 0, y: 0 },
-      style: { borderRadius: 12, border: '1px solid #c8d0f2', background: '#f6f7ff', color: '#33407d', padding: '8px 12px', boxShadow: '0 6px 14px rgba(82,104,232,.10)' },
-    });
-  };
-  rows.forEach((row) => row.forEach((cell) => {
-    if (!cell || typeof cell !== 'object' || Array.isArray(cell)) return;
-    const item = cell as Record<string, unknown>;
-    if (item.src !== undefined && item.dst !== undefined && item.type) {
-      const source = String(item.src);
-      const target = String(item.dst);
-      addNode(source, String(item.srcType ?? ''));
-      addNode(target, String(item.dstType ?? ''));
-      const id = `${item.type}-${item.rank ?? 0}-${source}-${target}`;
-      if (!seenEdges.has(id)) {
-        seenEdges.add(id);
-        edges.push({ id, source, target, label: String(item.type), animated: false, markerEnd: { type: MarkerType.ArrowClosed, width: 18, height: 18, color: '#5c6bc4' }, style: { stroke: '#5c6bc4', strokeWidth: 1.6 }, labelStyle: { fill: '#6570bb', fontSize: 11 }, labelBgStyle: { fill: '#ffffff', fillOpacity: .85 } });
-      }
-      return;
-    }
-    if (item.id !== undefined && item.type) addNode(String(item.id), String(item.type));
-  }));
-  const list = [...nodes.values()];
-  const radius = Math.max(120, list.length * 22);
-  list.forEach((node, index) => {
-    const angle = index / Math.max(1, list.length) * Math.PI * 2;
-    node.position = { x: Math.cos(angle) * radius + 260, y: Math.sin(angle) * Math.min(150, radius * .6) + 170 };
-  });
-  return { nodes: list, edges };
-}
-

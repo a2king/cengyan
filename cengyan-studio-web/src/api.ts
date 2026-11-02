@@ -66,8 +66,13 @@ export class CengyanApi {
     return this.request('/api/cancel', { queryId });
   }
 
-  async admin(command: string, index = '', timeoutMs?: number): Promise<QueryResponse> {
-    return this.request('/api/admin', { command, index, ...(timeoutMs ? { timeoutMs } : {}) });
+  async admin(command: string, index = '', timeoutMs?: number, refresh = false): Promise<QueryResponse> {
+    return this.request('/api/admin', {
+      command,
+      index,
+      ...(timeoutMs ? { timeoutMs } : {}),
+      ...(refresh ? { refresh: true } : {}),
+    });
   }
 
   async showMembers(graph: string): Promise<QueryResponse> {
