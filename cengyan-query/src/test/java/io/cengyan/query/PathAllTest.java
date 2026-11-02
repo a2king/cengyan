@@ -115,6 +115,30 @@ class PathAllTest {
     }
 
     @Test
+    void 变长路径的Where起点Id会下推为起点查找() throws Exception {
+        try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
+            script(db,
+                    "CREATE GRAPH corp_where_id",
+                    "USE corp_where_id",
+                    "CREATE NODE TYPE org ID STRING(64) ()",
+                    "CREATE REL TYPE inv ()",
+                    "INSERT (a:org {id:'q9ca43a26418c11ee99d200163e0ee983'})-[:inv]->(b:org {id:'n2'})",
+                    "INSERT (a:org {id:'n2'})-[:inv]->(b:org {id:'n3'})",
+                    "INSERT (a:org {id:'n3'})-[:inv]->(b:org {id:'n4'})");
+            QueryResult inWhere = run(db, """
+                    MATCH p=(a:org)-[:inv]->{1,3}(b)
+                    WHERE id(a)='q9ca43a26418c11ee99d200163e0ee983'
+                    RETURN p
+                    """);
+            QueryResult inPattern = run(db, """
+                    MATCH p=(a:org {id:'q9ca43a26418c11ee99d200163e0ee983'})-[:inv]->{1,3}(b)
+                    RETURN p
+                    """);
+            assertEquals(nodeIds(inPattern), nodeIds(inWhere));
+        }
+    }
+
+    @Test
     void 路径上的点带上类型和属性() throws Exception {
         try (QueryEngineTest.Db db = new QueryEngineTest.Db()) {
             script(db,
@@ -168,10 +192,16 @@ class PathAllTest {
             QueryResult outward = run(db, """
                     MATCH p = (a:Company {id:1})-[:holder]->{1,3}(b) RETURN p LIMIT 20
                     """);
+            QueryResult whereId = run(db, """
+                    MATCH p = (a:Company)-[:holder]->{1,3}(b)
+                    WHERE id(a) = 1
+                    RETURN p LIMIT 20
+                    """);
             assertEquals(Set.of(
                     List.of(1L, 2L),
                     List.of(1L, 2L, 4L),
                     List.of(1L, 4L)), nodeIds(outward));
+            assertEquals(nodeIds(outward), nodeIds(whereId));
             QueryResult between = run(db, """
                     MATCH p = (a:Company {id:1})-[:holder]->{1,3}(b:Company {id:4}) RETURN p LIMIT 20
                     """);

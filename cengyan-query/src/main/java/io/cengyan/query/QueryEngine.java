@@ -93,7 +93,27 @@ public final class QueryEngine {
         if (limits == null) {
             throw new IllegalArgumentException("查询上限不能为空");
         }
-        synchronized (session) {
+        long startedNanos = System.nanoTime();
+        try (QueryMemory.Scope ignored = QueryMemory.open(limits.queryMemoryBytes())) {
+            boolean exclusive = requiresExclusiveSession(gql);
+            QueryResult result = exclusive
+                    ? session.withWriteLock(() -> executeLocked(session, gql, params, limits, cancel))
+                    : session.withReadLock(() -> executeLocked(session, gql, params, limits, cancel));
+            return withElapsed(result, startedNanos);
+        }
+    }
+
+    private static QueryResult withElapsed(QueryResult result, long startedNanos) {
+        return new QueryResult(result.columns(), result.rows(), result.rowsAffected(), result.collectedAt(),
+                Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L));
+    }
+
+    private QueryResult executeLocked(
+            SessionState session,
+            String gql,
+            Map<String, Object> params,
+            QueryLimits limits,
+            CancelToken cancel) {
             int computeNode = bindCompute(session);
             try {
             List<Stmt> statements;
@@ -119,7 +139,17 @@ public final class QueryEngine {
                     membership.leave(computeNode);
                 }
             }
+    }
+
+    public static boolean requiresExclusiveSession(String gql) {
+        List<Stmt> statements;
+        try {
+            statements = Gql.parseAll(gql);
+        } catch (ParseException ex) {
+            // 解析错误仍然需要进入独占路径，避免并发修改状态时产生不一致的诊断行为。
+            return true;
         }
+        return statements.stream().anyMatch(stmt -> stmt instanceof Stmt.Use || writes(stmt));
     }
 
     private QueryResult executeOne(
@@ -229,10 +259,23 @@ public final class QueryEngine {
             boolean ignoreExisting,
             boolean skipMissing,
             CancelToken cancel) {
+        return bulkInsert(session, kind, typeName, rows, ignoreExisting, skipMissing, cancel, 0L);
+    }
+
+    public QueryResult bulkInsert(
+            SessionState session,
+            String kind,
+            String typeName,
+            List<Map<String, Object>> rows,
+            boolean ignoreExisting,
+            boolean skipMissing,
+            CancelToken cancel,
+            long queryMemoryBytes) {
         if (session == null || rows == null || kind == null || typeName == null) {
             throw new IllegalArgumentException("批量导入参数不能为空");
         }
-        synchronized (session) {
+        try (QueryMemory.Scope ignored = QueryMemory.open(queryMemoryBytes)) {
+            return session.withWriteLock(() -> {
             if (session.readOnly()) {
                 throw new CengyanException(ErrorCode.FORBIDDEN, "只读会话不能修改数据");
             }
@@ -307,6 +350,7 @@ public final class QueryEngine {
                 return QueryResult.changed(written);
             }
             throw new CengyanException(ErrorCode.SYNTAX, "bulkInsert 的 kind 只能是 node 或 edge");
+            });
         }
     }
 
@@ -396,7 +440,7 @@ public final class QueryEngine {
         if (auth == null) {
             throw new CengyanException(ErrorCode.INTERNAL, "还没有打开用户管理");
         }
-        synchronized (session) {
+        return session.withWriteLock(() -> {
             Auth.User found = auth.authenticate(user, password);
             if (found == null) {
                 throw new CengyanException(ErrorCode.FORBIDDEN, "用户或密码不正确");
@@ -404,7 +448,7 @@ public final class QueryEngine {
             session.bind(found.name(), found.role());
             String roleName = found.role() == Auth.ROLE_READ ? "read" : "write";
             return new QueryResult(List.of("user", "role"), List.of(List.of(found.name(), roleName)), 0);
-        }
+        });
     }
 
     public QueryResult admin(SessionState session, String command, String index, CancelToken cancel) {
@@ -440,7 +484,7 @@ public final class QueryEngine {
         if ("stats".equals(command) || "storage".equals(command)) {
             return backgroundRead(session, call, cancel);
         }
-        synchronized (session) {
+        return session.withWriteLock(() -> {
             if (cancel != null && cancel.cancelled()) {
                 throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
             }
@@ -548,20 +592,17 @@ public final class QueryEngine {
                 case "showMembers" -> showMembers(session, call.graph());
                 default -> throw new CengyanException(ErrorCode.SYNTAX, "无法识别的管理命令");
             };
-        }
+        });
     }
 
     /** 统计和存储占用只在锁里核对登录和图，扫描本身不占会话。 */
     private QueryResult backgroundRead(SessionState session, AdminCall call, CancelToken cancel) {
-        int selected = 0;
-        synchronized (session) {
+        int selected = session.withReadLock(() -> {
             if (cancel != null && cancel.cancelled()) {
                 throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
             }
-            if ("stats".equals(call.command())) {
-                selected = graphId(session);
-            }
-        }
+            return "stats".equals(call.command()) ? graphId(session) : 0;
+        });
         final int graphId = selected;
         if ("stats".equals(call.command())) {
             StatsCache.Snapshot<List<StatsRow>> sample = call.refresh()

@@ -69,7 +69,7 @@ final class DuckResult {
         for (int i = 0; i < sorts.size(); i++) {
             keys[i] = kind(sortKeys, i, true);
         }
-        try (Held held = open(settings)) {
+        try (Held held = open(settings.forCurrentQuery())) {
             try {
                 create(held.connection, distinct, width, keys);
                 insert(held.connection, rows, sortKeys, distinct, keys, cancel);
@@ -116,7 +116,7 @@ final class DuckResult {
             integral[i] = !"sum".equals(kinds[i]) || integralSum(rows, i);
             columns[i] = "star".equals(kinds[i]) ? Kind.LONG : kind(rows, i, false);
         }
-        try (Held held = open(settings)) {
+        try (Held held = open(settings.forCurrentQuery())) {
             try {
                 createAggregate(held.connection, columns);
                 insertAggregate(held.connection, rows, columns, cancel);

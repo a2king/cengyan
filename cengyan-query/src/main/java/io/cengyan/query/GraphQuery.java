@@ -69,6 +69,7 @@ final class GraphQuery {
 
     QueryResult select(Stmt.Select select, int graphId, Map<String, Object> params, QueryLimits limits, CancelToken cancel) {
         List<Row> rows = runClauses(select.clauses(), List.of(Row.empty()), graphId, params, limits, cancel);
+        QueryMemory.current().observeRows(rows.size(), select.tail().items().size());
         return finish(select.tail(), rows, graphId, params, cancel);
     }
 
@@ -80,6 +81,7 @@ final class GraphQuery {
         }
         List<List<Object>> rows = new ArrayList<>(left.rows());
         rows.addAll(right.rows());
+        QueryMemory.current().observeRows(rows);
         if (composite.all() && "UNION".equals(composite.op())) {
             return new QueryResult(left.columns(), rows, 0);
         }
@@ -134,6 +136,7 @@ final class GraphQuery {
         }
         return new QueryResult(columns, rows, 0);
     }
+
 
     int insertGraph(List<Stmt.Element> elements, int graphId, Map<String, Object> params, Map<String, Long> bound) {
         return writePattern(elements, graphId, params, bound);
@@ -231,6 +234,7 @@ final class GraphQuery {
                     case Stmt.Clause.For each -> unwind(each, rows, graphId, params);
                     case Stmt.Clause.Call call -> call(call.call(), rows, graphId, params, limits, cancel);
                 };
+                QueryMemory.current().observeRows(rows.size(), rows.isEmpty() ? 1 : rows.get(0).values.size());
                 if (rows.size() > SPILL_ROWS * 10) {
                     throw new CengyanException(ErrorCode.QUERY_MEMORY_EXCEEDED, "中间结果超过 " + (SPILL_ROWS * 10) + " 行");
                 }
@@ -691,6 +695,7 @@ final class GraphQuery {
                 }
                 table.add(values);
             }
+            QueryMemory.current().observeRows(table);
             if (kinds != null) {
                 table = DuckResult.aggregate(table, kinds, duck, cancel);
             }
