@@ -77,6 +77,34 @@ class HopLoopTest {
         }
     }
 
+    @Test
+    void 超级节点触发查询级DuckDBSpill后结果仍正确() throws Exception {
+        try (Db db = new Db()) {
+            writeStar(db.store, 12);
+            QueryLimits limits = new QueryLimits(
+                    100,
+                    100,
+                    2,
+                    100,
+                    64L * 1024 * 1024,
+                    true,
+                    2,
+                    true,
+                    64L * 1024 * 1024,
+                    2);
+            DuckSettings settings = new DuckSettings("64MB", Files.createTempDirectory("cengyan-hop-duck-"), "64MB", 1);
+            try (QuerySpillContext.Scope scope = QuerySpillContext.open(limits, settings);
+                 ReadSession session = db.store.read()) {
+                Set<Long> found = HopLoop.expand(
+                        session, 1, 1, Direction.OUT, 0L, 1, 2, 100, 100, null);
+                assertEquals(12, found.size());
+                assertTrue(found.contains(1000L));
+                assertTrue(QuerySpillContext.current() != null);
+            }
+            assertTrue(QuerySpillContext.current() == null);
+        }
+    }
+
     /** 第 layer 层第 index 个点。层号从 1 开始，起点单独用 0。 */
     static long layerId(int layer, int index) {
         return layer * 1000L + index;

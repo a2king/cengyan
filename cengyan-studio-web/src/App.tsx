@@ -102,7 +102,7 @@ export function App() {
       if (!previous || previous.session === nextSession) return previous;
       return { ...previous, session: nextSession };
     });
-    });
+    }, handleLogout);
   }
   const api = apiRef.current;
   const [activeNav, setActiveNav] = useState<NavKey>('graph');
@@ -120,6 +120,13 @@ export function App() {
   const [tableMaxNodes, setTableMaxNodes] = useState(2000);
   const [messageApi, contextHolder] = message.useMessage();
   const [notificationApi, notificationContextHolder] = notification.useNotification();
+
+  function handleLogout() {
+    storage.clearSession();
+    setSession(null);
+    setCurrentGraph('');
+    setSpaces([]);
+  }
 
   const refreshSpaces = useCallback(async () => {
     if (!session) return;
@@ -164,6 +171,22 @@ export function App() {
   }, [session, refreshSpaces]);
 
   useEffect(() => {
+    if (!session) return undefined;
+    let active = true;
+    const validate = () => {
+      if (active) void api.checkSession().catch(() => {
+        // 网络暂时不可用时保留当前页面；FORBIDDEN 会由 API 统一触发登出。
+      });
+    };
+    validate();
+    const timer = window.setInterval(validate, 60_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [api, session]);
+
+  useEffect(() => {
     void api.config().then((config) => {
       setGraphMaxNodes(config.graphMaxNodes);
       setTableMaxNodes(config.tableMaxNodes);
@@ -189,13 +212,6 @@ export function App() {
     setActiveNav('graph');
     messageApi.success('已连接到图数据库');
   };
-
-  function handleLogout() {
-    storage.clearSession();
-    setSession(null);
-    setCurrentGraph('');
-    setSpaces([]);
-  }
 
   const selectGraph = async (name: string, openWorkspace = false) => {
     try {
@@ -998,7 +1014,7 @@ function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, o
 }
 
 function ScriptResults({ api, results, loading, graphMaxNodes, tableMaxNodes, exporting, onExport }: { api: CengyanApi; results: ScriptResult[]; loading: boolean; graphMaxNodes: number; tableMaxNodes: number; exporting: boolean; onExport: () => void }) {
-  if (!results.length) return <Card className="result-card result-loading-card" bordered={false}><Spin description="查询中..." size="small"><div className="result-loading-content" /></Spin></Card>;
+  if (!results.length) return <Card className="result-card" bordered={false}><div className="result-card-loading-placeholder" /><div className="result-card-loading-overlay"><Spin description="查询中..." size="small"><div className="result-card-loading-content" /></Spin></div></Card>;
   if (results.length === 1) return <QueryResult api={api} response={results[0].response} elapsedMs={results[0].elapsedMs} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} loading={loading} exporting={exporting} onExport={onExport} />;
   return <>{results.map((item, index) => <div className="script-result" key={`${index}-${item.statement}`}><div className="script-result-label"><Text type="secondary">第 {index + 1} 条 · {item.elapsedMs} ms</Text><pre>{item.statement}</pre></div><QueryResult api={api} response={item.response} elapsedMs={item.elapsedMs} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} loading={loading && index === results.length - 1} exporting={exporting} onExport={onExport} /></div>)}</>;
 }
@@ -1008,15 +1024,15 @@ function QueryResult({ api, response, elapsedMs, graphMaxNodes, tableMaxNodes, l
   const rows = response.rows || [];
   const [view, setView] = useState('table');
   useEffect(() => { setView('table'); }, [response]);
-  const tableColumns: TableProps<Record<string, unknown>>['columns'] = columns.map((column, index) => ({ title: column, dataIndex: column, key: column, render: (value: unknown) => <JsonValue value={value} /> }));
+   const tableColumns: TableProps<Record<string, string>>['columns'] = columns.map((column) => ({ title: column, dataIndex: column, key: column }));
    const displayLimit = Math.max(1, tableMaxNodes || MAX_TABLE_ROWS);
    const displayRows = rows.slice(0, displayLimit);
-   const data = displayRows.map((row, rowIndex) => Object.fromEntries(columns.map((column, index) => [column, row[index]]).concat([['key', rowIndex]])));
+   const data = displayRows.map((row, rowIndex) => Object.fromEntries(columns.map((column, index) => [column, tableCellText(row[index])]).concat([['key', String(rowIndex)]])) as Record<string, string>);
    const tabs: TabsProps['items'] = [
        { key: 'table', label: '表格', children: <Table className="result-data-table" size="small" rowKey="key" showHeader tableLayout="auto" scroll={{ x: 'max-content', y: 330 }} columns={tableColumns} dataSource={data} pagination={{ pageSize: 100, showSizeChanger: true, pageSizeOptions: ['50', '100', '200'], showTotal: (total, range) => `${range[0]}-${range[1]} / ${total} 条` }} /> },
       { key: 'graph', label: '关系图', children: view === 'graph' ? <QueryGraph api={api} rows={rows} maxNodes={graphMaxNodes} /> : null },
    ];
-   return <Spin className="result-card-spin" spinning={loading} description="查询中..." size="small"><Card className="result-card" bordered={false}><div className="result-heading"><div><Title level={4}>查询结果</Title><Text type="secondary">{columns.length ? `${rows.length} 行 · ${elapsedMs} ms${rows.length > displayLimit ? ` · 前 ${displayLimit} 行可分页查看` : ''}` : `完成，影响 ${response.rowsAffected || 0} 行 · ${elapsedMs} ms`}</Text></div>{columns.length && <Button icon={<Download size={15} />} loading={exporting} disabled={exporting || loading} onClick={onExport}>导出 CSV</Button>}</div>{columns.length && rows.length > displayLimit && <Alert className="result-limit-alert" type="info" showIcon message={`当前查询共 ${rows.length} 行，表格最多展示前 ${displayLimit} 行；导出 CSV 会重新执行查询并导出全部结果。`} />}{columns.length ? <Tabs className="result-tabs" activeKey={view} onChange={setView} destroyOnHidden items={tabs} /> : <div className="success-result"><Check size={20} /><span>语句执行成功</span></div>}</Card></Spin>;
+   return <Card className="result-card" bordered={false}><div className="result-heading"><div><Title level={4}>查询结果</Title><Text type="secondary">{columns.length ? `${rows.length} 行 · ${elapsedMs} ms${rows.length > displayLimit ? ` · 前 ${displayLimit} 行可分页查看` : ''}` : `完成，影响 ${response.rowsAffected || 0} 行 · ${elapsedMs} ms`}</Text></div>{columns.length && <Button icon={<Download size={15} />} loading={exporting} disabled={exporting || loading} onClick={onExport}>导出 CSV</Button>}</div>{columns.length && rows.length > displayLimit && <Alert className="result-limit-alert" type="info" showIcon message={`当前查询共 ${rows.length} 行，表格最多展示前 ${displayLimit} 行；导出 CSV 会重新执行查询并导出全部结果。`} />}{columns.length ? <Tabs className="result-tabs" activeKey={view} onChange={setView} destroyOnHidden items={tabs} /> : <div className="success-result"><Check size={20} /><span>语句执行成功</span></div>}{loading && <div className="result-card-loading-overlay"><Spin description="查询中..." size="small"><div className="result-card-loading-content" /></Spin></div>}</Card>;
 }
 
 function csvCell(value: unknown) {
@@ -1025,10 +1041,14 @@ function csvCell(value: unknown) {
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-function JsonValue({ value }: { value: unknown }) {
-  if (value === null || value === undefined) return <Text type="secondary">null</Text>;
+function tableCellText(value: unknown) {
+  if (value === null || value === undefined) return '';
   if (typeof value === 'object') {
-    return <span className="table-value-detail">{JSON.stringify(value)}</span>;
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
   }
-  return <span className="table-value-detail">{String(value)}</span>;
+  return String(value);
 }

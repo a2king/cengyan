@@ -53,6 +53,25 @@ final class ExecuteService {
         this.sessions = sessions;
     }
 
+    void session(ChannelHandlerContext ctx, JsonNode node) {
+        String sessionId = node.path("session").asText("");
+        if (sessionId.isBlank()) {
+            error(ctx, sessionId, null, ErrorCode.FORBIDDEN, "请先登录");
+            return;
+        }
+        SessionState session = sessions.open(sessionId);
+        if (!session.authenticated()) {
+            error(ctx, sessionId, null, ErrorCode.FORBIDDEN, "请先登录");
+            return;
+        }
+        ObjectNode response = MAPPER.createObjectNode();
+        response.put("code", ErrorCode.OK.name());
+        response.put("session", sessionId);
+        response.put("user", session.user());
+        response.put("role", session.readOnly() ? "read" : "write");
+        write(ctx, response);
+    }
+
     void execute(ChannelHandlerContext ctx, JsonNode node) {
         String sessionId = node.path("session").asText("");
         if (sessionId.isBlank()) {
@@ -378,7 +397,12 @@ final class ExecuteService {
                     config.maxFrontierPerHop(),
                     config.maxHops(),
                     config.maxPaths(),
-                    config.queryMemoryBytes()),
+                    config.queryMemoryBytes(),
+                    config.supernodeSpillEnabled(),
+                    config.supernodeEdgeThreshold(),
+                    config.supernodeFrontierSpillEnabled(),
+                    config.supernodeSpillMaxBytes(),
+                    config.supernodeSpillBatchEdges()),
                     handle);
             ObjectNode node = MAPPER.createObjectNode();
             node.put("code", ErrorCode.OK.name());

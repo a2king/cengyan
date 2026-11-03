@@ -55,6 +55,7 @@ final class ExprEval {
                 forbidReference();
                 yield call(call);
             }
+            case Expr.Reduce reduce -> reduce(reduce);
             case Expr.Unary unary -> unary(unary.op(), eval(unary.inner()));
             case Expr.Binary binary -> binary(binary.op(), eval(binary.left()), eval(binary.right()));
             case Expr.In in -> in(eval(in.value()), in.options(), in.negated());
@@ -119,6 +120,18 @@ final class ExprEval {
 
     private Object field(String variable, String name) {
         Slot slot = slot(variable);
+        if (slot.whole != null && slot.whole.containsKey("\u0000")) {
+            Object scalar = slot.whole.get("\u0000");
+            if (scalar instanceof Map<?, ?> body) {
+                if (body.containsKey(name)) {
+                    return body.get(name);
+                }
+                if (body.get("properties") instanceof Map<?, ?> properties && properties.containsKey(name)) {
+                    return properties.get(name);
+                }
+            }
+            return null;
+        }
         if (!slot.edge && slot.typeName == null && slot.whole != null && slot.whole.containsKey("\u0000")
                 && slot.whole.get("\u0000") == null) {
             return null;
@@ -130,6 +143,14 @@ final class ExprEval {
             return slot.rank;
         }
         if (slot.props == null || !slot.props.containsKey(name)) {
+            if (slot.whole instanceof Map<?, ?> body) {
+                if (body.containsKey(name)) {
+                    return body.get(name);
+                }
+                if (body.get("properties") instanceof Map<?, ?> properties && properties.containsKey(name)) {
+                    return properties.get(name);
+                }
+            }
             return null;
         }
         return slot.props.get(name);
@@ -204,6 +225,30 @@ final class ExprEval {
                     throw new CengyanException(ErrorCode.SYNTAX, "聚合只能写在 RETURN");
             default -> scalar(name, args);
         };
+    }
+
+    private Object reduce(Expr.Reduce reduce) {
+        Object accumulator = eval(reduce.initial());
+        Object collection = eval(reduce.collection());
+        if (collection == null) {
+            return accumulator;
+        }
+        if (!(collection instanceof List<?> list)) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "REDUCE 的集合必须是列表");
+        }
+        Map<String, Slot> previous = slots;
+        try {
+            for (Object item : list) {
+                Map<String, Slot> scoped = new LinkedHashMap<>(previous);
+                scoped.put(reduce.accumulator(), Slot.scalar(accumulator));
+                scoped.put(reduce.item(), Slot.scalar(item));
+                slots = scoped;
+                accumulator = eval(reduce.body());
+            }
+            return accumulator;
+        } finally {
+            slots = previous;
+        }
     }
 
     private Slot slotOf(Expr expr) {

@@ -140,10 +140,12 @@ button, input, textarea, select { font-family: inherit; }
 .editor-footer .ant-typography { font-size: 11px; }
 .card-title { display: inline-flex; align-items: center; gap: 8px; }
 .result-card { display: flex; flex-direction: column; height: 492px; margin-top: 17px; overflow: hidden; }
-.result-card-spin { display: block; margin-top: 17px; }
-.result-card-spin > .ant-spin-container { display: block; }
-.result-card-spin .result-card { margin-top: 0; }
-.result-card > .ant-card-body { display: flex; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
+.result-card > .ant-card-body { position: relative; display: flex; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
+.result-card-loading-placeholder { flex: 1; min-height: 0; }
+.result-card-loading-overlay { position: absolute; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; background: rgba(255, 255, 255, .72); }
+.result-card-loading-overlay > .ant-spin-section { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; }
+.result-card-loading-overlay > .ant-spin-section .ant-spin { position: static; }
+.result-card-loading-content { width: 1px; height: 1px; }
 .result-loading-card { align-items: center; justify-content: center; }
 .result-loading-content { width: 1px; height: 1px; }
 .result-card .result-heading { flex: none; }
@@ -178,9 +180,6 @@ button, input, textarea, select { font-family: inherit; }
 .result-heading { margin-bottom: 16px; }
 .result-heading h4 { margin: 0 0 3px; color: #293352; }
 .success-result { display: flex; align-items: center; justify-content: center; gap: 9px; min-height: 120px; color: #27a975; }
-.json-cell { max-width: none; margin: 0; overflow-wrap: anywhere; color: #59627b; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; white-space: normal; cursor: pointer; }
-.table-value { cursor: pointer; }
-.table-value-detail { display: block; max-width: none; color: #59627b; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; line-height: 1.5; white-space: nowrap; }
 .result-card .result-data-table .ant-table-container { min-width: 0; overflow: hidden; }
 .result-card .result-data-table .ant-table-header { flex: 0 0 auto; min-height: 39px; overflow-x: hidden !important; overflow-y: hidden !important; }
 .result-card .result-data-table .ant-table-body { flex: 1 1 auto; min-height: 0; overflow-x: auto !important; overflow-y: auto !important; }

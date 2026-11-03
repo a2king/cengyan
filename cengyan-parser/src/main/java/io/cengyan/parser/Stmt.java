@@ -147,6 +147,9 @@ public sealed interface Stmt {
     record Select(List<Clause> clauses, Tail tail) implements Stmt {
     }
 
+    record AggregateFilter(Stmt query, Expr condition) implements Stmt {
+    }
+
     record Composite(String op, boolean all, Stmt left, Stmt right) implements Stmt {
     }
 
@@ -214,7 +217,12 @@ public sealed interface Stmt {
             List<Expr> groupBy,
             List<Sort> orderBy,
             Expr skip,
-            Expr limit) {
+            Expr limit,
+            Expr postFilter) {
+        public Tail(boolean distinct, boolean star, List<Item> items, List<Expr> groupBy,
+                    List<Sort> orderBy, Expr skip, Expr limit) {
+            this(distinct, star, items, groupBy, orderBy, skip, limit, null);
+        }
     }
 
     record EdgePat(

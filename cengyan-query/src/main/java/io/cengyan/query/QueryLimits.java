@@ -12,20 +12,26 @@ public record QueryLimits(
         int maxFrontierPerHop,
         int maxHops,
         int maxPaths,
-        long queryMemoryBytes) {
+        long queryMemoryBytes,
+        boolean supernodeSpillEnabled,
+        int supernodeEdgeThreshold,
+        boolean supernodeFrontierSpillEnabled,
+        long supernodeSpillMaxBytes,
+        int supernodeSpillBatchEdges) {
     public QueryLimits(int maxEdgesPerVertex, int maxFrontierPerHop, int maxHops, int maxPaths) {
-        this(maxEdgesPerVertex, maxFrontierPerHop, maxHops, maxPaths, 0L);
+        this(maxEdgesPerVertex, maxFrontierPerHop, maxHops, maxPaths, 0L, false, 0, false, 0L, 4096);
     }
 
     public QueryLimits(int maxEdgesPerVertex, long queryMemoryBytes) {
-        this(maxEdgesPerVertex, 0, 0, 0, queryMemoryBytes);
+        this(maxEdgesPerVertex, 0, 0, 0, queryMemoryBytes, false, 0, false, 0L, 4096);
     }
 
     public QueryLimits {
         if (maxEdgesPerVertex < 0 || maxFrontierPerHop < 0 || maxHops < 0 || maxPaths < 0) {
             throw new IllegalArgumentException("查询预算不能为负，0 表示不限");
         }
-        if (queryMemoryBytes < 0) {
+        if (queryMemoryBytes < 0 || supernodeEdgeThreshold < 0
+                || supernodeSpillMaxBytes < 0 || supernodeSpillBatchEdges <= 0) {
             throw new IllegalArgumentException("查询内存预算不能为负，0 表示不限");
         }
         maxEdgesPerVertex = unlimited(maxEdgesPerVertex);
@@ -36,7 +42,7 @@ public record QueryLimits(
 
     /** 测试里只改每点边数时，其余上限用计划书里的默认值。 */
     public QueryLimits(int maxEdgesPerVertex) {
-        this(maxEdgesPerVertex, 0, 0, 0, 0L);
+        this(maxEdgesPerVertex, 0, 0, 0, 0L, false, 0, false, 0L, 4096);
     }
 
     private static int unlimited(int value) {

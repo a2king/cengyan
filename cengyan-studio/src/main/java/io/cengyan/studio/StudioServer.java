@@ -63,6 +63,7 @@ public final class StudioServer implements AutoCloseable {
         http.setExecutor(workers);
         StudioServer server = new StudioServer(db, http, workers, http.getAddress().getPort(), config.graphMaxNodes(), config.tableMaxNodes());
         http.createContext("/api/ping", server::ping);
+        http.createContext("/api/session", server::session);
         http.createContext("/api/config", server::config);
         http.createContext("/api/login", server::login);
         http.createContext("/api/query", server::query);
@@ -108,6 +109,17 @@ public final class StudioServer implements AutoCloseable {
         response.put("graphMaxNodes", graphMaxNodes);
         response.put("tableMaxNodes", tableMaxNodes);
         send(exchange, 200, response);
+    }
+
+    private void session(HttpExchange exchange) {
+        JsonNode body = read(exchange);
+        if (body == null) {
+            return;
+        }
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("op", "session");
+        request.put("session", session(exchange, body));
+        forward(exchange, request, 3000);
     }
 
     private void login(HttpExchange exchange) {
