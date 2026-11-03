@@ -36,6 +36,13 @@ public record ServerConfig(
         int cacheCompactIntervalMinutes,
         String duckdbMemory,
         Path duckdbTempDirectory,
+        String duckdbMaxTempDirectorySize,
+        int duckdbThreads,
+        boolean supernodeSpillEnabled,
+        int supernodeEdgeThreshold,
+        boolean supernodeFrontierSpillEnabled,
+        long supernodeSpillMaxBytes,
+        int supernodeSpillBatchEdges,
         String rootPassword) {
 
     public ServerConfig {
@@ -88,6 +95,15 @@ public record ServerConfig(
         if (duckdbTempDirectory == null) {
             throw new IllegalArgumentException("duckdbTempDirectory 不能为空");
         }
+        if (duckdbMaxTempDirectorySize == null || duckdbMaxTempDirectorySize.isBlank()) {
+            throw new IllegalArgumentException("duckdbMaxTempDirectorySize 不能为空");
+        }
+        if (duckdbThreads <= 0) {
+            throw new IllegalArgumentException("duckdbThreads 必须为正");
+        }
+        if (supernodeEdgeThreshold < 0 || supernodeSpillMaxBytes < 0 || supernodeSpillBatchEdges <= 0) {
+            throw new IllegalArgumentException("超级节点 spill 配置无效");
+        }
         if (rootPassword == null) {
             throw new IllegalArgumentException("rootPassword 不能为空");
         }
@@ -136,6 +152,13 @@ public record ServerConfig(
                 cacheCompactIntervalMinutes,
                 duckdbMemory,
                 duckdbTempDirectory,
+                duckdbMaxTempDirectorySize,
+                duckdbThreads,
+                supernodeSpillEnabled,
+                supernodeEdgeThreshold,
+                supernodeFrontierSpillEnabled,
+                supernodeSpillMaxBytes,
+                supernodeSpillBatchEdges,
                 rootPassword);
     }
 
@@ -166,6 +189,13 @@ public record ServerConfig(
                 integer(properties, "cache_compact_interval_minutes", 30),
                 properties.getProperty("duckdb_memory", "1GB").trim(),
                 Path.of(properties.getProperty("duckdb_temp_directory", "tmp/duck")),
+                properties.getProperty("duckdb_max_temp_directory_size", "10GB").trim(),
+                integer(properties, "duckdb_threads", 1),
+                Boolean.parseBoolean(properties.getProperty("supernode_spill_enabled", "true").trim()),
+                integer(properties, "supernode_edge_threshold", 10000),
+                Boolean.parseBoolean(properties.getProperty("supernode_frontier_spill_enabled", "true").trim()),
+                longValue(properties, "supernode_spill_max_bytes", 10737418240L),
+                integer(properties, "supernode_spill_batch_edges", 4096),
                 properties.getProperty("root_password", "cengyan"));
     }
 

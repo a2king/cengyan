@@ -49,6 +49,7 @@ final class LineServer extends SimpleChannelInboundHandler<String> {
         String op = node.path("op").asText("");
         switch (op) {
             case "ping" -> ok(ctx);
+            case "session" -> execute.session(ctx, node);
             case "execute" -> execute.execute(ctx, node);
             case "bulkInsert" -> execute.bulkInsert(ctx, node);
             case "login" -> execute.login(ctx, node);
