@@ -19,6 +19,9 @@ public sealed interface Expr {
     record Call(String name, List<Expr> args) implements Expr {
     }
 
+    record Reduce(String accumulator, Expr initial, String item, Expr collection, Expr body) implements Expr {
+    }
+
     record Unary(String op, Expr inner) implements Expr {
     }
 
@@ -77,6 +80,7 @@ public sealed interface Expr {
             case Variable ignored -> List.of();
             case Prop ignored -> List.of();
             case Call call -> call.args();
+            case Reduce reduce -> List.of(reduce.initial(), reduce.collection(), reduce.body());
             case Unary unary -> List.of(unary.inner());
             case Binary binary -> List.of(binary.left(), binary.right());
             case In in -> {

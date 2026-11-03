@@ -369,8 +369,13 @@ final class GqlReader {
             return mutation(clauses);
         }
         Stmt.Tail tail = tail();
+        Expr aggregateFilter = null;
+        if (take(Kind.FILTER)) {
+            aggregateFilter = expr();
+        }
         Stmt query = lower(clauses, tail);
-        return compose(query == null ? new Stmt.Select(clauses, tail) : query);
+        Stmt selected = query == null ? new Stmt.Select(clauses, tail) : query;
+        return compose(aggregateFilter == null ? selected : new Stmt.AggregateFilter(selected, aggregateFilter));
     }
 
     private Stmt mutation(List<Stmt.Clause> clauses) {
@@ -510,6 +515,7 @@ final class GqlReader {
             }
             groupBy = List.copyOf(groupBy);
         }
+        Expr postFilter = take(Kind.FILTER) ? expr() : null;
         List<Stmt.Sort> order = List.of();
         if (take(Kind.ORDER)) {
             expect(Kind.BY, "ORDER 后面要写 BY");
@@ -520,7 +526,7 @@ final class GqlReader {
             skip = expr();
         }
         Expr limit = take(Kind.LIMIT) ? expr() : null;
-        return new Stmt.Tail(distinct, star, items, groupBy, order, skip, limit);
+        return new Stmt.Tail(distinct, star, items, groupBy, order, skip, limit, postFilter);
     }
 
     private Stmt compose(Stmt query) {
@@ -1121,6 +1127,10 @@ final class GqlReader {
             String type = typeName();
             expect(Kind.RP, "CAST 缺少右括号");
             expr = new Expr.Cast(value, type);
+        } else if (peek() == Kind.IDENT && "REDUCE".equalsIgnoreCase(at().text)
+                && look(1) == Kind.LP) {
+            next();
+            expr = reduceExpr();
         } else if (take(Kind.EXISTS)) {
             if (take(Kind.LC)) {
                 Stmt query = peek() == Kind.MATCH || peek() == Kind.OPTIONAL ? statement() : query(false);
@@ -1146,6 +1156,21 @@ final class GqlReader {
             return fail("无法识别的表达式");
         }
         return postfix(expr);
+    }
+
+    private Expr reduceExpr() {
+        expect(Kind.LP, "REDUCE 缺少左括号");
+        String accumulator = ident();
+        expect(Kind.EQ, "REDUCE 初始值缺少等号");
+        Expr initial = expr();
+        expect(Kind.COMMA, "REDUCE 初始值后面要写逗号");
+        String item = ident();
+        expect(Kind.IN, "REDUCE 迭代变量后面要写 IN");
+        Expr collection = expr();
+        expect(Kind.PIPE, "REDUCE 集合后面要写 | ");
+        Expr body = expr();
+        expect(Kind.RP, "REDUCE 缺少右括号");
+        return new Expr.Reduce(accumulator, initial, item, collection, body);
     }
 
     private Expr postfix(Expr expr) {

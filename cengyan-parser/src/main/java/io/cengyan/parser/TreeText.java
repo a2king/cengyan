@@ -69,6 +69,7 @@ final class TreeText {
             case Stmt.DropType drop -> "(dropType " + (drop.node() ? "node " : "rel ") + drop.name()
                     + (drop.ifExists() ? " ifExists" : "") + ")";
             case Stmt.Select select -> "(select " + select.clauses().size() + " " + tail(select.tail()) + ")";
+            case Stmt.AggregateFilter filter -> "(aggregateFilter " + of(filter.query()) + " " + expr(filter.condition()) + ")";
             case Stmt.Composite composite -> "(" + composite.op() + (composite.all() ? " all " : " ")
                     + of(composite.left()) + " " + of(composite.right()) + ")";
             case Stmt.Next next -> "(next " + of(next.left()) + " " + of(next.right()) + ")";
@@ -194,6 +195,8 @@ final class TreeText {
             case Expr.Variable variable -> variable.name();
             case Expr.Prop prop -> prop.variable() + "." + prop.field();
             case Expr.Call call -> call.name() + args(call.args());
+            case Expr.Reduce reduce -> "(reduce " + reduce.accumulator() + " " + expr(reduce.initial())
+                    + " " + reduce.item() + " " + expr(reduce.collection()) + " " + expr(reduce.body()) + ")";
             case Expr.Unary unary -> "(" + unary.op() + " " + expr(unary.inner()) + ")";
             case Expr.Binary binary -> "(" + binary.op() + " " + expr(binary.left()) + " " + expr(binary.right()) + ")";
             case Expr.In in -> "(" + (in.negated() ? "not-in " : "in ") + expr(in.value()) + args(in.options()) + ")";
