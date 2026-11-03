@@ -310,7 +310,9 @@ final class GraphQuery {
             for (Row left : current) {
                 switch (element) {
                     case Stmt.Element.Node node -> next.addAll(bindNode(node.node(), left, session, graphId, params, limits, cancel));
-                    case Stmt.Element.Rel rel -> next.addAll(bindEdge(rel.edge(), match, previous, left, session, graphId, params, limits, cancel));
+                    case Stmt.Element.Rel rel -> next.addAll(bindEdge(
+                            rel.edge(), match, previous, nextNode(pattern, element), left,
+                            session, graphId, params, limits, cancel));
                     case Stmt.Element.Group group -> next.addAll(bindGroup(group, match, left, session, graphId, params, limits, cancel));
                 }
             }
@@ -325,6 +327,16 @@ final class GraphQuery {
             }
         }
         return current;
+    }
+
+    private static Stmt.NodePat nextNode(Stmt.Pattern pattern, Stmt.Element current) {
+        List<Stmt.Element> elements = pattern.elements();
+        int index = elements.indexOf(current);
+        if (index >= 0 && index + 1 < elements.size()
+                && elements.get(index + 1) instanceof Stmt.Element.Node node) {
+            return node.node();
+        }
+        return null;
     }
 
     /**
@@ -454,6 +466,7 @@ final class GraphQuery {
             Stmt.EdgePat edge,
             Stmt.Clause.Match match,
             String previous,
+            Stmt.NodePat target,
             Row row,
             ReadSession session,
             int graphId,
@@ -468,7 +481,8 @@ final class GraphQuery {
             return oneHop(edge, start, row, session, graphId, params, limits, cancel);
         }
         if (match.search() != null) {
-            return shortest(edge, match, start, row, session, graphId, params, limits, cancel);
+            Set<Long> targetIds = targetIds(target, match.where(), graphId, params);
+            return shortest(edge, match, start, targetIds, row, session, graphId, params, limits, cancel);
         }
         return walks(edge, match.mode(), start, row, session, graphId, params, limits, cancel);
     }
@@ -507,7 +521,7 @@ final class GraphQuery {
         if (min == 0) {
             walks.add(List.of());
         }
-        walk(edge, mode == null ? "WALK" : mode, start, List.of(), new LinkedHashSet<>(List.of(start)),
+        walk(edge, mode == null ? "WALK" : mode, start, start, List.of(), new LinkedHashSet<>(List.of(start)),
                 new LinkedHashSet<>(), 1, max, walks, session, graphId, params, limits, cancel);
         List<Row> rows = new ArrayList<>();
         for (List<Found> walk : walks) {
@@ -528,6 +542,7 @@ final class GraphQuery {
             Stmt.EdgePat edge,
             String mode,
             long vid,
+            long root,
             List<Found> path,
             Set<Long> nodes,
             Set<EdgeRef> used,
@@ -552,7 +567,13 @@ final class GraphQuery {
             if ("TRAIL".equals(mode) && used.contains(found.edge)) {
                 continue;
             }
-            if (("SIMPLE".equals(mode) || "ACYCLIC".equals(mode)) && nodes.contains(found.other)) {
+            if ("ACYCLIC".equals(mode) && nodes.contains(found.other)) {
+                continue;
+            }
+            boolean closesSimpleCycle = "SIMPLE".equals(mode)
+                    && nodes.contains(found.other)
+                    && found.other == root;
+            if ("SIMPLE".equals(mode) && nodes.contains(found.other) && !closesSimpleCycle) {
                 continue;
             }
             List<Found> longer = new ArrayList<>(path);
@@ -562,7 +583,10 @@ final class GraphQuery {
             seenNodes.add(found.other);
             Set<EdgeRef> seenEdges = new LinkedHashSet<>(used);
             seenEdges.add(found.edge);
-            walk(edge, mode, found.other, longer, seenNodes, seenEdges, depth + 1, max, walks, session, graphId, params, limits, cancel);
+            if (!closesSimpleCycle) {
+                walk(edge, mode, found.other, root, longer, seenNodes, seenEdges, depth + 1, max,
+                        walks, session, graphId, params, limits, cancel);
+            }
         }
     }
 
@@ -570,6 +594,7 @@ final class GraphQuery {
             Stmt.EdgePat edge,
             Stmt.Clause.Match match,
             long start,
+            Set<Long> targetIds,
             Row row,
             ReadSession session,
             int graphId,
@@ -580,24 +605,52 @@ final class GraphQuery {
         List<List<Found>> layer = List.of(List.of());
         List<List<Found>> found = new ArrayList<>();
         Set<Long> seen = new LinkedHashSet<>();
+        Map<Long, Integer> bestDepth = new LinkedHashMap<>();
+        Map<Long, Integer> targetDepth = new LinkedHashMap<>();
         seen.add(start);
-        for (int hop = 1; hop <= max && found.isEmpty(); hop++) {
+        bestDepth.put(start, 0);
+        boolean allShortest = "ALL_SHORTEST".equals(match.search());
+        for (int hop = 1; hop <= max; hop++) {
             List<List<Found>> next = new ArrayList<>();
             for (List<Found> path : layer) {
                 long vid = path.isEmpty() ? start : path.get(path.size() - 1).other;
                 for (Found step : scan(edge, vid, session, graphId, params, limits, cancel)) {
-                    if (!seen.add(step.other)) {
+                    if (allShortest) {
+                        Integer previous = bestDepth.get(step.other);
+                        if (previous != null && previous < hop) {
+                            continue;
+                        }
+                        bestDepth.putIfAbsent(step.other, hop);
+                    } else if (!seen.add(step.other)) {
                         continue;
                     }
                     List<Found> longer = new ArrayList<>(path);
                     longer.add(step);
                     next.add(longer);
-                    if (edge.minHop() == null || hop >= edge.minHop()) {
-                        found.add(longer);
+                    boolean reachesTarget = targetIds == null || targetIds.contains(step.other);
+                    if (reachesTarget && (edge.minHop() == null || hop >= edge.minHop())) {
+                        if (targetIds == null) {
+                            found.add(longer);
+                        } else {
+                            Integer previousTargetDepth = targetDepth.get(step.other);
+                            if (previousTargetDepth == null || previousTargetDepth == hop) {
+                                targetDepth.putIfAbsent(step.other, hop);
+                                found.add(longer);
+                            }
+                        }
                     }
                 }
             }
             layer = next;
+            if (!allShortest && !found.isEmpty()) {
+                break;
+            }
+            if (targetIds != null && targetDepth.keySet().containsAll(targetIds)) {
+                break;
+            }
+            if (layer.isEmpty()) {
+                break;
+            }
         }
         int keep = switch (match.search()) {
             case "ANY_SHORTEST", "ANY" -> match.searchCount() == null ? 1 : match.searchCount();
@@ -614,6 +667,59 @@ final class GraphQuery {
             rows.add(copy);
         }
         return rows;
+    }
+
+    private Set<Long> targetIds(
+            Stmt.NodePat target, Expr where, int graphId, Map<String, Object> params) {
+        ExprEval eval = new ExprEval(params, false);
+        NodeType type = target == null || target.typeName() == null
+                ? null : catalog.nodeType(graphId, target.typeName());
+        Set<Long> pattern = idsFromNode(target, type, graphId, eval);
+        Set<Long> predicate = idsFromPredicate(where, target == null ? null : target.variable(), type, graphId, eval);
+        if (pattern == null) return predicate;
+        if (predicate == null) return pattern;
+                pattern.retainAll(predicate);
+        return pattern;
+    }
+
+    private Set<Long> idsFromNode(Stmt.NodePat node, NodeType type, int graphId, ExprEval eval) {
+        if (node == null) return null;
+        for (Stmt.Prop prop : node.properties()) {
+            if ("id".equals(prop.name())) {
+                return new LinkedHashSet<>(Set.of(catalog.findVertexId(graphId, type, eval.eval(prop.value()))));
+            }
+        }
+        return null;
+    }
+
+    private Set<Long> idsFromPredicate(
+            Expr where, String variable, NodeType type, int graphId, ExprEval eval) {
+        if (where == null || variable == null) return null;
+        if (where instanceof Expr.Binary binary && "AND".equals(binary.op())) {
+            Set<Long> left = idsFromPredicate(binary.left(), variable, type, graphId, eval);
+            Set<Long> right = idsFromPredicate(binary.right(), variable, type, graphId, eval);
+            if (left == null) return right;
+            if (right == null) return left;
+            left.retainAll(right);
+            return left;
+        }
+        if (where instanceof Expr.Binary binary && "=".equals(binary.op())) {
+            Expr constant = isIdExpr(binary.left(), variable) ? binary.right()
+                    : isIdExpr(binary.right(), variable) ? binary.left() : null;
+            Object value = constant == null ? null : constantValue(constant, eval);
+            if (constant == null || value == null) return null;
+            return new LinkedHashSet<>(Set.of(catalog.findVertexId(graphId, type, value)));
+        }
+        if (where instanceof Expr.In in && !in.negated() && isIdExpr(in.value(), variable)) {
+            Set<Long> ids = new LinkedHashSet<>();
+            for (Expr option : in.options()) {
+                Object value = constantValue(option, eval);
+                if (value == null) return Set.of();
+                ids.add(catalog.findVertexId(graphId, type, value));
+            }
+            return ids;
+        }
+        return null;
     }
 
     private List<Row> bindGroup(
