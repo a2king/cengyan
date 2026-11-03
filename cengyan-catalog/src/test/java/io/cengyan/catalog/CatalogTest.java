@@ -60,6 +60,29 @@ class CatalogTest {
     }
 
     @Test
+    void 统计从图元数据计数并随新增删除更新() throws Exception {
+        try (Db db = new Db()) {
+            int graphId = db.catalog.createGraph("company");
+            db.catalog.createNodeType(graphId, "Company", List.of());
+            db.catalog.createRelType(graphId, "holder", List.of());
+            db.catalog.insertVertex(graphId, "Company", 1L, Map.of(), false);
+            db.catalog.insertRel(graphId, "holder", 0L,
+                    VertexWrite.of("Company", 1L, Map.of()),
+                    VertexWrite.of("Company", 2L, Map.of()), Map.of(), false);
+
+            assertEquals(List.of(
+                    new StatsRow("NODE", "Company", 2L),
+                    new StatsRow("REL", "holder", 1L)), db.catalog.stats(graphId, null));
+            try (ReadSession session = db.store.read()) {
+                assertTrue(session.get(Cf.CATALOG, KeyCodec.statsCountKey(graphId, Catalog.NODE_KIND, 1)).length > 0);
+                assertTrue(session.get(Cf.CATALOG, KeyCodec.statsReadyKey(graphId)).length > 0);
+            }
+            db.catalog.apply(graphId, List.of(new Mutation.DeleteEdge("holder", 0L, 1L, 2L)), 100);
+            assertEquals(0L, db.catalog.stats(graphId, null).get(1).count());
+        }
+    }
+
+    @Test
     void 扫拓扑时不读属性() throws Exception {
         try (Db db = new Db()) {
             int graphId = db.catalog.createGraph("company");
