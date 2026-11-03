@@ -351,6 +351,13 @@ TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`
 | `block_cache_bytes` | `268435456` | RocksDB 块缓存 |
 | `duckdb_memory` | `1GB` | 排序和聚合使用的 DuckDB 内存 |
 | `duckdb_temp_directory` | `tmp/duck` | DuckDB 临时目录 |
+| `duckdb_max_temp_directory_size` | `10GB` | 单条 DuckDB 查询允许使用的临时磁盘空间 |
+| `duckdb_threads` | `1` | 单条 DuckDB 查询线程数，1 优先保证服务并发稳定性 |
+| `supernode_spill_enabled` | `true` | 超级节点查询是否允许把 frontier/visited 临时状态放入查询级 DuckDB 工作区 |
+| `supernode_edge_threshold` | `10000` | 单个点扫描超过该边数后触发超级节点 spill，0 表示关闭阈值触发 |
+| `supernode_frontier_spill_enabled` | `true` | 是否允许多跳 frontier、visited 和已到达集合切换到 DuckDB |
+| `supernode_spill_max_bytes` | `10737418240` | 单条超级节点查询的 DuckDB 临时空间上限 |
+| `supernode_spill_batch_edges` | `4096` | spill 状态迁移时每批写入 DuckDB 的点数 |
 | 
 ocksdb_background_jobs | 6 | RocksDB background flush/compaction jobs |
 | 
