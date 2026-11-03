@@ -302,6 +302,7 @@ public final class Catalog {
                 batch.put(Cf.CATALOG, KeyCodec.nameKey(name), CatalogCodec.nameValue(GraphName.GRAPH, graphId));
                 batch.put(Cf.CATALOG, KeyCodec.graphRecordKey(graphId), CatalogCodec.graphRecord(name, comment));
                 batch.put(Cf.CATALOG, KeyCodec.spaceKey(graphId), ClusterCodec.space(ClusterCodec.MODE_NORMAL, 1, parts));
+                batch.put(Cf.CATALOG, KeyCodec.statsReadyKey(graphId), new byte[] {0});
                 batch.put(Cf.CATALOG, KeyCodec.nextGraphIdKey(), counterAfter(graphId, false));
                 store.noteGraph(graphId, name);
                 store.mutate(batch);
@@ -407,6 +408,8 @@ public final class Catalog {
                 batch.delete(Cf.CATALOG, KeyCodec.nextRelTypeKey(graphId));
                 deletePrefix(batch, session, Cf.CATALOG, KeyCodec.partVotePrefix(graphId));
                 deletePrefix(batch, session, Cf.CATALOG, KeyCodec.movePrefix(graphId));
+                deletePrefix(batch, session, Cf.CATALOG, new byte[] {0x23, (byte) (graphId >>> 8), (byte) graphId});
+                batch.delete(Cf.CATALOG, KeyCodec.statsReadyKey(graphId));
                 batch.delete(Cf.CATALOG, KeyCodec.spaceKey(graphId));
                 byte[] dataPrefix = KeyCodec.graphIdPrefix(graphId);
                 deletePrefix(batch, session, Cf.VERTEX, dataPrefix);
@@ -501,7 +504,7 @@ public final class Catalog {
     public boolean insertVertex(
             int graphId, String typeName, long vid, Map<String, Object> properties, boolean ifNotExists) {
         checkIdentifier(typeName);
-        return store.withStripes(List.of(nodeStripe(graphId, typeName)), () -> {
+        return store.withStripes(List.of(nodeStripe(graphId, typeName), metaStripe(graphId)), () -> {
             requireGraph(graphId);
             requireWritable(graphId);
             requirePart(graphId, partOf(graphId, vid));
@@ -525,6 +528,9 @@ public final class Catalog {
                         PropCodec.decode(type.properties(), type.schemaVersion(), encoded),
                         graphId,
                         KeyCodec.vertexIdentity(type.id(), vid));
+                if (existing == null) {
+                    applyStatsDelta(session, batch, graphId, NODE_KIND, type.id(), 1L);
+                }
                 store.mutate(batch);
                 return true;
             }
@@ -635,13 +641,14 @@ public final class Catalog {
         if (rows == null) {
             throw new IllegalArgumentException("批量节点不能为空");
         }
-        return store.withStripes(List.of(nodeStripe(graphId, typeName)), () -> {
+        return store.withStripes(List.of(nodeStripe(graphId, typeName), metaStripe(graphId)), () -> {
             requireGraph(graphId);
             requireWritable(graphId);
             NodeType type = nodeType(graphId, typeName);
             StoreBatch batch = new StoreBatch();
             Map<Long, byte[]> previous = new LinkedHashMap<>();
             Map<Long, Map<String, Object>> nextValues = new LinkedHashMap<>();
+            long created = 0;
             try (ReadSession session = store.read()) {
                 for (BulkVertex row : rows) {
                     long vid = row.vid();
@@ -665,7 +672,9 @@ public final class Catalog {
                     batch.put(Cf.VERTEX, key, encoded);
                     previous.put(vid, encoded);
                     nextValues.put(vid, next);
+                    if (old == null) created++;
                 }
+                applyStatsDelta(session, batch, graphId, NODE_KIND, type.id(), created);
                 if (!batch.isEmpty()) {
                     store.mutate(batch);
                 }
@@ -687,9 +696,7 @@ public final class Catalog {
         NodeType planned = nodeType(graphId, typeName);
         List<String> stripes = new ArrayList<>();
         stripes.add(nodeStripe(graphId, typeName));
-        if (planned.idType() == IdType.STRING) {
-            stripes.add(metaStripe(graphId));
-        }
+        stripes.add(metaStripe(graphId));
         return store.withStripes(stripes, () -> {
             requireGraph(graphId);
             requireWritable(graphId);
@@ -700,6 +707,7 @@ public final class Catalog {
             long sequence = -1L;
             long originalSequence = -1L;
             int written = 0;
+            int created = 0;
             try (ReadSession session = store.read()) {
                 byte[] counterKey = KeyCodec.stringIdCounterKey(graphId);
                 if (type.idType() == IdType.STRING) {
@@ -760,10 +768,12 @@ public final class Catalog {
                     batch.put(Cf.VERTEX, key, encoded);
                     previous.put(vid, encoded);
                     written++;
+                    if (old == null) created++;
                 }
                 if (type.idType() == IdType.STRING && sequence != originalSequence) {
                     batch.put(Cf.CATALOG, counterKey, encodeLong(sequence));
                 }
+                applyStatsDelta(session, batch, graphId, NODE_KIND, type.id(), created);
                 if (!batch.isEmpty()) {
                     store.mutate(batch);
                 }
@@ -791,6 +801,7 @@ public final class Catalog {
         checkIdentifier(relType);
         List<String> stripes = new ArrayList<>();
         stripes.add(edgeStripe(graphId, relType));
+        stripes.add(metaStripe(graphId));
         if (source.typeName() != null) {
             stripes.add(nodeStripe(graphId, source.typeName()));
         }
@@ -821,6 +832,8 @@ public final class Catalog {
                     return insertAcross(session, graphId, type, rank, source, target, encoded, propKey,
                             outPart, inPart, vertices, edgeIndexes, existingProp);
                 }
+                byte[] existingOut = session.get(Cf.EDGE, KeyCodec.edgeKey(
+                        graphId, outPart, source.vid(), type.id(), Direction.OUT.code(), rank, target.vid()));
                 StoreBatch batch = new StoreBatch();
                 batch.put(Cf.EDGE, KeyCodec.edgeKey(
                         graphId, outPart, source.vid(), type.id(), Direction.OUT.code(), rank, target.vid()), EMPTY);
@@ -838,16 +851,18 @@ public final class Catalog {
                             graphId,
                             KeyCodec.edgeIdentity(type.id(), rank, source.vid(), target.vid()));
                 }
+                Map<Integer, Long> newVertexCounts = new LinkedHashMap<>();
                 for (VertexPut vertex : vertices) {
                     byte[] vertexKey = KeyCodec.vertexKey(
                             graphId, partOf(graphId, vertex.vid()), vertex.vid(), vertex.tagId());
                     batch.put(Cf.VERTEX, vertexKey, vertex.value());
+                    byte[] existingVertex = session.get(Cf.VERTEX, vertexKey);
+                    if (existingVertex == null) newVertexCounts.merge(vertex.tagId(), 1L, Long::sum);
                     List<IndexDef> nodeIndexes = indexesFor(graphId, true, vertex.tagId());
                     if (nodeIndexes.isEmpty()) {
                         continue;
                     }
                     NodeType node = nodeTypeById(graphId, vertex.tagId());
-                    byte[] existingVertex = session.get(Cf.VERTEX, vertexKey);
                     IndexMaintenance.sync(
                             session,
                             batch,
@@ -860,6 +875,11 @@ public final class Catalog {
                             graphId,
                             KeyCodec.vertexIdentity(vertex.tagId(), vertex.vid()));
                 }
+                Map<CountKey, Long> statsDelta = new LinkedHashMap<>();
+                newVertexCounts.forEach((tagId, count) -> statsDelta.merge(
+                        new CountKey(NODE_KIND, tagId), count, Long::sum));
+                if (existingOut == null) statsDelta.merge(new CountKey(REL_KIND, type.id()), 1L, Long::sum);
+                applyStatsDeltas(session, batch, graphId, statsDelta);
                 store.commitEdges(batch);
                 return true;
             }
@@ -876,7 +896,7 @@ public final class Catalog {
         if (rows == null) {
             throw new IllegalArgumentException("批量边不能为空");
         }
-        return store.withStripes(List.of(edgeStripe(graphId, relTypeName)), () -> {
+        return store.withStripes(List.of(edgeStripe(graphId, relTypeName), metaStripe(graphId)), () -> {
             requireGraph(graphId);
             requireWritable(graphId);
             RelType type = relType(graphId, relTypeName);
@@ -884,6 +904,7 @@ public final class Catalog {
             StoreBatch batch = new StoreBatch();
             Map<EdgeIdentity, CrossEdge> cross = new LinkedHashMap<>();
             Map<EdgeIdentity, byte[]> previous = new LinkedHashMap<>();
+            Map<CountKey, Long> statsDelta = new LinkedHashMap<>();
             try (ReadSession session = store.read()) {
                 for (BulkEdge row : rows) {
                     int outPart = partOf(graphId, row.src());
@@ -897,6 +918,9 @@ public final class Catalog {
                             : session.get(Cf.PROP, propKey);
                     if (ifNotExists && old != null) {
                         continue;
+                    }
+                    if (old == null) {
+                        statsDelta.merge(new CountKey(REL_KIND, type.id()), 1L, Long::sum);
                     }
                     Map<String, Object> next = normalizeProperties(type.properties(), row.properties());
                     byte[] encoded = PropCodec.encode(type.schemaVersion(), type.properties(), next);
@@ -931,6 +955,10 @@ public final class Catalog {
                 }
                 if (!cross.isEmpty()) {
                     writeCrossBulk(session, graphId, type, edgeIndexes, List.copyOf(cross.values()));
+                    // 跨分片提交包含补偿事务，完成后再由重建逻辑校准计数。
+                    batch.put(Cf.CATALOG, KeyCodec.statsReadyKey(graphId), new byte[] {0});
+                } else {
+                    applyStatsDeltas(session, batch, graphId, statsDelta);
                 }
                 if (!batch.isEmpty()) {
                     store.commitEdges(batch);
@@ -948,6 +976,7 @@ public final class Catalog {
             List<IndexDef> edgeIndexes,
             List<CrossEdge> rows) {
         StoreBatch outBatch = new StoreBatch();
+        outBatch.put(Cf.CATALOG, KeyCodec.statsReadyKey(graphId), new byte[] {0});
         for (CrossEdge row : rows) {
             outBatch.put(Cf.EDGE, KeyCodec.edgeKey(
                     graphId, row.outPart(), row.src(), type.id(), Direction.OUT.code(), row.rank(), row.dst()), EMPTY);
@@ -1086,6 +1115,7 @@ public final class Catalog {
         requireWritable(graphId);
         StoreBatch batch = new StoreBatch();
         boolean edgeKeys = false;
+        Map<CountKey, Long> statsDelta = new LinkedHashMap<>();
         int affected = 0;
         try (ReadSession session = store.read()) {
             for (Mutation mutation : mutations) {
@@ -1093,13 +1123,17 @@ public final class Catalog {
                     case Mutation.SetVertex set -> affected += writeVertex(session, batch, graphId, set);
                     case Mutation.SetEdge set -> affected += writeEdge(session, batch, graphId, set);
                     case Mutation.DeleteEdge delete -> {
+                        int edgeTypeId = relType(graphId, delete.typeName()).id();
                         if (removeEdge(session, batch, graphId, delete)) {
                             affected++;
                             edgeKeys = true;
+                            statsDelta.merge(new CountKey(REL_KIND, edgeTypeId), -1L, Long::sum);
                         }
                     }
                     case Mutation.DeleteVertex delete -> {
-                        int removed = removeVertex(session, batch, graphId, delete.vid(), maxEdgesPerVertex, delete.detach());
+                        Map<CountKey, Long> removedCounts = new LinkedHashMap<>();
+                        int removed = removeVertex(session, batch, graphId, delete.vid(), maxEdgesPerVertex, delete.detach(), removedCounts);
+                        removedCounts.forEach((key, value) -> statsDelta.merge(key, value, Long::sum));
                         if (removed > 0) {
                             affected++;
                         }
@@ -1109,6 +1143,7 @@ public final class Catalog {
                     }
                 }
             }
+            applyStatsDeltas(session, batch, graphId, statsDelta);
         }
         if (batch.isEmpty()) {
             return 0;
@@ -1199,7 +1234,8 @@ public final class Catalog {
 
     /** @return 0 没有这个点，1 只删了点，2 还删了边 */
     private int removeVertex(
-            ReadSession session, StoreBatch batch, int graphId, long vid, int maxEdgesPerVertex, boolean detach) {
+            ReadSession session, StoreBatch batch, int graphId, long vid, int maxEdgesPerVertex, boolean detach,
+            Map<CountKey, Long> statsDelta) {
         int part = partOf(graphId, vid);
         byte[] prefix = KeyCodec.vertexPrefix(graphId, part, vid);
         LinkedHashSet<EdgeRef> edges = new LinkedHashSet<>();
@@ -1221,6 +1257,7 @@ public final class Catalog {
             return 0;
         }
         for (EdgeRef edge : edges) {
+            statsDelta.merge(new CountKey(REL_KIND, edge.edgeTypeId()), -1L, Long::sum);
             ensureParts(graphId, edge.outSrc(), edge.outDst());
             dropEdgeIndex(session, batch, graphId, edge);
             batch.delete(Cf.EDGE, edgeKey(graphId, edge.edgeTypeId(), Direction.OUT, edge.outSrc(), edge.rank(), edge.outDst()));
@@ -1228,6 +1265,7 @@ public final class Catalog {
             batch.delete(Cf.PROP, KeyCodec.propKey(graphId, edge.edgeTypeId(), edge.rank(), edge.outSrc(), edge.outDst()));
         }
         for (byte[] key : vertices) {
+            statsDelta.merge(new CountKey(NODE_KIND, KeyCodec.tagIdOf(key)), -1L, Long::sum);
             dropVertexIndex(session, batch, graphId, key);
             batch.delete(Cf.VERTEX, key);
         }
@@ -1399,35 +1437,106 @@ public final class Catalog {
 
     public List<StatsRow> stats(int graphId, CancelToken cancel) {
         requireGraph(graphId);
-        Map<Integer, Long> relCount = new HashMap<>();
-        Map<Integer, Long> nodeCount = new HashMap<>();
-        try (ReadSession session = store.read()) {
-            session.visitPrefix(Cf.EDGE, KeyCodec.graphIdPrefix(graphId), cancel, key -> {
-                if (key.length != KeyCodec.EDGE_KEY_LENGTH) {
-                    return;
+        return store.withStripes(List.of(metaStripe(graphId)), () -> {
+            boolean rebuild;
+            try (ReadSession session = store.read()) {
+                byte[] ready = session.get(Cf.CATALOG, KeyCodec.statsReadyKey(graphId));
+                rebuild = ready == null || ready.length == 0 || ready[0] != 1;
+                if (rebuild) {
+                    rebuildStats(session, graphId, cancel);
                 }
-                KeyCodec.DecodedEdge edge = KeyCodec.decodeEdge(key);
-                if (edge.direction() != Direction.OUT.code()) {
-                    return;
+            }
+            // rebuildStats 写入了新的元数据，必须重新打开快照才能读到新计数。
+            try (ReadSession session = store.read()) {
+                List<StatsRow> rows = new ArrayList<>();
+                for (NodeType type : nodeTypes(graphId)) {
+                    rows.add(new StatsRow("NODE", type.name(), readStatsCount(session, graphId, NODE_KIND, type.id())));
                 }
-                relCount.merge(edge.edgeTypeId(), 1L, Long::sum);
-            });
-            session.visitPrefix(Cf.VERTEX, KeyCodec.graphIdPrefix(graphId), cancel, key -> {
-                if (key.length != KeyCodec.VERTEX_KEY_LENGTH) {
-                    return;
+                for (RelType type : relTypes(graphId)) {
+                    rows.add(new StatsRow("REL", type.name(), readStatsCount(session, graphId, REL_KIND, type.id())));
                 }
-                nodeCount.merge(KeyCodec.tagIdOf(key), 1L, Long::sum);
-            });
-        }
-        List<StatsRow> rows = new ArrayList<>();
+                rows.sort(Comparator.comparing(StatsRow::target).thenComparing(StatsRow::name));
+                return rows;
+            }
+        });
+    }
+
+    private void rebuildStats(ReadSession session, int graphId, CancelToken cancel) {
+        Map<CountKey, Long> counts = new LinkedHashMap<>();
+        session.visitPrefix(Cf.EDGE, KeyCodec.graphIdPrefix(graphId), cancel, key -> {
+            if (key.length != KeyCodec.EDGE_KEY_LENGTH) return;
+            KeyCodec.DecodedEdge edge = KeyCodec.decodeEdge(key);
+            if (edge.direction() == Direction.OUT.code()) {
+                counts.merge(new CountKey(REL_KIND, edge.edgeTypeId()), 1L, Long::sum);
+            }
+        });
+        session.visitPrefix(Cf.VERTEX, KeyCodec.graphIdPrefix(graphId), cancel, key -> {
+            if (key.length == KeyCodec.VERTEX_KEY_LENGTH) {
+                counts.merge(new CountKey(NODE_KIND, KeyCodec.tagIdOf(key)), 1L, Long::sum);
+            }
+        });
+        StoreBatch batch = new StoreBatch();
         for (NodeType type : nodeTypes(graphId)) {
-            rows.add(new StatsRow("NODE", type.name(), nodeCount.getOrDefault(type.id(), 0L)));
+            batch.put(Cf.CATALOG, KeyCodec.statsCountKey(graphId, NODE_KIND, type.id()),
+                    encodeLong(counts.getOrDefault(new CountKey(NODE_KIND, type.id()), 0L)));
         }
         for (RelType type : relTypes(graphId)) {
-            rows.add(new StatsRow("REL", type.name(), relCount.getOrDefault(type.id(), 0L)));
+            batch.put(Cf.CATALOG, KeyCodec.statsCountKey(graphId, REL_KIND, type.id()),
+                    encodeLong(counts.getOrDefault(new CountKey(REL_KIND, type.id()), 0L)));
         }
-        rows.sort(Comparator.comparing(StatsRow::target).thenComparing(StatsRow::name));
-        return rows;
+        long nodes = counts.entrySet().stream().filter(entry -> entry.getKey().kind() == NODE_KIND)
+                .mapToLong(Map.Entry::getValue).sum();
+        long rels = counts.entrySet().stream().filter(entry -> entry.getKey().kind() == REL_KIND)
+                .mapToLong(Map.Entry::getValue).sum();
+        batch.put(Cf.CATALOG, KeyCodec.statsCountKey(graphId, NODE_KIND, 0), encodeLong(nodes));
+        batch.put(Cf.CATALOG, KeyCodec.statsCountKey(graphId, REL_KIND, 0), encodeLong(rels));
+        batch.put(Cf.CATALOG, KeyCodec.statsReadyKey(graphId), new byte[] {1});
+        store.mutate(batch);
+    }
+
+    private static long readStatsCount(ReadSession session, int graphId, int kind, int typeId) {
+        byte[] raw = session.get(Cf.CATALOG, KeyCodec.statsCountKey(graphId, kind, typeId));
+        return raw == null ? 0L : decodeLong(raw);
+    }
+
+    private void applyStatsDelta(ReadSession session, StoreBatch batch, int graphId, int kind, int typeId, long delta) {
+        if (delta == 0) return;
+        byte[] ready = session.get(Cf.CATALOG, KeyCodec.statsReadyKey(graphId));
+        if (ready == null || ready.length == 0 || ready[0] != 1) return;
+        long current = readStatsCount(session, graphId, kind, typeId);
+        long total = readStatsCount(session, graphId, kind, 0);
+        if (current + delta < 0 || total + delta < 0) {
+            throw new CengyanException(ErrorCode.INTERNAL, "统计计数不能为负");
+        }
+        batch.put(Cf.CATALOG, KeyCodec.statsCountKey(graphId, kind, typeId), encodeLong(current + delta));
+        batch.put(Cf.CATALOG, KeyCodec.statsCountKey(graphId, kind, 0), encodeLong(total + delta));
+    }
+
+    private void applyStatsDeltas(ReadSession session, StoreBatch batch, int graphId, Map<CountKey, Long> deltas) {
+        if (deltas.isEmpty()) return;
+        byte[] ready = session.get(Cf.CATALOG, KeyCodec.statsReadyKey(graphId));
+        if (ready == null || ready.length == 0 || ready[0] != 1) return;
+        Map<Integer, Long> totalDeltas = new LinkedHashMap<>();
+        for (Map.Entry<CountKey, Long> entry : deltas.entrySet()) {
+            CountKey key = entry.getKey();
+            long delta = entry.getValue();
+            if (delta == 0) continue;
+            long current = readStatsCount(session, graphId, key.kind(), key.typeId());
+            if (current + delta < 0) {
+                throw new CengyanException(ErrorCode.INTERNAL, "统计计数不能为负");
+            }
+            batch.put(Cf.CATALOG, KeyCodec.statsCountKey(graphId, key.kind(), key.typeId()),
+                    encodeLong(current + delta));
+            totalDeltas.merge(key.kind(), delta, Long::sum);
+        }
+        for (Map.Entry<Integer, Long> entry : totalDeltas.entrySet()) {
+            long current = readStatsCount(session, graphId, entry.getKey(), 0);
+            long next = current + entry.getValue();
+            if (next < 0) {
+                throw new CengyanException(ErrorCode.INTERNAL, "统计总数不能为负");
+            }
+            batch.put(Cf.CATALOG, KeyCodec.statsCountKey(graphId, entry.getKey(), 0), encodeLong(next));
+        }
     }
 
     private static Map<String, Object> checkedUpdates(List<PropDef> properties, Map<String, Object> updates) {
@@ -1747,6 +1856,7 @@ public final class Catalog {
                 }
                 StoreBatch batch = new StoreBatch();
                 batch.delete(Cf.CATALOG, KeyCodec.typeKey(graphId, kind, typeKey.typeId()));
+                batch.put(Cf.CATALOG, KeyCodec.statsReadyKey(graphId), new byte[] {0});
                 int typeId = typeKey.typeId();
                 if (node) {
                     session.visitPrefix(Cf.VERTEX, KeyCodec.graphIdPrefix(graphId), null, key -> {
@@ -2290,6 +2400,7 @@ public final class Catalog {
             byte[] existingProp) {
         byte[] txnKey = KeyCodec.txnKey(graphId, outPart, type.id(), rank, source.vid(), target.vid());
         StoreBatch outBatch = new StoreBatch();
+        outBatch.put(Cf.CATALOG, KeyCodec.statsReadyKey(graphId), new byte[] {0});
         outBatch.put(Cf.EDGE, KeyCodec.edgeKey(
                 graphId, outPart, source.vid(), type.id(), Direction.OUT.code(), rank, target.vid()), EMPTY);
         outBatch.put(Cf.PROP, propKey, encoded);
@@ -2590,6 +2701,9 @@ public final class Catalog {
     }
 
     private record EdgeIdentity(long rank, long src, long dst) {
+    }
+
+    private record CountKey(int kind, int typeId) {
     }
 
     private record CrossEdge(

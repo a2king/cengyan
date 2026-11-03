@@ -535,6 +535,57 @@ class QueryEngineTest {
         }
     }
 
+    @Test
+    void 最短路径必须到达模式中的终点而不是第一层中间点() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH ShortestTarget",
+                    "USE ShortestTarget",
+                    "CREATE NODE TYPE org ID STRING(32) ()",
+                    "CREATE REL TYPE inv ()",
+                    "INSERT (a:org {id:'A'})-[:inv]->(b:org {id:'M'})",
+                    "INSERT (a:org {id:'M'})-[:inv]->(b:org {id:'T'})");
+            QueryResult any = run(db, """
+                    MATCH p = ANY SHORTEST
+                        (s:org {id:'A'})-[:inv]-{1,6}(t:org {id:'T'})
+                    RETURN p
+                    """);
+            assertEquals(1, any.rows().size());
+            Map<?, ?> path = (Map<?, ?>) any.rows().get(0).get(0);
+            List<?> nodes = (List<?>) path.get("nodes");
+            assertEquals("T", ((Map<?, ?>) nodes.get(nodes.size() - 1)).get("id"));
+        }
+    }
+
+    @Test
+    void 多起点多终点的AllShortest使用目标Id集合() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH MultiShortest",
+                    "USE MultiShortest",
+                    "CREATE NODE TYPE org ID STRING(32) ()",
+                    "CREATE REL TYPE inv ()",
+                    "INSERT (a:org {id:'S1'})-[:inv]->(b:org {id:'M'})",
+                    "INSERT (a:org {id:'S2'})-[:inv]->(b:org {id:'M'})",
+                    "INSERT (a:org {id:'M'})-[:inv]->(b:org {id:'T1'})",
+                    "INSERT (a:org {id:'M'})-[:inv]->(b:org {id:'T2'})");
+            QueryResult result = run(db, """
+                    MATCH p = ALL SHORTEST TRAIL
+                        (s)-[:inv]-{1,5}(t)
+                    WHERE s.id IN ['S1', 'S2'] AND t.id IN ['T1', 'T2']
+                    RETURN p
+                    LIMIT 50
+                    """);
+            assertEquals(4, result.rows().size());
+            for (List<Object> row : result.rows()) {
+                Map<?, ?> path = (Map<?, ?>) row.get(0);
+                List<?> nodes = (List<?>) path.get("nodes");
+                assertTrue(Set.of("T1", "T2").contains(
+                        ((Map<?, ?>) nodes.get(nodes.size() - 1)).get("id")));
+            }
+        }
+    }
+
     private static QueryResult run(Db db, String gql) {
         return run(db, gql, limits());
     }

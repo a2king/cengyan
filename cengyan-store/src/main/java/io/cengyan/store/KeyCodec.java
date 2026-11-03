@@ -194,6 +194,41 @@ public final class KeyCodec {
         return markedGraphKey(0x22, graphId);
     }
 
+    /** 图空间元数据中的精确计数：0x23 + graphId + kind + typeId。typeId=0 表示总数。 */
+    public static byte[] statsCountKey(int graphId, int kind, int typeId) {
+        checkUint16(graphId, "graphId");
+        checkUint32(typeId, "typeId");
+        if (kind != 1 && kind != 2) throw new IllegalArgumentException("统计种类无效");
+        byte[] key = new byte[8];
+        key[0] = 0x23;
+        putUint16(key, 1, graphId);
+        key[3] = (byte) kind;
+        putUint32(key, 4, typeId);
+        return key;
+    }
+
+    public static byte[] statsCountPrefix(int graphId, int kind) {
+        byte[] key = new byte[4];
+        key[0] = 0x23;
+        putUint16(key, 1, graphId);
+        key[3] = (byte) kind;
+        return key;
+    }
+
+    public static byte[] statsReadyKey(int graphId) {
+        return markedGraphKey(0x24, graphId);
+    }
+
+    public static int statsCountKind(byte[] key) {
+        if (key == null || key.length != 8 || key[0] != 0x23) throw new IllegalArgumentException("不是统计计数键");
+        return key[3] & 0xFF;
+    }
+
+    public static int statsCountTypeId(byte[] key) {
+        if (key == null || key.length != 8 || key[0] != 0x23) throw new IllegalArgumentException("不是统计计数键");
+        return getUint32(key, 4);
+    }
+
     /** 字符串 ID 映射记录：0x60 + kind + graphId + payload。 */
     public static byte[] stringIdCounterKey(int graphId) {
         byte[] key = new byte[4];

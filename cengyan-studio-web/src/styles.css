@@ -148,6 +148,7 @@ button, input, textarea, select { font-family: inherit; }
 .result-card-loading-content { width: 1px; height: 1px; }
 .result-loading-card { align-items: center; justify-content: center; }
 .result-loading-content { width: 1px; height: 1px; }
+.result-error-card { padding: 24px; }
 .result-card .result-heading { flex: none; }
 .result-card .result-tabs { display: flex; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
 .result-card .ant-tabs-body-holder,
@@ -233,6 +234,8 @@ button, input, textarea, select { font-family: inherit; }
 }
 .login-card .login-check.ant-btn {
   margin-top: 10px;
+  height: 40px;
+  padding-block: 0;
   background: #e8ebf2;
   color: #3d4663;
 }
