@@ -35,10 +35,12 @@ export const storage = {
 export class CengyanApi {
   private session: string;
   private readonly onSession: (session: string) => void;
+  private readonly onUnauthorized: () => void;
 
-  constructor(session: string, onSession: (session: string) => void) {
+  constructor(session: string, onSession: (session: string) => void, onUnauthorized: () => void) {
     this.session = session;
     this.onSession = onSession;
+    this.onUnauthorized = onUnauthorized;
   }
 
   async login(user: string, password: string): Promise<SessionInfo> {
@@ -87,6 +89,10 @@ export class CengyanApi {
     return this.request('/api/ping', {});
   }
 
+  async checkSession(): Promise<QueryResponse> {
+    return this.request('/api/session', {});
+  }
+
   async config(): Promise<StudioConfig> {
     const response = await fetch('/api/config');
     const data = await response.json() as QueryResponse & Partial<StudioConfig>;
@@ -114,6 +120,9 @@ export class CengyanApi {
     if (data.session && data.session !== this.session) {
       this.session = data.session;
       this.onSession(data.session);
+    }
+    if (response.status === 401 || response.status === 403 || data.code === 'FORBIDDEN') {
+      this.onUnauthorized();
     }
     if (!response.ok || data.code !== 'OK') {
       throw new Error(`${data.code || 'REQUEST_FAILED'} ${data.message || '请求失败'}`);
