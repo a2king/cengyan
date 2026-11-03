@@ -418,7 +418,7 @@ function LoginPage({ api, onLogin }: { api: CengyanApi; onLogin: (info: SessionI
               icon={error.startsWith('连接正常') ? <Check size={16} /> : <AlertCircle size={16} />}
               message={error || ' '}
             />
-            <Button type="primary" htmlType="submit" size="large" block loading={loading}>登录并连接</Button>
+            <Button type="primary" htmlType="submit" size="large" block loading={loading}>登录</Button>
             <Button className="login-check" type="text" block loading={pinging} onClick={async () => { setPinging(true); setError(''); try { await api.ping(); setError('连接正常，可以登录'); } catch (reason) { setError(reason instanceof Error ? reason.message : '连接失败'); } finally { setPinging(false); } }}>检查连接</Button>
           </Form>
         </Card>
@@ -928,6 +928,7 @@ function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, o
   const { notification: notificationApi } = AntApp.useApp();
   const [query, setQuery] = useState(() => localStorage.getItem('cengyan.studio.last-query') || DEFAULT_QUERY);
   const [result, setResult] = useState<ScriptResult[] | null>(null);
+  const [queryError, setQueryError] = useState('');
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState('');
   const [editorReady, setEditorReady] = useState(false);
@@ -950,6 +951,7 @@ function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, o
     if (!graph) { reportQueryError('请先在右上角选择图空间'); return; }
     const statements = [text.trim()];
     if (!statements[0]) { reportQueryError('GQL 语句不能为空'); return; }
+    setQueryError('');
     setRunning(true);
     onInflight(text.trim());
     const done: ScriptResult[] = [];
@@ -957,13 +959,15 @@ function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, o
       setProgress(text.includes(';') ? '正在执行脚本，返回最后一条语句的结果' : '');
        const response = await api.query(text, 30000);
        done.push({ statement: text.trim(), response, elapsedMs: Number(response.elapsedMs ?? 0) });
-      setResult([...done]);
+       setResult([...done]);
+       setQueryError('');
       const uses = [...text.matchAll(/\bUSE\s+([A-Za-z][A-Za-z0-9_]*)/gi)];
       if (uses.length) onGraphChanged(uses[uses.length - 1][1]);
       localStorage.setItem('cengyan.studio.last-query', text);
     } catch (reason) {
-      if (done.length) setResult([...done]);
       const message = reason instanceof Error ? reason.message : '查询失败';
+      setResult(null);
+      setQueryError(message);
       reportQueryError(message);
     } finally {
       setRunning(false);
@@ -1010,10 +1014,11 @@ function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, o
   const editorMount: OnMount = (editor) => { editorRef.current = editor; editor.addCommand(2048 | 3, () => { runQueryRef.current(); }); };
   useEffect(() => { let live = true; void import('./monaco').then(() => { if (live) setEditorReady(true); }); return () => { live = false; }; }, []);
   useEffect(() => { if (active) editorRef.current?.layout(); }, [active]);
-  return <div className="query-page"><Row gutter={[18, 18]}><Col span={24}><Card className="editor-card" bordered={false}><div className="editor-toolbar"><div className="editor-file"><Tag color="geekblue">GQL</Tag></div><Button type="text" size="small" icon={<Trash2 size={14} />} onClick={() => { setQuery(''); editorRef.current?.setValue(''); }}>清空</Button></div>{editorReady ? <Editor height="350px" language="gql" theme="vs" value={query} onChange={(value) => setQuery(value || '')} onMount={editorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineNumbers: 'on', padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false, wordWrap: 'on', roundedSelection: false, automaticLayout: true, tabSize: 2 }} /> : <div className="editor-pending">正在打开编辑器…</div>}<div className="editor-footer"><Text type="secondary">{progress || '多条语句用分号分隔，服务端顺序执行并返回最后一条 · Ctrl + Enter'}</Text><Space size={8}>{canWrite && <Tag color="green">读写权限</Tag>}<Button type="primary" icon={<Code2 size={15} />} onClick={() => void runQuery()} loading={running} disabled={!graph || exporting}>执行查询 <Text className="shortcut">Ctrl ↵</Text></Button></Space></div></Card>{(result || running) && <ScriptResults api={api} results={result || []} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} loading={running} exporting={exporting} onExport={() => void exportCsv()} />}</Col></Row></div>;
+  return <div className="query-page"><Row gutter={[18, 18]}><Col span={24}><Card className="editor-card" bordered={false}><div className="editor-toolbar"><div className="editor-file"><Tag color="geekblue">GQL</Tag></div><Button type="text" size="small" icon={<Trash2 size={14} />} onClick={() => { setQuery(''); editorRef.current?.setValue(''); }}>清空</Button></div>{editorReady ? <Editor height="350px" language="gql" theme="vs" value={query} onChange={(value) => setQuery(value || '')} onMount={editorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineNumbers: 'on', padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false, wordWrap: 'on', roundedSelection: false, automaticLayout: true, tabSize: 2 }} /> : <div className="editor-pending">正在打开编辑器…</div>}<div className="editor-footer"><Text type="secondary">{progress || '多条语句用分号分隔，服务端顺序执行并返回最后一条 · Ctrl + Enter'}</Text><Space size={8}>{canWrite && <Tag color="green">读写权限</Tag>}<Button type="primary" icon={<Code2 size={15} />} onClick={() => void runQuery()} loading={running} disabled={!graph || exporting}>执行查询 <Text className="shortcut">Ctrl ↵</Text></Button></Space></div></Card>{(result || running || queryError) && <ScriptResults api={api} results={result || []} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} loading={running} error={queryError} exporting={exporting} onExport={() => void exportCsv()} />}</Col></Row></div>;
 }
 
-function ScriptResults({ api, results, loading, graphMaxNodes, tableMaxNodes, exporting, onExport }: { api: CengyanApi; results: ScriptResult[]; loading: boolean; graphMaxNodes: number; tableMaxNodes: number; exporting: boolean; onExport: () => void }) {
+function ScriptResults({ api, results, loading, error, graphMaxNodes, tableMaxNodes, exporting, onExport }: { api: CengyanApi; results: ScriptResult[]; loading: boolean; error?: string; graphMaxNodes: number; tableMaxNodes: number; exporting: boolean; onExport: () => void }) {
+  if (error) return <Card className="result-card result-error-card" bordered={false}><Alert type="error" showIcon message="查询失败" description={error} /></Card>;
   if (!results.length) return <Card className="result-card" bordered={false}><div className="result-card-loading-placeholder" /><div className="result-card-loading-overlay"><Spin description="查询中..." size="small"><div className="result-card-loading-content" /></Spin></div></Card>;
   if (results.length === 1) return <QueryResult api={api} response={results[0].response} elapsedMs={results[0].elapsedMs} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} loading={loading} exporting={exporting} onExport={onExport} />;
   return <>{results.map((item, index) => <div className="script-result" key={`${index}-${item.statement}`}><div className="script-result-label"><Text type="secondary">第 {index + 1} 条 · {item.elapsedMs} ms</Text><pre>{item.statement}</pre></div><QueryResult api={api} response={item.response} elapsedMs={item.elapsedMs} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} loading={loading && index === results.length - 1} exporting={exporting} onExport={onExport} /></div>)}</>;
