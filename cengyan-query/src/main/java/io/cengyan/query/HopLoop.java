@@ -75,11 +75,12 @@ public final class HopLoop {
         if (maxHop > maxHops) {
             throw new CengyanException(ErrorCode.SYNTAX, "跳数 " + maxHop + " 超过上限 " + maxHops);
         }
-        LinkedHashSet<Long> visited = new LinkedHashSet<>();
+        QuerySpillContext spill = QuerySpillContext.current();
+        IdSet visited = newIdSet(spill);
         visited.add(start);
-        LinkedHashSet<Long> frontier = new LinkedHashSet<>();
+        IdSet frontier = newIdSet(spill);
         frontier.add(start);
-        LinkedHashSet<Long> reached = new LinkedHashSet<>();
+        IdSet reached = newIdSet(spill);
         for (int hop = 1; hop <= maxHop; hop++) {
             if (cancel != null && cancel.cancelled()) {
                 throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
@@ -89,8 +90,11 @@ public final class HopLoop {
                         ErrorCode.FRONTIER_EXCEEDED,
                         "第 " + hop + " 跳的起点集合大小为 " + frontier.size() + "，超过上限 " + maxFrontierPerHop);
             }
-            LinkedHashSet<Long> next = new LinkedHashSet<>();
-            for (long vid : frontier) {
+            IdSet next = newIdSet(spill);
+            final int currentHop = hop;
+            IdSet currentFrontier = frontier;
+            currentFrontier.forEach(vid -> {
+                final int[] examined = {0};
                 for (Direction direction : directions) {
                     try (EdgeCursor cursor = session.scanEdges(
                             graphId, vid, edgeTypeId, direction, -1, maxEdgesPerVertex,
@@ -98,6 +102,11 @@ public final class HopLoop {
                             cancel)) {
                         while (cursor.hasNext()) {
                             EdgeRef edge = cursor.next();
+                            if (++examined[0] > 0 && spill != null && spill.enabled()
+                                    && !spill.active()
+                                    && spillEdgeThresholdReached(spill, examined[0])) {
+                                activate(spill, visited, next, reached);
+                            }
                             long other = other(edge, vid);
                             if (!visited.add(other)) {
                                 continue;
@@ -106,26 +115,31 @@ public final class HopLoop {
                             if (next.size() > maxFrontierPerHop) {
                                 throw new CengyanException(
                                         ErrorCode.FRONTIER_EXCEEDED,
-                                        "第 " + hop + " 跳起点 " + vid + " 的新点超过上限 " + maxFrontierPerHop);
+                                         "第 " + currentHop + " 跳起点 " + vid + " 的新点超过上限 " + maxFrontierPerHop);
                             }
                         }
                     } catch (CengyanException ex) {
                         if (ex.code() == ErrorCode.TRUNCATED) {
                             throw new CengyanException(
                                     ErrorCode.TRUNCATED,
-                                    "第 " + hop + " 跳起点 " + vid + "：" + ex.getMessage(),
+                                     "第 " + currentHop + " 跳起点 " + vid + "：" + ex.getMessage(),
                                     ex);
                         }
                         throw ex;
                     }
                 }
-            }
+            });
             if (hop >= minHop) {
-                reached.addAll(next);
+                next.forEach(reached::add);
+            }
+            if (spill != null && spill.active()) {
+                spill.activateSets(frontier.spillSet(), next.spillSet(), visited.spillSet(), reached.spillSet());
             }
             frontier = next;
         }
-        return reached;
+        LinkedHashSet<Long> result = new LinkedHashSet<>();
+        reached.forEach(result::add);
+        return result;
     }
 
     /**
@@ -158,11 +172,12 @@ public final class HopLoop {
         if (maxHop > maxHops) {
             throw new CengyanException(ErrorCode.SYNTAX, "跳数 " + maxHop + " 超过上限 " + maxHops);
         }
-        LinkedHashSet<Long> visited = new LinkedHashSet<>();
+        QuerySpillContext spill = QuerySpillContext.current();
+        IdSet visited = newIdSet(spill);
         visited.add(start);
-        LinkedHashSet<Long> frontier = new LinkedHashSet<>();
+        IdSet frontier = newIdSet(spill);
         frontier.add(start);
-        LinkedHashSet<Long> reached = new LinkedHashSet<>();
+        IdSet reached = newIdSet(spill);
         for (int hop = 1; hop <= maxHop; hop++) {
             if (cancel != null && cancel.cancelled()) {
                 throw new CengyanException(ErrorCode.QUERY_CANCELED, "查询已取消");
@@ -172,14 +187,22 @@ public final class HopLoop {
                         ErrorCode.FRONTIER_EXCEEDED,
                         "第 " + hop + " 跳的起点集合大小为 " + frontier.size() + "，超过上限 " + maxFrontierPerHop);
             }
-            LinkedHashSet<Long> next = new LinkedHashSet<>();
-            for (long vid : frontier) {
+            IdSet next = newIdSet(spill);
+            final int currentHop = hop;
+            IdSet currentFrontier = frontier;
+            currentFrontier.forEach(vid -> {
+                final int[] examined = {0};
                 try (EdgeCursor cursor = session.scanEdges(
                         graphId, vid, edgeTypeIds, directions, -1, maxEdgesPerVertex,
                         edge -> rankOk(rank, edge.rank()) && neighborOk(neighbor, otherEnd(edge, vid)),
                         cancel)) {
                     while (cursor.hasNext()) {
                         EdgeRef edge = cursor.next();
+                        if (++examined[0] > 0 && spill != null && spill.enabled()
+                                && !spill.active()
+                                && spillEdgeThresholdReached(spill, examined[0])) {
+                            activate(spill, visited, next, reached);
+                        }
                         long other = otherEnd(edge, vid);
                         if (!visited.add(other)) {
                             continue;
@@ -188,25 +211,74 @@ public final class HopLoop {
                         if (next.size() > maxFrontierPerHop) {
                             throw new CengyanException(
                                     ErrorCode.FRONTIER_EXCEEDED,
-                                    "第 " + hop + " 跳起点 " + vid + " 的新点超过上限 " + maxFrontierPerHop);
+                                         "第 " + currentHop + " 跳起点 " + vid + " 的新点超过上限 " + maxFrontierPerHop);
                         }
                     }
                 } catch (CengyanException ex) {
                     if (ex.code() == ErrorCode.TRUNCATED) {
                         throw new CengyanException(
                                 ErrorCode.TRUNCATED,
-                                "第 " + hop + " 跳起点 " + vid + "：" + ex.getMessage(),
+                                     "第 " + currentHop + " 跳起点 " + vid + "：" + ex.getMessage(),
                                 ex);
                     }
                     throw ex;
                 }
-            }
+            });
             if (hop >= minHop) {
-                reached.addAll(next);
+                next.forEach(reached::add);
+            }
+            if (spill != null && spill.active()) {
+                spill.activateSets(frontier.spillSet(), next.spillSet(), visited.spillSet(), reached.spillSet());
             }
             frontier = next;
         }
-        return reached;
+        LinkedHashSet<Long> result = new LinkedHashSet<>();
+        reached.forEach(result::add);
+        return result;
+    }
+
+    private static boolean spillEdgeThresholdReached(QuerySpillContext spill, int examined) {
+        return examined > spill.edgeThreshold();
+    }
+
+    private static void activate(QuerySpillContext spill, IdSet... sets) {
+        QuerySpillContext.SpillSet[] spillSets = java.util.Arrays.stream(sets)
+                .map(IdSet::spillSet)
+                .filter(java.util.Objects::nonNull)
+                .toArray(QuerySpillContext.SpillSet[]::new);
+        spill.activate(spillSets);
+    }
+
+    private static IdSet newIdSet(QuerySpillContext spill) {
+        return spill != null && spill.enabled()
+                ? new SpillIdSet(spill.newSet())
+                : new MemoryIdSet();
+    }
+
+    private interface IdSet {
+        boolean add(long value);
+        long size();
+        void forEach(java.util.function.LongConsumer consumer);
+        QuerySpillContext.SpillSet spillSet();
+    }
+
+    private static final class MemoryIdSet implements IdSet {
+        private final LinkedHashSet<Long> values = new LinkedHashSet<>();
+
+        @Override public boolean add(long value) { return values.add(value); }
+        @Override public long size() { return values.size(); }
+        @Override public void forEach(java.util.function.LongConsumer consumer) { values.forEach(consumer::accept); }
+        @Override public QuerySpillContext.SpillSet spillSet() { return null; }
+    }
+
+    private static final class SpillIdSet implements IdSet {
+        private final QuerySpillContext.SpillSet values;
+
+        private SpillIdSet(QuerySpillContext.SpillSet values) { this.values = values; }
+        @Override public boolean add(long value) { return values.add(value); }
+        @Override public long size() { return values.size(); }
+        @Override public void forEach(java.util.function.LongConsumer consumer) { values.forEach(consumer); }
+        @Override public QuerySpillContext.SpillSet spillSet() { return values; }
     }
 
     private static long otherEnd(EdgeRef edge, long vid) {

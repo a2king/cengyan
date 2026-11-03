@@ -302,7 +302,7 @@ final class GraphQuery {
             QueryLimits limits,
             CancelToken cancel) {
         Row start = row.copy();
-        start.candidates = null;
+        start.candidates = sourceIdCandidates(match, graphId, params);
         List<Row> current = List.of(start);
         String previous = null;
         for (Stmt.Element element : pattern.elements()) {
@@ -325,6 +325,91 @@ final class GraphQuery {
             }
         }
         return current;
+    }
+
+    /**
+     * 在通用 MATCH 管道中也下推起点 ID 谓词。
+     * 带 LET/GROUP BY 的查询不会走 MatchExecutor 的轻量 lower 路径，
+     * 因此这里必须在 bindNode 前处理 WHERE id(start)=...。
+     */
+    private List<Long> sourceIdCandidates(
+            Stmt.Clause.Match match,
+            int graphId,
+            Map<String, Object> params) {
+        if (match.patterns().isEmpty() || match.where() == null) {
+            return null;
+        }
+        Stmt.Pattern pattern = match.patterns().get(0);
+        if (pattern.elements().isEmpty() || !(pattern.elements().get(0) instanceof Stmt.Element.Node source)) {
+            return null;
+        }
+        String variable = source.node().variable();
+        if (variable == null) {
+            return null;
+        }
+        NodeType type = source.node().typeName() == null
+                ? null
+                : catalog.nodeType(graphId, source.node().typeName());
+        ExprEval eval = new ExprEval(params, false);
+        return sourceIdCandidates(match.where(), variable, type, graphId, eval);
+    }
+
+    private List<Long> sourceIdCandidates(
+            Expr where,
+            String variable,
+            NodeType type,
+            int graphId,
+            ExprEval eval) {
+        if (where instanceof Expr.Binary binary && "AND".equals(binary.op())) {
+            List<Long> left = sourceIdCandidates(binary.left(), variable, type, graphId, eval);
+            return left != null ? left : sourceIdCandidates(binary.right(), variable, type, graphId, eval);
+        }
+        if (where instanceof Expr.Binary binary && "=".equals(binary.op())) {
+            Expr constant;
+            if (isIdExpr(binary.left(), variable)) {
+                constant = binary.right();
+            } else if (isIdExpr(binary.right(), variable)) {
+                constant = binary.left();
+            } else {
+                return null;
+            }
+            Object value = constantValue(constant, eval);
+            if (value == null) {
+                return List.of();
+            }
+            long id = catalog.findVertexId(graphId, type, value);
+            return id == io.cengyan.catalog.Catalog.MISSING_VERTEX_ID ? List.of() : List.of(id);
+        }
+        if (where instanceof Expr.In in && !in.negated() && isIdExpr(in.value(), variable)) {
+            List<Long> ids = new ArrayList<>();
+            for (Expr option : in.options()) {
+                Object value = constantValue(option, eval);
+                if (value == null) {
+                    return List.of();
+                }
+                long id = catalog.findVertexId(graphId, type, value);
+                if (id != io.cengyan.catalog.Catalog.MISSING_VERTEX_ID) {
+                    ids.add(id);
+                }
+            }
+            return ids;
+        }
+        return null;
+    }
+
+    private static boolean isIdExpr(Expr expr, String variable) {
+        if (expr instanceof Expr.Prop prop) {
+            return variable.equals(prop.variable()) && "id".equals(prop.field());
+        }
+        return expr instanceof Expr.Call call
+                && "id".equalsIgnoreCase(call.name())
+                && call.args().size() == 1
+                && call.args().get(0) instanceof Expr.Variable ref
+                && variable.equals(ref.name());
+    }
+
+    private static Object constantValue(Expr expr, ExprEval eval) {
+        return expr instanceof Expr.Literal || expr instanceof Expr.Param ? eval.eval(expr) : null;
     }
 
     private List<Row> bindNode(
@@ -566,6 +651,9 @@ final class GraphQuery {
             return;
         }
         Found last = found.get(found.size() - 1);
+        for (Found step : found) {
+            row.pathEdges.add(edgeMap(graphId, step));
+        }
         if (edge.variable() != null) {
             if (edge.minHop() == null || found.size() == 1) {
                 row.edgeRefs.put(edge.variable(), last.edge);
@@ -699,6 +787,21 @@ final class GraphQuery {
             if (kinds != null) {
                 table = DuckResult.aggregate(table, kinds, duck, cancel);
             }
+        }
+        if (tail.postFilter() != null) {
+            List<List<Object>> filtered = new ArrayList<>();
+            for (List<Object> row : table) {
+                Map<String, ExprEval.Slot> slots = new LinkedHashMap<>();
+                for (int i = 0; i < columns.size() && i < row.size(); i++) {
+                    slots.put(columns.get(i), ExprEval.Slot.scalar(row.get(i)));
+                }
+                ExprEval post = new ExprEval(params, false);
+                post.slots(slots);
+                if (post.isTrue(tail.postFilter())) {
+                    filtered.add(row);
+                }
+            }
+            table = filtered;
         }
         Long skip = count(tail.skip(), params);
         Long limit = count(tail.limit(), params);
@@ -1021,7 +1124,7 @@ final class GraphQuery {
         }
         body.put("length", Math.max(0, nodes.size() - 1));
         body.put("nodes", nodes);
-        body.put("edges", List.of());
+        body.put("edges", List.copyOf(row.pathEdges));
         return body;
     }
 
@@ -1181,6 +1284,7 @@ final class GraphQuery {
         private final Map<String, Object> values = new LinkedHashMap<>();
         private final Map<String, Long> vids = new LinkedHashMap<>();
         private final Map<String, EdgeRef> edgeRefs = new LinkedHashMap<>();
+        private final List<Object> pathEdges = new ArrayList<>();
         private List<Long> candidates;
 
         private static Row empty() {
@@ -1192,6 +1296,7 @@ final class GraphQuery {
             copy.values.putAll(values);
             copy.vids.putAll(vids);
             copy.edgeRefs.putAll(edgeRefs);
+            copy.pathEdges.addAll(pathEdges);
             copy.candidates = candidates;
             return copy;
         }

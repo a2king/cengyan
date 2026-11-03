@@ -83,6 +83,7 @@ public final class PathAll {
         vids.add(start);
         onPath.add(start);
         stack.push(new Frame(start));
+        try {
         while (!stack.isEmpty()) {
             cancelled(cancel);
             Frame frame = stack.peek();
@@ -101,11 +102,14 @@ public final class PathAll {
                     found.add(new Found(depth, List.copyOf(vids), List.copyOf(walked)));
                 }
                 boolean terminal = depth == maxHop || (end != null && frame.vid == end);
-                frame.edges = terminal
-                        ? List.of()
-                        : edgesOf(session, graphId, edgeTypeIds, directions, frame.vid, maxEdgesPerVertex, rank, cancel);
+                frame.cursor = terminal ? null
+                        : openEdges(session, graphId, edgeTypeIds, directions, frame.vid, maxEdgesPerVertex, rank, cancel);
             }
-            if (frame.index >= frame.edges.size()) {
+            if (frame.cursor == null || !frame.cursor.hasNext()) {
+                if (frame.cursor != null) {
+                    frame.cursor.close();
+                    frame.cursor = null;
+                }
                 Frame done = stack.pop();
                 onPath.remove(done.vid);
                 vids.remove(vids.size() - 1);
@@ -114,7 +118,7 @@ public final class PathAll {
                 }
                 continue;
             }
-            EdgeRef edge = frame.edges.get(frame.index++);
+            EdgeRef edge = frame.cursor.next();
             long next = edge.outSrc() == frame.vid ? edge.outDst() : edge.outSrc();
             if (!onPath.add(next)) {
                 continue;
@@ -124,9 +128,14 @@ public final class PathAll {
             stack.push(new Frame(next));
         }
         return found;
+        } finally {
+            for (Frame frame : stack) {
+                if (frame.cursor != null) frame.cursor.close();
+            }
+        }
     }
 
-    private static List<EdgeRef> edgesOf(
+    private static EdgeCursor openEdges(
             ReadSession session,
             int graphId,
             Set<Integer> edgeTypeIds,
@@ -135,20 +144,16 @@ public final class PathAll {
             int maxEdgesPerVertex,
             LongPredicate rank,
             CancelToken cancel) {
-        List<EdgeRef> edges = new ArrayList<>();
-        try (EdgeCursor cursor = session.scanEdges(
-                graphId, vid, edgeTypeIds, directions, -1, maxEdgesPerVertex,
-                rank == null ? null : edge -> rank.test(edge.rank()), cancel)) {
-            while (cursor.hasNext()) {
-                edges.add(cursor.next());
-            }
+        try {
+            return session.scanEdges(
+                    graphId, vid, edgeTypeIds, directions, -1, maxEdgesPerVertex,
+                    rank == null ? null : edge -> rank.test(edge.rank()), cancel);
         } catch (CengyanException ex) {
             if (ex.code() == ErrorCode.TRUNCATED) {
                 throw new CengyanException(ErrorCode.TRUNCATED, "起点 " + vid + "：" + ex.getMessage(), ex);
             }
             throw ex;
         }
-        return edges;
     }
 
     private static void cancelled(CancelToken cancel) {
@@ -159,8 +164,7 @@ public final class PathAll {
 
     private static final class Frame {
         private final long vid;
-        private List<EdgeRef> edges = List.of();
-        private int index;
+        private EdgeCursor cursor;
         private boolean opened;
 
         private Frame(long vid) {

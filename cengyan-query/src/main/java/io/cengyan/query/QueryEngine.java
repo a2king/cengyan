@@ -44,6 +44,7 @@ public final class QueryEngine {
     private final MutateExecutor mutate;
     private final ProcedureExecutor procedures;
     private final GraphQuery graphs;
+    private final DuckSettings duck;
     private final StatsCache statsCache = new StatsCache();
 
     public QueryEngine(Catalog catalog, GraphStore store) {
@@ -54,6 +55,18 @@ public final class QueryEngine {
         this(catalog, store, duckdbMemory, duckdbTempDirectory, null);
     }
 
+    public QueryEngine(
+            Catalog catalog,
+            GraphStore store,
+            String duckdbMemory,
+            Path duckdbTempDirectory,
+            String duckdbMaxTempDirectorySize,
+            int duckdbThreads,
+            Auth auth) {
+        this(catalog, store, new DuckSettings(
+                duckdbMemory, duckdbTempDirectory, duckdbMaxTempDirectorySize, duckdbThreads), auth);
+    }
+
 
     public QueryEngine(
             Catalog catalog,
@@ -61,13 +74,17 @@ public final class QueryEngine {
             String duckdbMemory,
             Path duckdbTempDirectory,
             Auth auth) {
+        this(catalog, store, new DuckSettings(duckdbMemory, duckdbTempDirectory), auth);
+    }
+
+    private QueryEngine(Catalog catalog, GraphStore store, DuckSettings duck, Auth auth) {
         if (catalog == null || store == null) {
             throw new IllegalArgumentException("目录和存储不能为空");
         }
         this.catalog = catalog;
         this.store = store;
         this.auth = auth;
-        DuckSettings duck = new DuckSettings(duckdbMemory, duckdbTempDirectory);
+        this.duck = duck;
         this.match = new MatchExecutor(catalog, store, duck);
         this.mutate = new MutateExecutor(catalog, store);
         this.procedures = new ProcedureExecutor(catalog, store);
@@ -94,7 +111,8 @@ public final class QueryEngine {
             throw new IllegalArgumentException("查询上限不能为空");
         }
         long startedNanos = System.nanoTime();
-        try (QueryMemory.Scope ignored = QueryMemory.open(limits.queryMemoryBytes())) {
+        try (QueryMemory.Scope ignored = QueryMemory.open(limits.queryMemoryBytes());
+             QuerySpillContext.Scope spill = QuerySpillContext.open(limits, duck)) {
             boolean exclusive = requiresExclusiveSession(gql);
             QueryResult result = exclusive
                     ? session.withWriteLock(() -> executeLocked(session, gql, params, limits, cancel))
@@ -234,6 +252,7 @@ public final class QueryEngine {
                 case Stmt.Select select -> graphs.select(select, graphId(session), values, limits, cancel);
                 case Stmt.Composite composite -> graphs.composite(composite, graphId(session), values, limits, cancel);
                 case Stmt.Next next -> graphs.next(next, graphId(session), values, limits, cancel);
+                case Stmt.AggregateFilter filter -> filterAggregate(filter, session, values, limits, cancel);
                 case Stmt.InsertGraph insert -> QueryResult.changed(
                         graphs.insertGraph(insert.elements(), graphId(session), values, Map.of()));
                 case Stmt.InsertUsing insert -> QueryResult.changed(
@@ -245,6 +264,28 @@ public final class QueryEngine {
                     yield QueryResult.changed(1);
                 }
             };
+    }
+
+    private QueryResult filterAggregate(
+            Stmt.AggregateFilter filter,
+            SessionState session,
+            Map<String, Object> values,
+            QueryLimits limits,
+            CancelToken cancel) {
+        QueryResult input = executeOne(session, filter.query(), values, limits, cancel);
+        List<List<Object>> kept = new ArrayList<>();
+        for (List<Object> row : input.rows()) {
+            Map<String, ExprEval.Slot> slots = new LinkedHashMap<>();
+            for (int i = 0; i < input.columns().size() && i < row.size(); i++) {
+                slots.put(input.columns().get(i), ExprEval.Slot.scalar(row.get(i)));
+            }
+            ExprEval eval = new ExprEval(values, false);
+            eval.slots(slots);
+            if (eval.isTrue(filter.condition())) {
+                kept.add(row);
+            }
+        }
+        return new QueryResult(input.columns(), kept, kept.size(), input.collectedAt(), input.elapsedMs());
     }
 
     /**

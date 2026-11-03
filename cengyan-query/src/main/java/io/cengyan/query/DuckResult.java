@@ -132,7 +132,8 @@ final class DuckResult {
     }
 
     private static Held open(DuckSettings settings) throws SQLException {
-        if (!settings.memoryLimit().matches("[0-9]+([KMGT]B)?")) {
+        if (!settings.memoryLimit().matches("[0-9]+([KMGT]B)?")
+                || !settings.maxTempDirectorySize().matches("[0-9]+([KMGT]B)?")) {
             throw new CengyanException(ErrorCode.INTERNAL, "DuckDB 内存上限格式不正确");
         }
         Path work = settings.tempDirectory().resolve("duck-" + UUID.randomUUID());
@@ -148,14 +149,14 @@ final class DuckResult {
         Properties properties = new Properties();
         properties.setProperty("memory_limit", settings.memoryLimit());
         properties.setProperty("temp_directory", spill.toAbsolutePath().toString());
-        properties.setProperty("max_temp_directory_size", "100GB");
-        properties.setProperty("threads", "1");
+        properties.setProperty("max_temp_directory_size", settings.maxTempDirectorySize());
+        properties.setProperty("threads", Integer.toString(settings.threads()));
         Connection connection = DriverManager.getConnection("jdbc:duckdb:" + sqlPath(work.resolve("query.duckdb")), properties);
         try (Statement statement = connection.createStatement()) {
             statement.execute("SET memory_limit='" + settings.memoryLimit() + "'");
             statement.execute("SET temp_directory='" + sqlPath(spill) + "'");
-            statement.execute("SET max_temp_directory_size='100GB'");
-            statement.execute("SET threads=1");
+            statement.execute("SET max_temp_directory_size='" + settings.maxTempDirectorySize() + "'");
+            statement.execute("SET threads=" + settings.threads());
             statement.execute("SET preserve_insertion_order=false");
         } catch (SQLException ex) {
             connection.close();

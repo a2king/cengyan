@@ -9,21 +9,44 @@ import java.util.function.Consumer;
 final class DuckSettings {
     private final String memoryLimit;
     private final Path tempDirectory;
+    private final String maxTempDirectorySize;
+    private final int threads;
     private final Consumer<Path> beforeClose;
 
     DuckSettings(String memoryLimit, Path tempDirectory) {
-        this(memoryLimit, tempDirectory, null);
+        this(memoryLimit, tempDirectory, "100GB", 1, null);
     }
 
     DuckSettings(String memoryLimit, Path tempDirectory, Consumer<Path> beforeClose) {
+        this(memoryLimit, tempDirectory, "100GB", 1, beforeClose);
+    }
+
+    DuckSettings(String memoryLimit, Path tempDirectory, String maxTempDirectorySize, int threads) {
+        this(memoryLimit, tempDirectory, maxTempDirectorySize, threads, null);
+    }
+
+    DuckSettings(
+            String memoryLimit,
+            Path tempDirectory,
+            String maxTempDirectorySize,
+            int threads,
+            Consumer<Path> beforeClose) {
         if (memoryLimit == null || memoryLimit.isBlank()) {
             throw new IllegalArgumentException("DuckDB 内存上限不能为空");
         }
         if (tempDirectory == null) {
             throw new IllegalArgumentException("DuckDB 临时目录不能为空");
         }
+        if (maxTempDirectorySize == null || maxTempDirectorySize.isBlank()) {
+            throw new IllegalArgumentException("DuckDB 临时目录上限不能为空");
+        }
+        if (threads <= 0) {
+            throw new IllegalArgumentException("DuckDB 线程数必须为正");
+        }
         this.memoryLimit = memoryLimit.trim();
         this.tempDirectory = tempDirectory;
+        this.maxTempDirectorySize = maxTempDirectorySize.trim();
+        this.threads = threads;
         this.beforeClose = beforeClose;
     }
 
@@ -42,11 +65,19 @@ final class DuckSettings {
         }
         long configuredBytes = memoryBytes(memoryLimit);
         long effective = Math.min(queryBytes, configuredBytes);
-        return new DuckSettings(formatBytes(effective), tempDirectory, beforeClose);
+        return new DuckSettings(formatBytes(effective), tempDirectory, maxTempDirectorySize, threads, beforeClose);
     }
 
     Consumer<Path> beforeClose() {
         return beforeClose;
+    }
+
+    String maxTempDirectorySize() {
+        return maxTempDirectorySize;
+    }
+
+    int threads() {
+        return threads;
     }
 
     private static long memoryBytes(String value) {

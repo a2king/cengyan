@@ -499,6 +499,42 @@ class QueryEngineTest {
         }
     }
 
+    @Test
+    void 路径权重归约分组并在聚合后过滤() throws Exception {
+        try (Db db = new Db()) {
+            script(db,
+                    "CREATE GRAPH Weighted",
+                    "USE Weighted",
+                    "CREATE NODE TYPE org ID STRING(16) ()",
+                    "CREATE REL TYPE inv (conprop DOUBLE NULL)",
+                    "INSERT (a:org {id:'A'})-[:inv {conprop:0.5}]->(b:org {id:'B'})",
+                    "INSERT (a:org {id:'A'})-[:inv {conprop:0.3}]->(b:org {id:'C'})",
+                    "INSERT (a:org {id:'C'})-[:inv {conprop:0.9}]->(b:org {id:'B'})");
+            QueryResult result = run(db, """
+                    MATCH p=(start:org)-[:inv]->{1,2}(shareholder)
+                    WHERE id(start) = 'A'
+                    LET path_conprop = REDUCE(acc = 1.0, rel IN relationships(p) | acc * rel.conprop)
+                    RETURN id(shareholder), collect_list(nodes(p)) AS node_list,
+                           collect_list(relationships(p)) AS path_list,
+                           sum(path_conprop) AS total_conprop
+                    GROUP BY shareholder
+                    FILTER total_conprop >= 0.25
+                    LIMIT 100
+                    """);
+            assertEquals(2, result.rows().size());
+            assertEquals(Set.of("B", "C"), Set.of(result.rows().get(0).get(0), result.rows().get(1).get(0)));
+            assertTrue(result.rows().get(0).get(1) instanceof List<?>);
+            assertTrue(result.rows().get(0).get(2) instanceof List<?>);
+            for (List<Object> row : result.rows()) {
+                if ("B".equals(row.get(0))) {
+                    assertEquals(2, ((List<?>) row.get(1)).size());
+                    assertEquals(2, ((List<?>) row.get(2)).size());
+                    assertEquals(0.77d, ((Number) row.get(3)).doubleValue(), 1e-9);
+                }
+            }
+        }
+    }
+
     private static QueryResult run(Db db, String gql) {
         return run(db, gql, limits());
     }
