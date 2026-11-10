@@ -2,6 +2,9 @@ package io.cengyan.studio;
 
 /**
  * 控制台自己的监听地址和端口，以及要转发到的图数据库地址。
+ *
+ * @param home Studio 安装目录。非空时启用集群管理：节点程序和离线 JDK 从 {@code home/nodes}、{@code home/jdk} 读取，
+ *             Studio 状态写在 {@code home/data}；有受管计算节点时数据库请求转发到其中一个，dbHost/dbPort 只作为后备。
  */
 public record StudioConfig(
         int port,
@@ -9,18 +12,28 @@ public record StudioConfig(
         String dbHost,
         int dbPort,
         int graphMaxNodes,
-        int tableMaxNodes) {
-    /** 保留原有构造方式，测试和嵌入式调用默认只监听本机。 */
+        int tableMaxNodes,
+        String computeHost,
+        int computePort,
+        String computeUser,
+        String computePassword,
+        String home) {
+    /** 保留原有构造方式，测试和嵌入式调用默认只监听本机，不启用集群管理。 */
     public StudioConfig(int port, String dbHost, int dbPort) {
-        this(port, "127.0.0.1", dbHost, dbPort, 2000, 2000);
+        this(port, "127.0.0.1", dbHost, dbPort, 2000, 2000, "", 0, "", "", "");
     }
 
     public StudioConfig(int port, String host, String dbHost, int dbPort) {
-        this(port, host, dbHost, dbPort, 2000, 2000);
+        this(port, host, dbHost, dbPort, 2000, 2000, "", 0, "", "", "");
     }
 
     public StudioConfig(int port, String host, String dbHost, int dbPort, int graphMaxNodes) {
-        this(port, host, dbHost, dbPort, graphMaxNodes, 2000);
+        this(port, host, dbHost, dbPort, graphMaxNodes, 2000, "", 0, "", "", "");
+    }
+
+    public StudioConfig(int port, String host, String dbHost, int dbPort, int graphMaxNodes, int tableMaxNodes,
+                        String computeHost, int computePort, String computeUser, String computePassword) {
+        this(port, host, dbHost, dbPort, graphMaxNodes, tableMaxNodes, computeHost, computePort, computeUser, computePassword, "");
     }
 
     public StudioConfig {
@@ -39,10 +52,15 @@ public record StudioConfig(
         if (tableMaxNodes <= 0) {
             throw new IllegalArgumentException("表格展示行数上限必须为正");
         }
+        if (computeHost == null || computePassword == null || computeUser == null
+                || computePort < 0 || computePort > 65535) {
+            throw new IllegalArgumentException("Compute 运维连接配置无效");
+        }
+        if (home == null) home = "";
     }
 
     public static StudioConfig defaults() {
-        return new StudioConfig(19670, "0.0.0.0", "127.0.0.1", 19669, 2000, 2000);
+        return new StudioConfig(19670, "0.0.0.0", "127.0.0.1", 19669, 2000, 2000, "", 0, "", "", "");
     }
 
     public static StudioConfig parse(String[] args) {
@@ -52,6 +70,11 @@ public record StudioConfig(
         int dbPort = 19669;
         int graphMaxNodes = 2000;
         int tableMaxNodes = 2000;
+        String computeHost = "";
+        int computePort = 0;
+        String computeUser = "";
+        String computePassword = "";
+        String home = "";
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--port" -> port = Integer.parseInt(args[++i]);
@@ -60,9 +83,15 @@ public record StudioConfig(
                 case "--db-port" -> dbPort = Integer.parseInt(args[++i]);
                 case "--graph-max-nodes" -> graphMaxNodes = Integer.parseInt(args[++i]);
                 case "--table-max-nodes" -> tableMaxNodes = Integer.parseInt(args[++i]);
+                case "--compute-host" -> computeHost = args[++i];
+                case "--compute-port" -> computePort = Integer.parseInt(args[++i]);
+                case "--compute-user" -> computeUser = args[++i];
+                case "--compute-password" -> computePassword = args[++i];
+                case "--home" -> home = args[++i];
                 default -> throw new IllegalArgumentException("无法识别的参数 " + args[i]);
             }
         }
-        return new StudioConfig(port, listenHost, host, dbPort, graphMaxNodes, tableMaxNodes);
+        return new StudioConfig(port, listenHost, host, dbPort, graphMaxNodes, tableMaxNodes,
+                computeHost, computePort, computeUser, computePassword, home);
     }
 }

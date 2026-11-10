@@ -7,9 +7,22 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class CengyanCliTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    @Test
+    void 旧单机管理命令拒绝并保留集群字符串身份() throws Exception {
+        var cli = new CengyanCli();
+        for (String command : new String[] {":addStorage host:123", ":addCompute host:123", ":setPartCount G 4", ":rebuildIndex i"}) {
+            assertThrows(IllegalArgumentException.class, () -> cli.request(command));
+        }
+        assertEquals("storage-3", MAPPER.readTree(cli.request(":removeStorage storage-3")).path("nodeId").asText());
+        assertTrue(MAPPER.readTree(cli.request(":removeStorage 3")).path("nodeId").isTextual());
+        cli.request("USE Company");
+        assertEquals("Company", MAPPER.readTree(cli.request("MATCH (n) RETURN n")).path("graph").asText());
+    }
 
     @Test
     void 普通文本包成execute() throws Exception {

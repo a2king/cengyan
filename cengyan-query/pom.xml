@@ -12,13 +12,10 @@
     <name>cengyan-query</name>
 
     <dependencies>
+        <dependency><groupId>io.cengyan</groupId><artifactId>cengyan-distributed</artifactId></dependency>
         <dependency>
             <groupId>io.cengyan</groupId>
-            <artifactId>cengyan-store</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.cengyan</groupId>
-            <artifactId>cengyan-catalog</artifactId>
+            <artifactId>cengyan-common</artifactId>
         </dependency>
         <dependency>
             <groupId>io.cengyan</groupId>

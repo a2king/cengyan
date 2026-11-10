@@ -144,6 +144,7 @@ final class GqlReader {
             case ALTER -> alter();
             case INSERT -> insert();
             case MATCH -> query(false);
+            case RETURN -> new Stmt.Select(List.of(), tail());
             case OPTIONAL -> {
                 next();
                 expect(Kind.MATCH, "OPTIONAL 后面要写 MATCH");
@@ -186,7 +187,9 @@ final class GqlReader {
         String comment = comment();
         String idType = "INT";
         int idLength = 19;
+        boolean idSpecified = false;
         if (node && take(Kind.ID)) {
+            idSpecified = true;
             if (take(Kind.STRING)) {
                 idType = "STRING";
                 idLength = idLength();
@@ -206,7 +209,7 @@ final class GqlReader {
         expect(Kind.LP, "类型定义缺少左括号");
         List<Stmt.Field> fields = fields();
         expect(Kind.RP, "类型定义缺少右括号");
-        return new Stmt.CreateType(node, name, comment, idType, idLength, fields, ifNotExists);
+        return new Stmt.CreateType(node, name, comment, idType, idLength, idSpecified, fields, ifNotExists);
     }
 
     private int idLength() {

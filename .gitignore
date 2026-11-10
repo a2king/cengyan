@@ -20,3 +20,10 @@ cengyan-studio-web/node_modules/
 cengyan-studio-web/.npm-cache/
 cengyan-studio-web/dist/
 cengyan-python-tests/
+# Offline Temurin 21 archives for packaging (large, downloaded per build machine).
+packaging/jdk/
+__pycache__/
+# Local deploy scripts and session notes. They contain host addresses and credential handling.
+session/
+# Local IDE launch config with machine-specific paths.
+.claude/

@@ -1,60 +1,49 @@
-层岩图数据库部署包
+层岩图数据库：Studio 部署包
 
-目录：
-  cengyan-server.jar       图数据库服务
-  cengyan-studio.jar       Web 控制台后端
-  bin/                     Windows 和 Linux 启停命令
-  config/                  配置文件和样例
-  data/                    数据目录
-  logs/                    各服务日志目录
-  pid/                     各服务 PID 文件目录
-  tmp/                     临时文件目录
-  lib/                     可选的应用私有 Linux 运行库
+部署时只需在一台机器上解压并启动 Studio。服务器、存储节点、计算节点的安装、配置、
+滚动重启、升级和移除都在 Studio 网页上完成。
 
-要求：JDK 21。启动命令会先检查 Java 主版本；检测到 Java 8、17 或其他版本时会中断并输出原因。
+内容：
+  cengyan-studio.jar       Studio 控制台（网页、集群管理）
+  cengyan-cli.jar          可选 Java 交互式客户端
+  nodes/                  Studio 下发到各服务器的 Storage / Compute 程序和日志配置
+  jdk/                    离线 JDK 21（Linux x64、aarch64），Studio 推送到各服务器
+  config/studio.properties Studio 监听地址等
+  config/logging.properties Studio 日志级别
+  data/                   Studio 自身状态：服务器、节点、配置版本、SSH 私钥（升级时必须保留）
+  sdk/python/             Python 客户端
+  docs/                   设计和运维文档
+  BUILD-INFO.json          构建信息
+  SHA256SUMS              包内文件校验
 
-Windows（命令会后台启动，日志写入 logs/）：
-  bin\start-server.bat     启动图数据库
-  bin\stop-server.bat      停止图数据库
-  bin\start-studio.bat     启动 Web 控制台
-  bin\stop-studio.bat      停止 Web 控制台
-  bin\start-all.bat        启动全部服务
-  bin\stop-all.bat         停止全部服务
+启动：
+  tar -xzpf cengyan-<版本>-linux.tar.gz
+  cd cengyan-<版本>
+  ./bin/start-studio.sh
+  浏览器打开 http://<本机 IP>:19670 ，点击"集群管理"
 
-Linux（命令会后台启动，日志写入 logs/）：
-  ./bin/start-server.sh     启动图数据库
-  ./bin/stop-server.sh      停止图数据库
-  ./bin/start-studio.sh     启动 Web 控制台
-  ./bin/stop-studio.sh      停止 Web 控制台
-  ./bin/start-all.sh        启动全部服务
-  ./bin/stop-all.sh         停止全部服务
-  bin/java.env              可选的 JDK 21 路径配置
+  本机没有 Java 21 时，start-studio.sh 自动把 jdk/ 中对应架构的 JDK 解压到 runtime/jdk 使用。
+  也可以在 bin/java.env 中设置 JAVA_HOME。
 
-Linux ZIP 已保留 bin/*.sh 的可执行权限，解压后可直接运行上述命令，通常不需要再执行 chmod。
-如果使用了不保留 Unix 权限的解压工具，请改用 unzip，或执行：chmod 755 bin/*.sh
+首次使用：
+  1. 设置 Studio 管理员密码。
+  2. 添加服务器：填写内网 IP 和 root 密码。Studio 检查系统、配置免密登录（随后丢弃密码）、
+     安装 JDK 21、同步程序。
+  3. 添加存储节点（生产环境至少 3 个），设置数据库 root 密码，再添加计算节点。
+  4. 节点就绪后，用数据库账号登录 Studio 开始建图和查询。
 
-PID 文件：
-  pid/server.pid
-  pid/studio.pid
+被管理服务器要求：Linux x86_64 或 aarch64，glibc 2.17+，systemd，root SSH 登录，
+/opt 所在磁盘至少 1GB 可用。节点安装在 /opt/cengyan，以 systemd 服务 cengyan-<节点ID> 运行，
+日志用 journalctl -u cengyan-<节点ID> 查看，也可在 Studio 节点页查看。
 
-日志文件：
-  logs/server.log
-  logs/studio.log
-Windows 启动脚本的标准错误另外写入：
-  logs/server-error.log
-  logs/studio-error.log
+停止 Studio：./bin/stop-studio.sh 。停止 Studio 不影响已运行的节点。
 
-服务端配置：config/cengyan.properties
-Studio 配置：config/studio.properties
-其中 graph_max_nodes 控制关系图可视化上限，默认 2000；超过后页面只提示不渲染。
-table_max_nodes 控制表格前端最多展示的行数，默认 2000；不会改变查询实际返回总量和查询耗时。
-Studio 配置中的 host 控制 Web 控制台监听地址，部署到内网时通常填写：
-  host=0.0.0.0
-然后通过服务器实际内网 IP 和端口访问，例如：http://192.168.1.20:19670
-如果服务器的 Java 21 不在系统 PATH 中，编辑 bin/java.env，填写：
-  export JAVA_HOME=/你的/jdk-21/目录
-如果系统自带的 libstdc++.so.6 太旧，也可以在 bin/java.env 配置兼容库目录，例如：
-  export LD_LIBRARY_PATH=/opt/rh/gcc-toolset-11/root/usr/lib64:${LD_LIBRARY_PATH:-}
-也可以把与服务器 glibc 和 CPU 架构兼容的 libstdc++.so.6 放进 lib/；启动命令会自动优先使用它。
-不要把 libc.so.6 或 ld-linux*.so.* 放进应用 lib/，否则会覆盖系统 glibc 并导致命令无法运行。
-修改配置后重新执行对应启动命令即可。服务端的数据目录按启动包根目录解析，默认写入 data/data。
+升级：
+  1. ./bin/stop-studio.sh 停止旧 Studio。
+  2. 解压新包到新目录，把旧目录的 data/ 和 config/studio.properties 复制过去。
+  3. 启动新 Studio。节点版本低于 Studio 随附版本时，概览页提示"升级集群"，确认后逐台滚动升级。
+
+安全：data/ssh/id_rsa 是登录所有受管服务器的 root 私钥，data/ 目录只允许运行 Studio 的用户读取。
+Studio 端口只开放给可信内网。bin/ 下文件权限为 777，应部署到受信任目录。
+
+完整设计见 docs/studio-cluster-management.md。

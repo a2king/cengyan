@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent><groupId>io.cengyan</groupId><artifactId>cengyan</artifactId><version>1.0.0</version></parent>
+    <artifactId>cengyan-raft</artifactId>
+    <dependencies>
+        <dependency><groupId>io.cengyan</groupId><artifactId>cengyan-protocol</artifactId></dependency>
+        <dependency><groupId>org.rocksdb</groupId><artifactId>rocksdbjni</artifactId></dependency>
+        <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-server</artifactId></dependency>
+        <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-client</artifactId></dependency>
+        <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-netty</artifactId></dependency>
+        <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-metrics-default</artifactId></dependency>
+        <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId><scope>test</scope></dependency>
+    </dependencies>
+</project>

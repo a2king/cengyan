@@ -132,8 +132,8 @@ final class DuckResult {
     }
 
     private static Held open(DuckSettings settings) throws SQLException {
-        if (!settings.memoryLimit().matches("[0-9]+([KMGT]B)?")
-                || !settings.maxTempDirectorySize().matches("[0-9]+([KMGT]B)?")) {
+        if (!settings.memoryLimit().matches("[0-9]+([KMGT]?B)?")
+                || !settings.maxTempDirectorySize().matches("[0-9]+([KMGT]?B)?")) {
             throw new CengyanException(ErrorCode.INTERNAL, "DuckDB 内存上限格式不正确");
         }
         Path work = settings.tempDirectory().resolve("duck-" + UUID.randomUUID());

@@ -59,8 +59,10 @@ import {
   X,
 } from 'lucide-react';
 import { CengyanApi, escapeIdent, graphFromRows, rowsAsObjects, storage } from './api';
+import { ClusterApi } from './clusterApi';
+import { ClusterConsole } from './cluster/ClusterConsole';
 import { QueryGraph } from './QueryGraph';
-import type { GraphSpace, IndexRow, QueryResponse, SessionInfo, StatsRow, TypeProperty, TypeRow } from './types';
+import type { GraphSpace, IndexRow, OpsOverview, QueryResponse, SessionInfo, StatsRow, TypeProperty, TypeRow } from './types';
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
@@ -70,7 +72,8 @@ const NODE_ID_TYPES = [
   { value: 'INT', label: 'INT（整数）' },
   { value: 'STRING', label: 'STRING（字符串）' },
 ];
-const DEFAULT_QUERY = "MATCH (a:Person)-[e:knows]->(b) RETURN a, e, b";
+const DEFAULT_QUERY = '';
+const LEGACY_SAMPLE_QUERY = "MATCH (a:Person)-[e:knows]->(b) RETURN a, e, b";
 // Keep the Studio interaction limits explicit for the table and graph result views.
 const MAX_TABLE_ROWS = 200;
 const MAX_GRAPH_NODES = 200;
@@ -90,7 +93,7 @@ const COMPATIBILITY_MARKER = [
 
 function canWrite(role: string) { return role === 'write'; }
 
-type NavKey = 'graph' | 'gql' | 'running';
+type NavKey = 'graph' | 'gql' | 'running' | 'ops' | 'cluster';
 type GraphTab = 'nodes' | 'rels' | 'indexes' | 'stats' | 'aliases' | 'replicas';
 
 export function App() {
@@ -118,6 +121,12 @@ export function App() {
   const [inflightQuery, setInflightQuery] = useState('');
   const [graphMaxNodes, setGraphMaxNodes] = useState(2000);
   const [tableMaxNodes, setTableMaxNodes] = useState(2000);
+  const [nodeHealth, setNodeHealth] = useState({ storageAlive: 0, storageTotal: 0, computeAlive: 0, computeTotal: 0, loading: true });
+  const [clusterManaged, setClusterManaged] = useState(false);
+  const [standaloneCluster, setStandaloneCluster] = useState(false);
+  const clusterApiRef = useRef<ClusterApi | undefined>(undefined);
+  if (!clusterApiRef.current) clusterApiRef.current = new ClusterApi();
+  const clusterApi = clusterApiRef.current;
   const [messageApi, contextHolder] = message.useMessage();
   const [notificationApi, notificationContextHolder] = notification.useNotification();
 
@@ -170,6 +179,31 @@ export function App() {
     if (session) void refreshSpaces();
   }, [session, refreshSpaces]);
 
+  const refreshNodeHealth = useCallback(async () => {
+    if (!session) return;
+    try {
+      const overview = await api.opsOverview();
+      const storageNodes = overview.storageNodes || [];
+      const computeNodes = overview.computeNodes || [];
+      setNodeHealth({
+        storageAlive: storageNodes.filter((row) => row.state !== 'UNAVAILABLE').length,
+        storageTotal: storageNodes.length,
+        computeAlive: computeNodes.filter((row) => row.state !== 'UNAVAILABLE').length,
+        computeTotal: computeNodes.length,
+        loading: false,
+      });
+      return;
+    } catch {
+      setNodeHealth((current) => ({ ...current, loading: false }));
+    }
+  }, [api, session]);
+
+  useEffect(() => {
+    void refreshNodeHealth();
+    const timer = window.setInterval(() => void refreshNodeHealth(), 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshNodeHealth]);
+
   useEffect(() => {
     if (!session) return undefined;
     let active = true;
@@ -190,6 +224,7 @@ export function App() {
     void api.config().then((config) => {
       setGraphMaxNodes(config.graphMaxNodes);
       setTableMaxNodes(config.tableMaxNodes);
+      setClusterManaged(Boolean(config.clusterManaged));
     }).catch(() => {
       // 使用前端默认值，配置接口不可用时不影响查询工作台。
     });
@@ -252,18 +287,43 @@ export function App() {
       icon: <Code2 size={18} />,
       label: <span className="menu-label"><span>GQL</span><small>查询工作台</small></span>,
     },
-    ...(session && canWrite(session.role) ? [{
+     ...(session && canWrite(session.role) ? [{
       key: 'running',
       icon: <Activity size={18} />,
-      label: <span className="menu-label"><span>运行查询</span><small>正在执行的语句</small></span>,
+       label: <span className="menu-label"><span>运行查询</span><small>正在执行的语句</small></span>,
+    }, {
+      key: 'ops',
+      icon: <Activity size={18} />,
+      label: <span className="menu-label"><span>集群运维</span><small>实时资源与拓扑</small></span>,
+    }] : []),
+    ...(clusterManaged ? [{
+      key: 'cluster',
+      icon: <FolderKanban size={18} />,
+      label: <span className="menu-label"><span>集群管理</span><small>服务器、节点与配置</small></span>,
     }] : []),
   ];
+
+  if (!session && standaloneCluster) {
+    return (
+      <ConfigProvider theme={themeConfig}>
+        <AntApp>
+          <Layout className="studio-layout cluster-standalone">
+            <Header className="studio-header">
+              <div className="brand-block"><div className="brand-mark"><Layers3 size={21} strokeWidth={2.2} /></div><div><div className="brand-name">层岩 <span>Studio</span></div><div className="brand-caption">集群管理</div></div></div>
+              <Button onClick={() => setStandaloneCluster(false)}>返回数据库登录</Button>
+            </Header>
+            <Content className="studio-content"><ClusterConsole api={clusterApi} /></Content>
+          </Layout>
+        </AntApp>
+      </ConfigProvider>
+    );
+  }
 
   if (!session) {
     return (
       <ConfigProvider theme={themeConfig}>
         <AntApp>
-          <LoginPage api={api} onLogin={handleLogin} />
+          <LoginPage api={api} onLogin={handleLogin} onCluster={clusterManaged ? () => setStandaloneCluster(true) : undefined} />
         </AntApp>
       </ConfigProvider>
     );
@@ -309,7 +369,7 @@ export function App() {
             <div className="sider-foot">
               <div className="connection-card">
                 <span className="online-dot" />
-                <div><Text strong>本地图数据库</Text><Text type="secondary">连接正常</Text></div>
+                 <div><Text strong>集群节点状态</Text><Text type="secondary">存储: {nodeHealth.loading ? '读取中' : `${nodeHealth.storageAlive}/${nodeHealth.storageTotal}`}</Text><Text type="secondary">计算: {nodeHealth.loading ? '读取中' : `${nodeHealth.computeAlive}/${nodeHealth.computeTotal}`}</Text></div>
                 <Badge status="success" />
               </div>
               <div className="user-card">
@@ -322,7 +382,7 @@ export function App() {
           <Layout>
             <Header className="studio-header">
               <div className="header-title">
-                <Title level={3}>{activeNav === 'graph' ? (graphView === 'workspace' ? '图空间详情' : '图空间') : activeNav === 'running' ? '正在执行' : '查询工作台'}</Title>
+                  <Title level={3}>{activeNav === 'graph' ? (graphView === 'workspace' ? '图空间详情' : '图空间') : activeNav === 'running' ? '正在执行' : activeNav === 'ops' ? '集群运维' : activeNav === 'cluster' ? '集群管理' : '查询工作台'}</Title>
               </div>
               <div className="header-actions">
                 {activeNav === 'gql' && (
@@ -351,6 +411,8 @@ export function App() {
                 </div>
               )}
               {activeNav === 'running' && writable && <RunningQueries api={api} inflight={inflightQuery} />}
+              {activeNav === 'ops' && writable && <OpsDashboard api={api} />}
+              {activeNav === 'cluster' && clusterManaged && <ClusterConsole api={clusterApi} />}
             </Content>
           </Layout>
         </Layout>
@@ -377,7 +439,7 @@ const themeConfig = {
   },
 };
 
-function LoginPage({ api, onLogin }: { api: CengyanApi; onLogin: (info: SessionInfo) => Promise<void> }) {
+function LoginPage({ api, onLogin, onCluster }: { api: CengyanApi; onLogin: (info: SessionInfo) => Promise<void>; onCluster?: () => void }) {
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -420,6 +482,7 @@ function LoginPage({ api, onLogin }: { api: CengyanApi; onLogin: (info: SessionI
             />
             <Button type="primary" htmlType="submit" size="large" block loading={loading}>登录</Button>
             <Button className="login-check" type="text" block loading={pinging} onClick={async () => { setPinging(true); setError(''); try { await api.ping(); setError('连接正常，可以登录'); } catch (reason) { setError(reason instanceof Error ? reason.message : '连接失败'); } finally { setPinging(false); } }}>检查连接</Button>
+            {onCluster && <Button className="login-cluster" block icon={<FolderKanban size={16} />} onClick={onCluster}>集群管理：添加服务器和节点</Button>}
           </Form>
         </Card>
       </div>
@@ -712,30 +775,72 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
   const [storageAt, setStorageAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [storageLoading, setStorageLoading] = useState(false);
+  const requestSequence = useRef(0);
   const load = useCallback(async (refresh: boolean) => {
+    const sequence = ++requestSequence.current;
     setLoading(true);
     setError('');
     try {
-      const [stats, storageResult] = await Promise.all([
-        api.admin('stats', '', undefined, refresh),
-        api.admin('storage').catch(() => null),
-      ]);
+      const stats = await api.admin('stats', '', undefined, refresh);
+      if (sequence !== requestSequence.current) return;
       setRows(rowsAsObjects<StatsRow>(stats));
       setCountedAt(typeof stats.collectedAt === 'number' ? stats.collectedAt : null);
-      const bytes = Number(storageResult?.rows?.[0]?.[0]);
-      setStorageBytes(Number.isFinite(bytes) && bytes >= 0 ? bytes : null);
-      setStorageAt(typeof storageResult?.collectedAt === 'number' ? storageResult.collectedAt : null);
+      // 数量来自分片计数元数据，先展示；文件大小查询较慢时不再阻塞节点/边数量。
+      setStorageLoading(true);
+      void api.admin('storage').then((storageResult) => {
+        if (sequence !== requestSequence.current) return;
+        const bytes = Number(storageResult?.rows?.[0]?.[0]);
+        setStorageBytes(Number.isFinite(bytes) && bytes >= 0 ? bytes : null);
+        setStorageAt(typeof storageResult?.collectedAt === 'number' ? storageResult.collectedAt : null);
+      }).catch(() => {
+        if (sequence === requestSequence.current) setStorageBytes(null);
+      }).finally(() => {
+        if (sequence === requestSequence.current) setStorageLoading(false);
+      });
     } catch (reason) {
+      if (sequence !== requestSequence.current) return;
       setError(reason instanceof Error ? reason.message : '加载统计信息失败');
     } finally {
-      setLoading(false);
+      if (sequence === requestSequence.current) setLoading(false);
     }
   }, [api]);
-  useEffect(() => { void load(false); }, [load, graph]);
+  useEffect(() => {
+    setRows([]);
+    setCountedAt(null);
+    setStorageBytes(null);
+    setStorageLoading(false);
+    void load(false);
+    return () => { requestSequence.current++; };
+  }, [load, graph]);
   const nodeCount = rows.filter((row) => row.target === 'NODE').reduce((sum, row) => sum + Number(row.count), 0);
   const edgeCount = rows.filter((row) => row.target === 'REL').reduce((sum, row) => sum + Number(row.count), 0);
   const countValue = countedAt == null ? '—' : undefined;
-  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>统计信息</Title><Text type="secondary">{graph} 按类型统计。打开页面只读取上次缓存。</Text><div className="stats-cache-time"><Text type="secondary">缓存记录时间：{loading && countedAt == null ? '读取中' : countedAt == null ? '尚未统计' : formatCollectedAt(countedAt)}</Text></div></div><Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load(true)} loading={loading}>刷新</Button></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}<Row gutter={[16, 16]}><Col xs={24} md={12}><Card className="metric-card"><Statistic title="节点数量" value={countValue ?? nodeCount} prefix={<Boxes size={18} />} /></Card></Col><Col xs={24} md={12}><Card className="metric-card"><Statistic title="边数量" value={countValue ?? edgeCount} prefix={<GitBranch size={18} />} /></Card></Col></Row><Card className="storage-card"><div className="storage-icon"><Database size={19} /></div><div><Text strong>存储占用</Text><Text type="secondary">{storageAt == null ? '当前数据库目录中 RocksDB 文件的实际占用。' : freshnessText('大小', storageAt)}</Text></div><Tag color="blue">{storageBytes == null ? (loading ? '读取中' : '未能读取') : formatBytes(storageBytes)}</Tag></Card>{rows.length ? <Table rowKey={(row) => `${row.target}-${row.name}`} loading={loading} columns={[{ title: '对象', dataIndex: 'target', render: (value: string) => <Tag>{value}</Tag> }, { title: '类型', dataIndex: 'name' }, { title: '数量', dataIndex: 'count' }]} dataSource={rows} pagination={false} /> : <Empty description={countedAt == null ? '还没有统计缓存，点击刷新开始统计' : '暂无统计信息'} />}</div>;
+  return <div className="panel-stack">
+    <div className="panel-toolbar">
+      <div>
+        <Title level={4}>统计信息</Title>
+        <Text type="secondary">{graph} 按类型统计，直接汇总分片持久化计数，不扫描图数据。并发事务收尾期间计数可能短暂滞后。</Text>
+        <div className="stats-cache-time"><Text type="secondary">计数读取时间：{loading && countedAt == null ? '读取中' : countedAt == null ? '尚未读取' : formatCollectedAt(countedAt)}</Text></div>
+      </div>
+      <Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load(true)} loading={loading}>刷新</Button>
+    </div>
+    {error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}
+    <Row gutter={[16, 16]}>
+      <Col xs={24} md={12}><Card className="metric-card"><Statistic title="节点数量" value={countValue ?? nodeCount} prefix={<Boxes size={18} />} /></Card></Col>
+      <Col xs={24} md={12}><Card className="metric-card"><Statistic title="边数量" value={countValue ?? edgeCount} prefix={<GitBranch size={18} />} /></Card></Col>
+    </Row>
+    <Card className="storage-card">
+      <div className="storage-icon"><Database size={19} /></div>
+      <div>
+        <Text strong>存储占用</Text>
+        <Text type="secondary">集群节点目录占用（含副本和日志），不是单图逻辑数据大小。</Text>
+        {storageAt != null && <Text type="secondary">读取时间：{formatCollectedAt(storageAt)}</Text>}
+      </div>
+      <Tag color="blue">{storageLoading ? '读取中' : storageBytes == null ? '未能读取' : formatBytes(storageBytes)}</Tag>
+    </Card>
+    {rows.length ? <Table rowKey={(row) => `${row.target}-${row.name}`} loading={loading} columns={[{ title: '对象', dataIndex: 'target', render: (value: string) => <Tag>{value}</Tag> }, { title: '类型', dataIndex: 'name' }, { title: '数量', dataIndex: 'count' }]} dataSource={rows} pagination={false} /> : <Empty description={loading ? '读取计数中…' : countedAt == null ? '尚未读取计数，请重试' : '暂无类型统计'} />}
+  </div>;
 }
 
 function freshnessText(kind: string, collectedAt: number): string {
@@ -922,11 +1027,123 @@ function RunningQueries({ api, inflight }: { api: CengyanApi; inflight: string }
   );
 }
 
+function bytesText(value?: unknown) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let index = 0;
+  let amount = bytes;
+  while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index += 1; }
+  return `${amount.toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function percentText(value?: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? `${(number * 100).toFixed(1)}%` : '—';
+}
+
+function numberValue(value: unknown): number | undefined {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : undefined;
+}
+
+function OpsDashboard({ api }: { api: CengyanApi }) {
+  const [data, setData] = useState<OpsOverview | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setData(await api.opsOverview()); setError(''); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : '集群运维数据读取失败'); }
+    finally { setLoading(false); }
+  }, [api]);
+  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 5000); return () => window.clearInterval(timer); }, [load]);
+  const storageNodes = data?.storageNodes || [];
+  const computeNodes = data?.computeNodes || [];
+  const shards = data?.shards || [];
+  const computeSummary = useMemo(() => {
+    const nodes = computeNodes.length > 0
+      ? computeNodes
+      : data ? [data as unknown as Record<string, unknown>] : [];
+    const cpuValues = nodes.map((node) => numberValue(node.systemCpuLoad)).filter((value): value is number => value !== undefined);
+    let heapUsed = 0;
+    let heapMax = 0;
+    let diskUsable = 0;
+    let diskTotal = 0;
+    let slotsActive = 0;
+    let slotsCapacity = 0;
+    let queuePending = 0;
+    let threadCount = 0;
+    let hasHeapUsed = false;
+    let hasHeapMax = false;
+    let hasDiskUsable = false;
+    let hasDiskTotal = false;
+    let hasThreadCount = false;
+
+    nodes.forEach((node) => {
+      const slots = recordValue(node.slots);
+      const values = [
+        ['heapUsedBytes', (value: number) => { heapUsed += value; hasHeapUsed = true; }],
+        ['heapMaxBytes', (value: number) => { heapMax += value; hasHeapMax = true; }],
+        ['diskUsableBytes', (value: number) => { diskUsable += value; hasDiskUsable = true; }],
+        ['diskTotalBytes', (value: number) => { diskTotal += value; hasDiskTotal = true; }],
+        ['threadCount', (value: number) => { threadCount += value; hasThreadCount = true; }],
+      ] as const;
+      values.forEach(([key, add]) => {
+        const value = numberValue(node[key]);
+        if (value !== undefined) add(value);
+      });
+      const active = numberValue(slots?.active);
+      const capacity = numberValue(slots?.capacity);
+      const queued = numberValue(node.queuePending);
+      if (active !== undefined) slotsActive += active;
+      if (capacity !== undefined) slotsCapacity += capacity;
+      if (queued !== undefined) queuePending += queued;
+    });
+
+    return {
+      averageCpu: cpuValues.length > 0 ? cpuValues.reduce((sum, value) => sum + value, 0) / cpuValues.length : undefined,
+      heapUsed: hasHeapUsed ? heapUsed : undefined,
+      heapMax: hasHeapMax ? heapMax : undefined,
+      diskUsable: hasDiskUsable ? diskUsable : undefined,
+      diskTotal: hasDiskTotal ? diskTotal : undefined,
+      slotsActive,
+      slotsCapacity,
+      queuePending,
+      threadCount: hasThreadCount ? threadCount : undefined,
+    };
+  }, [computeNodes, data]);
+  return <div className="page-stack workspace-page ops-dashboard">
+    {error && <Alert type="warning" showIcon message="集群运维数据暂不可用" description={error} closable onClose={() => setError('')} />}
+    <div className="ops-toolbar"><Text type="secondary">每 5 秒刷新 · {data?.nodeId ? `当前 Compute ${data.nodeId}` : '未连接 Compute'}</Text><Button icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></div>
+    <Card className="workspace-card ops-summary-card" bordered={false} title="计算资源汇总情况">
+      <Row gutter={[16, 16]}>
+        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="平均 CPU 值" value={percentText(computeSummary.averageCpu)} prefix={<Activity size={18} />} /></Card></Col>
+        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="堆内存汇总情况" value={`${bytesText(computeSummary.heapUsed)} / ${bytesText(computeSummary.heapMax)}`} prefix={<Database size={18} />} /></Card></Col>
+        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="磁盘汇总情况" value={`${bytesText(computeSummary.diskUsable)} / ${bytesText(computeSummary.diskTotal)}`} prefix={<Server size={18} />} /></Card></Col>
+        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="执行槽位情况" value={`${computeSummary.slotsActive} / ${computeSummary.slotsCapacity}`} prefix={<Gauge size={18} />} /></Card></Col>
+        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="排队情况" value={computeSummary.queuePending} prefix={<Activity size={18} />} /></Card></Col>
+        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="线程数情况" value={computeSummary.threadCount ?? '—'} prefix={<Workflow size={18} />} /></Card></Col>
+      </Row>
+    </Card>
+    <Card className="workspace-card" bordered={false} title="Compute 节点资源"><Table size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={computeNodes} columns={[{ title: '节点', dataIndex: 'nodeId' }, { title: '角色', dataIndex: 'role' }, { title: 'CPU', render: (_, row) => percentText(row.systemCpuLoad) }, { title: '堆内存', render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` }, { title: '执行中', render: (_, row) => String((row.slots as Record<string, unknown> | undefined)?.active ?? '—') }, { title: '排队', dataIndex: 'queuePending' }]} locale={{ emptyText: '没有 Compute 运维数据' }} /></Card>
+    <Card className="workspace-card" bordered={false} title="Storage 节点资源"><Table size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={storageNodes} columns={[{ title: '节点', dataIndex: 'nodeId' }, { title: '角色', dataIndex: 'role' }, { title: 'CPU', render: (_, row) => percentText(row.systemCpuLoad) }, { title: '堆内存', render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` }, { title: '磁盘可用', render: (_, row) => bytesText(row.diskUsableBytes) }, { title: 'Metadata Leader', dataIndex: 'metadataLeaderId' }]} locale={{ emptyText: '没有 Storage 运维数据' }} /></Card>
+    <Card className="workspace-card" bordered={false} title="分片拓扑"><Table size="small" rowKey={(row) => `${row.graphId}-${row.partId}`} pagination={{ pageSize: 10, hideOnSinglePage: true }} dataSource={shards} columns={[{ title: '图', dataIndex: 'graph' }, { title: '分片', dataIndex: 'partId' }, { title: 'Leader', dataIndex: 'leaderId' }, { title: 'Term', dataIndex: 'term' }, { title: 'Applied Index', dataIndex: 'appliedIndex' }, { title: '副本', render: (_, row) => Array.isArray(row.members) ? (row.members as unknown[]).join(', ') : '—' }, { title: '状态', render: (_, row) => <Tag color={row.state === 'UNAVAILABLE' ? 'red' : 'green'}>{String(row.state || 'HEALTHY')}</Tag> }]} locale={{ emptyText: '没有分片拓扑数据' }} /></Card>
+  </div>;
+}
+
 type ScriptResult = { statement: string; response: QueryResponse; elapsedMs: number };
 
 function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, onGraphChanged, onInflight }: { api: CengyanApi; graph: string; canWrite: boolean; active: boolean; graphMaxNodes: number; tableMaxNodes: number; onGraphChanged: (name: string) => void; onInflight: (query: string) => void }) {
   const { notification: notificationApi } = AntApp.useApp();
-  const [query, setQuery] = useState(() => localStorage.getItem('cengyan.studio.last-query') || DEFAULT_QUERY);
+  const [query, setQuery] = useState(() => {
+    const saved = localStorage.getItem('cengyan.studio.last-query') || DEFAULT_QUERY;
+    return saved === LEGACY_SAMPLE_QUERY ? DEFAULT_QUERY : saved;
+  });
   const [result, setResult] = useState<ScriptResult[] | null>(null);
   const [queryError, setQueryError] = useState('');
   const [running, setRunning] = useState(false);
@@ -1014,7 +1231,7 @@ function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, o
   const editorMount: OnMount = (editor) => { editorRef.current = editor; editor.addCommand(2048 | 3, () => { runQueryRef.current(); }); };
   useEffect(() => { let live = true; void import('./monaco').then(() => { if (live) setEditorReady(true); }); return () => { live = false; }; }, []);
   useEffect(() => { if (active) editorRef.current?.layout(); }, [active]);
-  return <div className="query-page"><Row gutter={[18, 18]}><Col span={24}><Card className="editor-card" bordered={false}><div className="editor-toolbar"><div className="editor-file"><Tag color="geekblue">GQL</Tag></div><Button type="text" size="small" icon={<Trash2 size={14} />} onClick={() => { setQuery(''); editorRef.current?.setValue(''); }}>清空</Button></div>{editorReady ? <Editor height="350px" language="gql" theme="vs" value={query} onChange={(value) => setQuery(value || '')} onMount={editorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineNumbers: 'on', padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false, wordWrap: 'on', roundedSelection: false, automaticLayout: true, tabSize: 2 }} /> : <div className="editor-pending">正在打开编辑器…</div>}<div className="editor-footer"><Text type="secondary">{progress || '多条语句用分号分隔，服务端顺序执行并返回最后一条 · Ctrl + Enter'}</Text><Space size={8}>{canWrite && <Tag color="green">读写权限</Tag>}<Button type="primary" icon={<Code2 size={15} />} onClick={() => void runQuery()} loading={running} disabled={!graph || exporting}>执行查询 <Text className="shortcut">Ctrl ↵</Text></Button></Space></div></Card>{(result || running || queryError) && <ScriptResults api={api} results={result || []} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} loading={running} error={queryError} exporting={exporting} onExport={() => void exportCsv()} />}</Col></Row></div>;
+  return <div className="query-page"><Row gutter={[18, 18]}><Col span={24}><Card className="editor-card" bordered={false}><div className="editor-toolbar"><div className="editor-file"><Tag color="geekblue">GQL</Tag></div><Button type="text" size="small" icon={<Trash2 size={14} />} onClick={() => { setQuery(''); editorRef.current?.setValue(''); }}>清空</Button></div>{editorReady ? <Editor height="350px" language="gql" theme="vs" value={query} onChange={(value) => setQuery(value || '')} onMount={editorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineNumbers: 'on', lineNumbersMinChars: 3, lineDecorationsWidth: 8, padding: { top: 14, bottom: 14 }, scrollBeyondLastLine: false, wordWrap: 'on', roundedSelection: false, automaticLayout: true, tabSize: 2 }} /> : <div className="editor-pending">正在打开编辑器…</div>}<div className="editor-footer"><Text type="secondary">{progress || '多条语句用分号分隔，服务端顺序执行并返回最后一条 · Ctrl + Enter'}</Text><Space size={8}>{canWrite && <Tag color="green">读写权限</Tag>}<Button type="primary" icon={<Code2 size={15} />} onClick={() => void runQuery()} loading={running} disabled={!graph || exporting}>执行查询 <Text className="shortcut">Ctrl ↵</Text></Button></Space></div></Card>{(result || running || queryError) && <ScriptResults api={api} results={result || []} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} loading={running} error={queryError} exporting={exporting} onExport={() => void exportCsv()} />}</Col></Row></div>;
 }
 
 function ScriptResults({ api, results, loading, error, graphMaxNodes, tableMaxNodes, exporting, onExport }: { api: CengyanApi; results: ScriptResult[]; loading: boolean; error?: string; graphMaxNodes: number; tableMaxNodes: number; exporting: boolean; onExport: () => void }) {

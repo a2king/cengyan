@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent><groupId>io.cengyan</groupId><artifactId>cengyan</artifactId><version>1.0.0</version></parent>
+    <artifactId>cengyan-compute</artifactId>
+    <dependencies>
+        <dependency><groupId>io.cengyan</groupId><artifactId>cengyan-distributed</artifactId></dependency>
+        <dependency><groupId>io.cengyan</groupId><artifactId>cengyan-raft</artifactId></dependency>
+        <dependency><groupId>io.cengyan</groupId><artifactId>cengyan-query</artifactId></dependency>
+        <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId></dependency>
+        <dependency><groupId>io.cengyan</groupId><artifactId>cengyan-protocol</artifactId></dependency>
+        <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>io.cengyan</groupId><artifactId>cengyan-storage</artifactId><version>${project.version}</version><scope>test</scope></dependency>
+    </dependencies>
+    <build><plugins><plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-shade-plugin</artifactId>
+        <executions><execution><phase>package</phase><goals><goal>shade</goal></goals><configuration>
+            <createDependencyReducedPom>false</createDependencyReducedPom>
+            <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer"><mainClass>io.cengyan.compute.ComputeServer</mainClass></transformer>
+            </transformers>
+            <filters><filter><artifact>*:*</artifact><excludes><exclude>META-INF/*.SF</exclude><exclude>META-INF/*.DSA</exclude><exclude>META-INF/*.RSA</exclude></excludes></filter></filters>
+        </configuration></execution></executions>
+    </plugin></plugins></build>
+</project>

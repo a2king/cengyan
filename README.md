@@ -1,374 +1,186 @@
-# 层岩图数据库
+# 层岩（Cengyan）图数据库
 
-单机图数据库。数据在本机 RocksDB 里，客户端用一行一条 JSON 连到默认端口 `19669`。
+Java 21 图数据库，使用 Ratis 共识、RocksDB 分片存储、独立 Compute 和 GQL 查询。
 
-当前做到第 9 期：建图、插入、单跳和有界多跳、`SET` / `DELETE`、排序聚合、最短路、穿透持股、属性索引、登录和只读角色，以及分片、副本、计算节点。语法是手写解析，不是完整的 ISO GQL。新建的图默认 1 个分片、1 个副本，已有数据的分片号仍是 0。
+## 统一运行架构
 
-每一类语句怎么写、和标准相比缺了什么，在 `docs/gql/`。先看 `docs/gql/00-和标准相比.md`。
-
-## 先跑起来
-
-需要 JDK 21。这台机器上的 JDK 21 在 `D:\workspace\code_env\jdk21`。系统默认的 `java` 如果是 1.8，先换过来，再在仓库根目录打包：
-
-```powershell
-chcp 65001
-$env:JAVA_HOME = "D:\workspace\code_env\jdk21"
-$env:Path = "$env:JAVA_HOME\bin;" + $env:Path
-mvn "-DskipTests" package
+```text
+Python ClusterClient / Java CLI / Studio
+                  ↓ Compute client_address
+Compute：认证、队列、执行协调、GQL、跨分片 Join、DuckDB
+                  ↓ 内部 RPC / Protobuf
+Storage：Metadata / Data Raft、RocksDB、事务、索引、Schema、拓扑任务
 ```
 
-如果要生成给新用户直接解压部署的发布包，仓库根目录执行：
+**单节点和多节点只差角色数量，不再有另一套单机 Server。**
+
+- 单节点：同一机器启动一个 Storage 和一个 Compute，建图副本数为 1。
+- 多节点：部署多个 Storage/Compute，图副本数独立设置，生产通常至少 3 副本。
+- 只有 Storage 不提供外部 GQL 服务；客户端始终连接 Compute。
+- 旧 `cengyan-server`、本地 `cengyan-store`/`cengyan-catalog`、本地 QueryEngine、
+  `cengyan.properties`、`start-server`/`start-all` 和 Python `Client/GraphSession` 已删除。
+- 已有分布式数据目录不变；旧单机库不支持直接接入新的 Storage。
+
+## 构建与发布
+
+要求：JDK 21、Maven 3.9+；构建 Web 还需符合 Vite 要求的 Node.js/npm；归档需 Python 3.11+。
 
 ```powershell
-# Windows
-$env:JAVA_HOME = "D:\workspace\code_env\jdk21"
-$env:Path = "$env:JAVA_HOME\bin;" + $env:Path
+$env:JAVA_HOME = 'D:\workspace\code_env\jdk21'
 .\build-dist.ps1
 ```
 
 ```bash
-# Linux
-export JAVA_HOME=/path/to/jdk-21
-export PATH="$JAVA_HOME/bin:$PATH"
-bash ./build-dist.sh
+export JAVA_HOME=/opt/jdk-21
+bash build-dist.sh
 ```
 
-脚本只构建并打包 `cengyan-server` 和 `cengyan-studio`，会在 `dist/` 下同时生成发布目录和压缩包。发布包内的 JAR、`bin/` 启动命令、`config/` 配置样例、数据目录和日志目录已经准备好，解压后运行 `bin/start-all.bat`（Windows）或 `./bin/start-all.sh`（Linux）即可。所有打包和启动命令都会检查 Java 主版本，检测到不是 Java 21 时会中断并说明原因。
+默认先构建 Web，再执行全量 Java `clean package`（含测试），最后归档到 `dist/`。
+不要并行运行多个 Maven reactor 操作同一工作区。支持 `-SkipTests`/`--skip-tests`、
+`-SkipWeb`/`--skip-web`，仅在明确需要时使用。
 
-Linux 服务器如果没有把 JDK 21 配到系统环境变量，可以直接编辑发布包里的 `bin/java.env`：
+发布包内容：
+
+```text
+cengyan-storage.jar            数据库 Storage 角色
+cengyan-compute.jar            数据库 Compute 角色
+cengyan-cli.jar                可选交互式客户端（不是数据库进程）
+cengyan-studio.jar             可选 Web 客户端服务（不是另一套数据库）
+config/{storage,compute,studio}.properties
+bin/start-cluster-node.sh
+bin/{status,stop}-cluster-node.sh
+sdk/python/
+docs/
+BUILD-INFO.json / SHA256SUMS
+```
+
+三个打包入口（`build-dist.ps1`、`build-dist.bat`、`build-dist.sh`）均只输出
+`dist/cengyan-<版本>-linux.tar.gz`，不再生成 ZIP、Windows 包或外部 `.sha256` 文件。
+保留包内 `BUILD-INFO.json` 和 `SHA256SUMS`。兼容 `-Target linux` / `--target linux`，不再接受 `windows` / `all`。
+新包发布成功后清理标准命名的旧发布归档及其校验文件；自定义包、已有解压目录和数据不会被删除。
+包内 `bin/` 下所有文件（包括 `java.env`）均为 `777`，目录为 `755`；在 Linux 上执行 `tar -xzpf` 解压可保留权限，无需手动 chmod。
+`777` 允许所有用户修改脚本与环境配置，仅应在受信任的部署目录使用。
+不包含 JDK。Linux 脚本兼容 Bash 4.2+，
+但 RocksDB/DuckDB 原生库仍要求兼容的 glibc/libstdc++，不保证 CentOS 7 可直接运行。
+打包不会删除已有 `dist/cengyan-<version>` 解压目录和数据。
+
+## 单节点快速启动
+
+以下仅用于全新的本机开发环境。默认两份配置各自只有一个回环网络成员。
+先修改 `config/compute.properties` 中的 `root_password`。
 
 ```bash
 export JAVA_HOME=/opt/jdk-21
+./bin/start-cluster-node.sh --daemon storage
+./bin/start-cluster-node.sh --daemon compute
+
+./bin/status-cluster-node.sh storage
+./bin/status-cluster-node.sh compute
 ```
 
-启动脚本会自动读取这个文件。Shell 中设置环境变量时写成 `export JAVA_HOME=/opt/jdk-21`，不要写成 `export $JAVA_HOME=...`。
-
-开一个终端启动服务。配置文件要在当前目录，所以就在仓库根目录执行：
+Windows（分别在两个终端前台运行）：
 
 ```powershell
-java -jar cengyan-server\target\cengyan-server-1.0.0.jar cengyan.properties
+.\bin\start-cluster-node.ps1 -Role storage
+.\bin\start-cluster-node.ps1 -Role compute
 ```
 
-看到日志里的 `0.0.0.0:19669` 就可以连。内网另一台机器用这台电脑的局域网 IP，不要写 `0.0.0.0`。数据写在 `data\`，日志打在这个终端。`Ctrl+C` 会关库。Windows 防火墙若拦截入站，需要放行这个端口。
+Linux 不加 `--daemon` 也为前台模式，适合 systemd/container。状态检查是进程检查，不是 Raft readiness。
+正常停机先 Compute，后 Storage；停止脚本不会自动 `kill -9`。
 
-再开一个终端启动客户端：
-
-```powershell
-java -jar cengyan-cli\target\cengyan-cli-1.0.0.jar
+```bash
+./bin/stop-cluster-node.sh compute
+./bin/stop-cluster-node.sh storage
 ```
 
-`--host` 和 `--port` 可改连接地址，默认 `127.0.0.1:19669`。交互模式里输入 `exit` 或 `quit` 退出。不要用「启动一次只发一条命令」的方式连续操作：每次新进程都不记得上次的登录。
+默认端口：Storage Raft `19700`、RPC `19701`；Compute Raft `19800`、RPC `19801`、客户端 `19669`。
+Storage/Compute 的相对 `data_dir` 都按配置文件目录解析；正式部署建议使用独立的绝对路径。
+已有多节点集群不能靠删配置条目缩成单节点，必须提交排空/成员移除操作。
 
-浏览器控制台另开一个终端：
+## 多节点与动态扩容
 
-```powershell
-java -jar cengyan-studio\target\cengyan-studio-1.0.0.jar
+完整步骤见 [Linux 真机部署](docs/linux-cluster-deployment.md)。
+
+- 首次 Bootstrap：各角色配置相同的初始成员列表、本机唯一 node_id 和真实地址。
+- 后续 Join：新节点配置现有成员作为联系入口，列表不包含新节点自己；老节点不用改配置重启。
+- Storage 成员格式：`id@raft@rpc`；Compute：`id@rpc@raft@client`。
+- 正式下线 Storage：`drainStorage` → 等待分片迁移 → `removeStorage` → 停止旧进程。
+- 正式下线 Compute：`drainCompute` → 等待任务结束 → 从另一 Compute 入口执行 `removeCompute`。
+- 所有正式 Storage 参与 Metadata 投票，所有正式 Compute 参与 Compute Group 投票；成员变更需多数派。
+- 内部 RPC/Raft 不重复用户认证，禁止暴露给不可信网络；多机必须同步时钟。
+
+## Python SDK（单节点、多节点共用）
+
+```bash
+python3 -m pip install ./sdk/python
 ```
 
-打开 `http://127.0.0.1:19670`。控制台把请求转到本机图库 `19669`。`--host`、`--port`、`--db-host`、`--db-port`、`--graph-max-nodes`、`--table-max-nodes` 可改；部署包的 `config/studio.properties` 默认使用 `host=0.0.0.0`，内网用户可以通过服务器 IP 访问。`graph_max_nodes` 默认 2000，查询结果行数超过后关系图只提示不渲染；`table_max_nodes` 默认 2000，表格只分页展示前面的结果，不改变真实查询总量和查询耗时。结果页支持重新执行当前 GQL 导出全部 CSV，导出期间不能重复提交。登录用图库用户（仓库默认 `root` / `cengyan`），不是独立 Studio 账号。
+```python
+from cengyan import ClusterClient
 
-Studio 前端源码在 `cengyan-studio-web`，和 Java 转发服务分开维护。开发前端时：
-
-```powershell
-cd cengyan-studio-web
-npm install
-npm run dev
+# 多节点只需改为多个 (host, port)。单节点仍连接 Compute。
+with ClusterClient([('127.0.0.1', 19669)], password='你的初始化密码') as client:
+    client.create_graph('Company', partitions=3, replicas=1,
+                        vertex_id_type='STRING', edge_id_type='STRING')
+    graph = client.graph('Company')
+    graph.write('CREATE NODE TYPE Company (name STRING NULL)')
+    graph.insert_nodes('Company', [{'id': 'a', 'name': 'Alice'}])
+    print(graph.read('MATCH (n:Company) RETURN n.id, n.name').to_dicts())
 ```
 
-生产构建会把静态资源写回 `cengyan-studio/src/main/resources/studio`，随后重新打包 `cengyan-studio` 即可随 Java Studio 一起部署：
+图身份随每个请求显式传递。读断线不重算；写断线最多重试三次并复用 requestId；
+批量导入按网络批次提交，失败停止并报告已确认进度。SDK 无 requests 依赖。
+旧 `Client/GraphSession` API 已删除，使用方必须迁移到 ClusterClient。
 
-```powershell
-npm run typecheck
-npm run build
+## 客户端工具
+
+Java CLI 可以连接 Compute，保存登录令牌并在客户端附带图上下文：
+
+```bash
+java -jar cengyan-cli.jar --host 127.0.0.1 --port 19669
 ```
-
-页面使用 Ant Design 组织工作台控件，Monaco Editor 承载 GQL 编辑器，React Flow 承载查询结果的点边关系图。图模式先进入图空间列表，打开空间后再切换点类型、边类型、索引和统计信息；GQL 页右上角可以独立切换当前图空间。
-
-## 第一段查询
-
-空库第一次启动会创建读写用户 `root`，密码是配置里的 `root_password`，仓库自带配置是 `cengyan`。先登录，再写语句。一次一行，不要用分号把多条拼在一起。
 
 ```text
-:login root cengyan
-CREATE GRAPH Company
+:login root 你的初始化密码
 USE Company
-CREATE NODE TYPE Company ID INT (name STRING NULL)
-CREATE REL TYPE holder (ratio DOUBLE NULL)
-INSERT (a:Company {id:1, name:'root'})-[:holder {ratio:0.5}]->(b:Company {id:2, name:'sub'})
-MATCH (a:Company {id:1})-[e:holder]->(b) RETURN b.id, e.ratio
+MATCH (n:Company) RETURN n.id, n.name
+:drainStorage storage-3
+:removeStorage storage-3
 ```
 
-最后一行应返回 `b.id = 2`、`e.ratio = 0.5`。
+旧单机的 addStorage/addCompute/setPartCount/rebuildIndex 管理命令已禁用；新增节点用自动 Join。
+Studio 前后端代码作为可选客户端保留，配置 `db_host/db_port` 指向 Compute。
+完整集群管理适配尚需验收，首次部署以 ClusterClient 为准，不把 Studio 作为就绪证明。
 
-名字只能是英文字母、数字、下划线，不能以数字或下划线开头，不能用中文，最长 128 字节。关键字不区分大小写，图名、类型名、属性名区分大小写。`id` 是点的编号，不是属性列。
+## 源码模块
 
-节点 ID 可以按类型定义为非负整数或字符串。字符串 ID 需要指定 UTF-8 最大字节长度；旧的 `CREATE NODE TYPE Company (...)` 写法等同于 `ID INT`。
-
-```text
-CREATE NODE TYPE Company ID INT (name STRING NULL)
-CREATE NODE TYPE Person ID STRING(64) (name STRING NULL)
-```
-
-字符串 ID 写入和查询时使用引号，例如 `id:'person-001'`。`SHOW NODE TYPES` 会返回 `idType` 和 `idLength` 两列。
-
-## 点和边怎么写
-
-带类型的点模式会把点写进去。只写 `({id:1})` 时只写边，不写点。
-
-```text
-INSERT (a:Company {id:3, name:'alone'})
-INSERT (a {id:1})-[:holder {ratio:0.2}]->(b {id:3})
-```
-
-箭头是逻辑方向。`(a)-[:holder]->(b)` 里 a 是起点、b 是终点。`(a)<-[:holder]-(b)` 则起点是 b、终点是 a。插入边必须有方向，也不能一次插入多跳。
-
-同一对点可以有多条边，用 `@` 后面的 rank 区分，不写就是 0：
-
-```text
-INSERT (a {id:1})-[:holder@3 {ratio:0.1}]->(b {id:2})
-```
-
-改和删都从 `MATCH` 开头，并且只支持一跳。删点可以不写边：
-
-```text
-MATCH (a:Company {id:1})-[e:holder]->(b {id:2}) SET e.ratio = 0.8, b.name = 'child'
-MATCH (a {id:3}) DELETE a
-```
-
-`RETURN b` 返回整个点，形如 `{"id":2,"type":"Company","properties":{...}}`。`RETURN e` 返回整条边，形如 `{"type":"holder","rank":0,"src":1,"dst":2,"properties":{...}}`。
-
-可以只查点，不写边。边上不写类型表示任何关系；用 `|` 列出几种类型，每个名字前面的冒号可以省略：
-
-```text
-MATCH (a:Company {id:1}) RETURN a
-MATCH (a:Company {id:1})-[e]->(b) RETURN e
-MATCH (a:Company {id:1})-[e:holder|:works]->(b) RETURN b.id
-```
-
-不写类型或一次写多种类型时，这个点上没被选中的边也算进每点上限。插入边仍然只能写一个类型。
-
-属性类型是 `BOOL`、`INT64`、`DOUBLE`、`STRING`、`DATETIME`。建类型后只能在末尾加可空列：
-
-```text
-ALTER NODE TYPE Company ADD founded DATETIME NULL
-```
-
-时间字面量写成 `DATETIME '2024-01-31T12:00:00Z'`。不带时区的 `DATETIME '2024-01-31 12:00:00'` 按 UTC。返回值是 ISO 字符串。
-
-## Spark 初始化脚本
-
-`dev-scripts/data_init_node.py` 和 `dev-scripts/data_init_edge.py` 都在 `main` 中创建 `SparkSession`，执行 `spark.sql`，再用 `foreachPartition` 复用一个 Cengyan 会话逐条写入。脚本只依赖随目录提供的 `cengyan.py`，不需要安装 Nebula 客户端。
-
-节点导入示例：
-
-```bash
-spark-submit --py-files dev-scripts/cengyan.py dev-scripts/data_init_node.py \
-  --sql "select id, name from company_source" \
-  --host 127.0.0.1 --port 19669 --user root --password cengyan \
-  --space Company --node-type Company --id-field id \
-  --id-type STRING --id-length 64 --property-fields name --batch 512
-```
-
-边导入示例：
-
-```bash
-spark-submit --py-files dev-scripts/cengyan.py dev-scripts/data_init_edge.py \
-  --sql "select src_id, dst_id, ratio from holding_source" \
-  --host 127.0.0.1 --port 19669 --user root --password cengyan \
-  --space Company --edge-type holder --src-field src_id --dst-field dst_id \
-  --id-type STRING --id-length 64 --property-fields ratio --batch 512
-```
-
-`--id-type INT` 是默认值；使用 `STRING` 时脚本会为 ID 自动加引号并转义单引号，`--id-length` 按 UTF-8 字节校验，需与节点类型定义一致。
-
-当前初始化脚本使用服务端批量接口。`--batch` 表示一次 `bulkInsert` 的行数，默认 512，服务端单批最多 10000 行、请求体最多 16 MiB；它不再为每行发一个 GQL 请求。
-
-批量接口的 JSON 形状如下：
-
-```json
-{
-  "op": "bulkInsert",
-  "session": "...",
-  "kind": "node",
-  "type": "Person",
-  "rows": [
-    {"id": 1, "name": "Alice"},
-    {"id": 2, "name": "Bob"}
-  ]
-}
-```
-
-边批次使用 `src`、`dst`、可选 `rank` 和属性列：
-
-```json
-{
-  "op": "bulkInsert",
-  "kind": "edge",
-  "type": "knows",
-  "rows": [
-    {"src": 1, "dst": 2, "rank": 0, "score": 0.5}
-  ]
-}
-```
-
-节点批次在服务端对应一次 RocksDB `WriteBatch`。字符串 ID 映射、节点属性和索引也在同一个批次中提交；任意一行校验失败时整批失败。同一分片的边同样一次提交。跨分片的边先写出边、属性和补偿标记，再写入边，最后删除标记。
-
-10 亿级数据不能放进一个请求，应该由 Spark 分区或外部导入器切成 512～10000 行的批次，并通过多个分区并行提交。批量边可以连接不同分片上的端点。
-
-## 目录
-
-```text
-SHOW GRAPHS
-SHOW ALIASES
-SHOW NODE TYPES
-SHOW REL TYPES
-DESCRIBE NODE TYPE Company
-DESCRIBE REL TYPE holder
-CREATE ALIAS corp FOR GRAPH Company
-DROP ALIAS corp
-DROP GRAPH Company
-```
-
-`USE` 之后的语句都落在当前图。别名指向图，不能指向另一个别名。`DROP GRAPH` 只能删图，不能拿来删别名。
-
-## 多跳、最短路、子图
-
-变长跳写在箭头后面。`{3}` 是正好第 3 跳的点，`{1,3}` 是第 1 到第 3 跳新到达的点，每个点只出现一次。要整条路，绑定路径变量并写 `LIMIT`。
-
-```text
-MATCH (a:Company {id:1})-[:holder]->{1,3}(b) RETURN b.id
-MATCH p = (a:Company {id:1})-[:holder]->{1,3}(b) RETURN p LIMIT 10000
-MATCH p = (a {id:1})-[:holder]->{1,3}(b {id:4}) RETURN p LIMIT 10000
-CALL path.shortest({start: 1, end: 2, rel: "holder", hops: 10}) YIELD length, vids
-CALL path.all({start: 1, rel: "holder", min: 1, max: 3, limit: 10000}) YIELD path
-CALL subgraph.bounded({start: 1, rel: "holder", hops: 3}) YIELD vid
-CALL ownership.largest_holder({start: 1, rel: "holder", ratioProp: "ratio", hops: 10}) YIELD vid, ratio
-```
-
-`p` 每行是 `{length, nodes:[{id, type, properties}], edges:[{type, rank, src, dst, properties}]}`。一条路上的点不重复，再多一条超过 `LIMIT` 就失败。多跳 `MATCH` 的 `WHERE` 目前只能比较边的 `rank` 和终点 `id`。`*` 表示无上界路径，会直接报语法错误。
-
-子图从起点沿这种边的出边和入边一起扩，结果包含起点，只返回 `vid`。`hops: 0` 只返回起点。
-
-
-## 索引
-
-```text
-CREATE INDEX by_name ON NODE TYPE Company (name)
-CREATE UNIQUE INDEX by_ratio ON REL TYPE holder (ratio)
-SHOW INDEXES
-DROP INDEX by_name
-:rebuildIndex by_name
-:stats
-```
-
-`CREATE INDEX` 只登记目录，此时查询还不会用它。执行 `:rebuildIndex 索引名`，`SHOW INDEXES` 里 `ready` 变成 true 之后，等值和数值范围才会走索引。索引建好之前的新写入仍会维护索引键。
-
-字符串只支持等值，范围条件不会走索引。`INT64`、`DOUBLE`、`DATETIME` 可以做范围。`NULL` 不进索引，多条 `NULL` 不算冲突。唯一索引冲突时报 `UNIQUE_VIOLATION`。`:stats` 需要先 `USE`。默认返回上次缓存的每种点、每种边数量和统计时间，不重新扫描。`:stats refresh` 才重新统计并更新缓存。
-
-## 用户和角色
-
-用户管理不写进 GQL，用冒号命令。角色只有 `read` 和 `write`，作用范围是整个进程，不是单张图。
-
-```text
-:createUser reader secret read
-:setPassword reader next
-:setRole reader write
-:dropUser reader
-```
-
-只读用户可以 `USE`、`SHOW`、`DESCRIBE`、`MATCH`、`CALL` 和 `:stats`。`INSERT`、`SET`、`DELETE`、`CREATE`、`DROP`、`ALTER`，以及重建索引、刷盘、压缩和用户管理，会返回 `FORBIDDEN`。最后一个读写用户不能删除，也不能改成只读。密码不以明文保存。会话只在内存里，空闲 8 小时删除，重启服务后要重新登录，图数据还在。
-
-## 运维命令
-
-| 输入 | 作用 |
+| 模块 | 用途 |
 |---|---|
-| `ping` 或 `:ping` | 看连接是否通，不用登录 |
-| `:login 用户 密码` | 登录，并记住这次会话 |
-| `:flush` | 把内存表刷到磁盘 |
-| `:compact` | 压缩全部列族。查询可以继续按快照读 |
-| `:rebuildIndex 索引名` | 重建索引并标记为可用 |
-| `:stats` | 返回上次缓存的点数和边数。`:stats refresh` 重新统计 |
-| `:createUser 用户 密码 read\|write` | 建用户 |
-| `:setPassword 用户 密码` | 改密码 |
-| `:setRole 用户 read\|write` | 改角色 |
-| `:dropUser 用户` | 删用户 |
-| `:setPartCount 图 分片数` | 按新的分片数重写已有键。1 个分片时分片号仍是 0 |
-| `:addStorage 主机:端口` | 加入空的存储节点，并开始搬分片号最小的那一个 |
-| `:drainStorage 节点号` | 存储节点开始下线。它若是某个分片的唯一投票成员，返回 `NODE_NOT_DRAINED` |
-| `:removeStorage 节点号` | 已经下线且不再持有分片时移除 |
-| `:addReplica 图 副本数` | 把图加到这么多投票副本。同步期间写入返回 `SPACE_READONLY`，查询继续 |
-| `:addCompute 主机:端口` | 健康检查通过后加入计算节点。计算节点不存点和边 |
-| `:drainCompute 节点号` | 不再把新会话分到这台 |
-| `:removeCompute 节点号` | 没有绑定会话、也没有正在执行的查询时才能移除 |
-| `:showMembers 图` | 只列出投票成员。学习者不显示 |
+| cengyan-common | 公共查询错误码、异常、取消契约；不包含数据库 |
+| cengyan-protocol / rpc | Protobuf、固定分片路由、Netty RPC/流控 |
+| cengyan-raft | Multi-Raft、RocksDB 状态机、快照和恢复 |
+| cengyan-distributed | 图目录、图实体、事务、索引、Schema 和副本任务 |
+| cengyan-parser / query | GQL 解析、远程查询协调、表达式、DuckDB |
+| cengyan-storage / compute | 两个数据库角色入口 |
+| cengyan-cli / studio | 可选客户端工具 |
 
-创建图时副本数只能是 1。先把数据灌完，再 `:addReplica`。跨分片的边会先写出边再写入边；补偿还没做完时，查询可能只看见出边。有 3 个投票成员以后，写入要多数派确认才返回成功，一台机器坏掉仍然可以写。计算节点只负责承接会话：新会话去正在执行的查询更少的那台，同一会话的下一条语句还留在那里。
+## 验证与边界
 
-## 自己写客户端
-
-TCP，一行一条 JSON，UTF-8，以换行结束。成功和失败都看 `code`。失败响应没有半截 `rows`。`message` 是中文说明。
-
-```json
-{"op":"ping"}
-{"op":"login","user":"root","password":"cengyan"}
-{"op":"execute","session":"上一次返回的 session","query":"RETURN 1","params":{}}
-{"op":"admin","session":"...","command":"rebuildIndex","index":"by_name"}
-{"op":"admin","session":"...","command":"createUser","user":"reader","password":"secret","role":"read"}
-{"op":"cancel","queryId":"要取消的查询"}
+```bash
+mvn clean test
+# 在 cengyan-cli-python 目录：
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+# JAR 构建后的真实独立进程冒烟：
+PYTHONPATH=src python3 tests/cluster_process_smoke.py --java /opt/jdk-21/bin/java
 ```
 
-`login`、`execute`、`admin` 成功时大致是：
+移除旧实现后不再运行它的专用测试，不能与历史的 186 个测试直接比较。
+现有远程集成测试覆盖登录、权限、建图、点边导入、更新、索引、聚合、路径和集群 Join；
+单机一 Storage + 一 Compute 还通过独立 JAR/SDK 冒烟验证。
 
-```json
-{"code":"OK","session":"...","queryId":"...","columns":["user","role"],"rows":[["root","write"]],"rowsAffected":0}
-```
+历史 [perf-report](docs/perf-report.md) 是已移除实现的参考数据，不代表当前角色架构性能。
+真实多机网络分区、长期压力、磁盘故障和生产容量仍需专项验收。
 
-没登录就执行，会得到 `{"code":"FORBIDDEN","message":"请先登录",...}`。把响应里的 `session` 原样带回去。客户端自带的交互模式会自动保存。
-
-查询参数放在 `params` 里，语句里用 `$名字`。交互客户端发出的 `params` 是空对象，所以在客户端里直接写字面量。
-
-## 配置
-
-`cengyan.properties` 在启动时读完，运行中不热更新。仓库里的块缓存是开发机的 256MB。32GB 机器按计划书把 `block_cache_bytes` 改成 `8589934592`。
-
-| 项 | 仓库里的值 | 含义 |
-|---|---|---|
-| `host` | `0.0.0.0` | 监听地址。`0.0.0.0` 是所有网卡，`127.0.0.1` 只本机 |
-| `port` | `19669` | 监听端口 |
-| `data_dir` | `data` | 数据目录，相对启动时的工作目录 |
-| `root_password` | `cengyan` | 只在还没有任何用户时，用来创建 `root` |
-| `query_threads` | `16` | 交互查询线程数。登录、SHOW、USE、DESCRIBE 和普通语句走这里 |
-| `interactive_reserved` | `2` | 上面的名额里留给登录和元数据的条数，必须小于 `query_threads` |
-| `heavy_query_threads` | `2` | 统计、存储扫描、重建索引、批量导入使用的线程数，不占用交互线程 |
-| `query_queue_ms` | `30000` | 等一条空闲线程的最长时间，超时返回 `BUSY` |
-| `heavy_max_execution_time_ms` | `0` | 重查询的硬超时。`0` 表示不再额外限制 |
-| `max_execution_time_ms` | `0` | 一条普通语句的服务端超时，`0` 表示不限 |
-| `max_edges_per_vertex` | `0` | 每点扫描边数预算，`0` 表示不限 |
-| `max_frontier_per_hop` | `0` | 每跳新点预算，`0` 表示不限 |
-| `max_hops` | `0` | 多跳、最短路、子图的跳数预算，`0` 表示不限 |
-| `max_paths` | `0` | 路径结果预算，`0` 表示不限 |
-| `query_memory_bytes` | `67108864` | 单条查询的 Java 中间结果预算；DuckDB 排序、去重和聚合使用同一上限并允许写临时目录，无法外排的中间结果超限会返回 `QUERY_MEMORY_EXCEEDED` |
-| `block_cache_bytes` | `268435456` | RocksDB 块缓存 |
-| `duckdb_memory` | `1GB` | 排序和聚合使用的 DuckDB 内存 |
-| `duckdb_temp_directory` | `tmp/duck` | DuckDB 临时目录 |
-| `duckdb_max_temp_directory_size` | `10GB` | 单条 DuckDB 查询允许使用的临时磁盘空间 |
-| `duckdb_threads` | `1` | 单条 DuckDB 查询线程数，1 优先保证服务并发稳定性 |
-| `supernode_spill_enabled` | `true` | 超级节点查询是否允许把 frontier/visited 临时状态放入查询级 DuckDB 工作区 |
-| `supernode_edge_threshold` | `10000` | 单个点扫描超过该边数后触发超级节点 spill，0 表示关闭阈值触发 |
-| `supernode_frontier_spill_enabled` | `true` | 是否允许多跳 frontier、visited 和已到达集合切换到 DuckDB |
-| `supernode_spill_max_bytes` | `10737418240` | 单条超级节点查询的 DuckDB 临时空间上限 |
-| `supernode_spill_batch_edges` | `4096` | spill 状态迁移时每批写入 DuckDB 的点数 |
-| 
-ocksdb_background_jobs | 6 | RocksDB background flush/compaction jobs |
-| 
-ocksdb_write_buffer_bytes | 134217728 | MemTable write buffer per Column Family, in bytes |
-
-这些预算是执行策略，不是 GQL 语义。默认值为 `0`，不会因为固定的 64 条边、10 跳或 100 条路径拒绝查询；不受信任的部署可以显式设置正数。
-
-## 测试
-
-```powershell
-mvn test
-```
-
-性能测试记在 `docs/perf-report.md`。
+文档：[索引](docs/README.md) · [架构](docs/distributed-architecture.md) ·
+[状态](docs/distributed-implementation-status.md) · [部署](docs/linux-cluster-deployment.md) ·
+[批量导入](docs/bulk-import.md) · [GQL](docs/gql/00-和标准相比.md)

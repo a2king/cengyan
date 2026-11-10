@@ -68,6 +68,10 @@ button, input, textarea, select { font-family: inherit; }
 .page-stack, .query-page { width: min(1280px, 100%); margin: 0 auto; }
 .page-heading, .query-heading, .panel-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .page-heading { margin-bottom: 25px; }
+.ops-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; margin-bottom: 16px; }
+.ops-dashboard .ant-row { row-gap: 5px !important; }
+.ops-dashboard > .workspace-card + .workspace-card { margin-top: 5px; }
+.ops-summary-card .ant-card-body { padding-top: 0; }
 .space-overview { display: flex; flex-direction: column; min-height: calc(100vh - 176px); }
 .page-heading h2, .query-heading h2 { margin: 5px 0 3px; color: #202b49; font-size: 27px; letter-spacing: -.035em; }
 .page-heading p, .query-heading p { margin: 0; }
@@ -258,3 +262,42 @@ button, input, textarea, select { font-family: inherit; }
   .login-intro { display: none; }
   .login-card { width: 100%; }
 }
+
+/* ---- 集群管理 ---- */
+.cluster-gate { display: grid; place-items: center; min-height: 60vh; }
+.cluster-standalone .studio-header .brand-block { margin: 0; padding: 0; line-height: normal; }
+.cluster-console .workspace-card .ant-card-body { padding-top: 0; }
+.cluster-console .ops-toolbar { flex-wrap: wrap; }
+.cluster-console .ops-toolbar > .ant-typography { min-width: 0; overflow-wrap: anywhere; }
+.cluster-tab, .cluster-overview { display: flex; flex-direction: column; gap: 16px; }
+.cluster-tab-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.cluster-alerts { display: flex; flex-direction: column; gap: 10px; }
+.cluster-alerts:empty { display: none; }
+.tab-badge { margin-inline-start: 4px; margin-inline-end: 0; font-size: 11px; line-height: 18px; }
+.task-card { cursor: pointer; margin-top: 0; }
+.task-card-body { flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.guide-card { border: 1px solid var(--line); }
+.guide-steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin: 0; padding: 0; list-style: none; counter-reset: guide; }
+.guide-steps li { position: relative; padding: 14px 14px 14px 46px; border: 1px solid var(--line); border-radius: 12px; background: #fbfcff; counter-increment: guide; }
+.guide-steps li::before { content: counter(guide); position: absolute; left: 14px; top: 14px; display: grid; place-items: center; width: 22px; height: 22px; color: #5268e8; border-radius: 50%; background: #e4e8ff; font-size: 12px; font-weight: 600; }
+.guide-steps li.done::before { content: '✓'; color: #fff; background: #27a975; }
+.guide-steps li .ant-typography { display: block; }
+.guide-steps li .ant-typography-secondary { margin: 4px 0 10px; font-size: 13px; }
+.port-row { display: flex; flex-wrap: wrap; }
+.port-row .ant-input-number { width: 130px; }
+.node-logs, .step-log { margin: 0; padding: 12px; overflow: auto; color: #d7dcef; border-radius: 8px; background: #1b2033; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-all; }
+.node-logs { min-height: 60vh; }
+.step-log { max-height: 280px; }
+.config-meta { font-size: 12px; }
+.config-scope-note { margin: -4px 0 0; }
+.root-card { align-items: center; margin-top: 0; }
+.root-card-body { flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.history-selected { background: #f3f5ff; }
+.diff-card { margin-top: 16px; }
+.task-layout { display: grid; grid-template-columns: 320px 1fr; gap: 16px; align-items: start; flex-direction: row; }
+.task-list .ant-list-item { padding: 10px 8px; cursor: pointer; border-radius: 8px; }
+.task-list .ant-list-item:hover { background: #f7f8fc; }
+.task-detail { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.task-alert { margin-bottom: 16px; }
+.login-card .login-cluster.ant-btn { margin-top: 10px; }
+@media (max-width: 900px) { .task-layout { grid-template-columns: 1fr; } }

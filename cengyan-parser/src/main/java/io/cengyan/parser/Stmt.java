@@ -36,14 +36,19 @@ public sealed interface Stmt {
     record Describe(boolean node, String name) implements Stmt {
     }
 
-    record CreateType(boolean node, String name, String comment, String idType, int idLength, List<Field> fields,
-                      boolean ifNotExists) implements Stmt {
+    record CreateType(boolean node, String name, String comment, String idType, int idLength, boolean idSpecified,
+                      List<Field> fields, boolean ifNotExists) implements Stmt {
         public CreateType(boolean node, String name, String idType, int idLength, List<Field> fields) {
-            this(node, name, null, idType, idLength, fields, false);
+            this(node, name, null, idType, idLength, true, fields, false);
         }
 
         public CreateType(boolean node, String name, String comment, String idType, int idLength, List<Field> fields) {
-            this(node, name, comment, idType, idLength, fields, false);
+            this(node, name, comment, idType, idLength, true, fields, false);
+        }
+
+        public CreateType(boolean node, String name, String comment, String idType, int idLength, List<Field> fields,
+                          boolean ifNotExists) {
+            this(node, name, comment, idType, idLength, true, fields, ifNotExists);
         }
     }
 

@@ -25,6 +25,28 @@ class StudioServerTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test
+    void 节点维护透传字符串身份() throws Exception {
+        for (String command : new String[] {"drainStorage", "removeStorage", "drainCompute", "removeCompute", "showNodes"}) {
+            try (ServerSocket db = new ServerSocket(0)) {
+                AtomicReference<String> seen = new AtomicReference<>();
+                Thread worker = new Thread(() -> reply(db, seen, "{\"code\":\"OK\"}"));
+                worker.start();
+                try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", db.getLocalPort()))) {
+                    HttpResponse<String> response = post(studio.port(), "/api/admin",
+                            "{\"command\":\"" + command + "\",\"nodeId\":\"storage-3\"}", "s1");
+                    assertEquals(200, response.statusCode());
+                }
+                worker.join(3000);
+                JsonNode sent = MAPPER.readTree(seen.get());
+                assertEquals(command, sent.path("command").asText());
+                assertTrue(sent.path("nodeId").isTextual());
+                assertEquals("storage-3", sent.path("nodeId").asText());
+                assertEquals("s1", sent.path("session").asText());
+            }
+        }
+    }
+
+    @Test
     void 登录把图数据库的会话交回浏览器() throws Exception {
         try (ServerSocket db = new ServerSocket(0)) {
             AtomicReference<String> seen = new AtomicReference<>();
@@ -135,7 +157,7 @@ class StudioServerTest {
     @Test
     void admin只转发白名单() throws Exception {
         try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", 1))) {
-            for (String command : new String[] {"createUser", "dropUser", "compact", "flush", "setRole"}) {
+            for (String command : new String[] {"createUser", "dropUser", "compact", "flush", "setRole", "addStorage", "addCompute", "rebuildIndex"}) {
                 HttpResponse<String> response = post(studio.port(), "/api/admin",
                         "{\"command\":\"" + command + "\"}", "s1");
                 assertEquals(400, response.statusCode(), command);
@@ -190,7 +212,7 @@ class StudioServerTest {
     }
 
     @Test
-    void rebuildIndex可以转发() throws Exception {
+    void showNodes可以转发() throws Exception {
         try (ServerSocket db = new ServerSocket(0)) {
             AtomicReference<String> seen = new AtomicReference<>();
             Thread worker = new Thread(() -> reply(db, seen, """
@@ -199,14 +221,13 @@ class StudioServerTest {
             worker.start();
             try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", db.getLocalPort()))) {
                 HttpResponse<String> response = post(studio.port(), "/api/admin",
-                        "{\"command\":\"rebuildIndex\",\"index\":\"by_name\"}", "s1");
+                        "{\"command\":\"showNodes\"}", "s1");
                 assertEquals(200, response.statusCode());
             }
             worker.join(3000);
             JsonNode sent = MAPPER.readTree(seen.get());
-            assertEquals("rebuildIndex", sent.get("command").asText());
-            assertEquals("by_name", sent.get("index").asText());
-            assertEquals(StudioServer.REBUILD_TIMEOUT_MS, sent.get("timeoutMs").asInt());
+            assertEquals("showNodes", sent.get("command").asText());
+            assertEquals(StudioServer.STATS_TIMEOUT_MS, sent.get("timeoutMs").asInt());
         }
     }
 

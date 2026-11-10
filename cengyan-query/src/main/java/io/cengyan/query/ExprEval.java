@@ -35,6 +35,13 @@ final class ExprEval {
         this.slots = slots == null ? Map.of() : slots;
     }
 
+    /** ORDER BY can refer to projected aliases as well as input bindings. */
+    void aliases(Map<String, Slot> aliases) {
+        Map<String, Slot> merged = new java.util.HashMap<>(slots);
+        merged.putAll(aliases);
+        slots = merged;
+    }
+
     Object eval(Expr expr) {
         return switch (expr) {
             case Expr.Literal literal -> literal(literal.value());

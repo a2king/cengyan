@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -33,14 +34,19 @@ public final class StudioServer implements AutoCloseable {
     private final int port;
     private final int graphMaxNodes;
     private final int tableMaxNodes;
+    private final ComputeOpsClient computeOps;
+    private final io.cengyan.studio.cluster.ClusterManager cluster;
 
-    private StudioServer(DbClient db, HttpServer http, ExecutorService workers, int port, int graphMaxNodes, int tableMaxNodes) {
+    private StudioServer(DbClient db, HttpServer http, ExecutorService workers, int port, int graphMaxNodes, int tableMaxNodes,
+                          ComputeOpsClient computeOps, io.cengyan.studio.cluster.ClusterManager cluster) {
         this.db = db;
         this.http = http;
         this.workers = workers;
         this.port = port;
         this.graphMaxNodes = graphMaxNodes;
         this.tableMaxNodes = tableMaxNodes;
+        this.computeOps = computeOps;
+        this.cluster = cluster;
     }
 
     public static void main(String[] args) throws Exception {
@@ -57,11 +63,22 @@ public final class StudioServer implements AutoCloseable {
     }
 
     public static StudioServer start(StudioConfig config) throws IOException {
-        DbClient db = new DbClient(config.dbHost(), config.dbPort());
+        io.cengyan.studio.cluster.ClusterManager cluster = config.home().isBlank() ? null
+                : io.cengyan.studio.cluster.ClusterManager.open(java.nio.file.Path.of(config.home()));
+        DbClient db = new DbClient(() -> {
+            if (cluster != null) {
+                var target = cluster.databaseTarget();
+                if (target != null) return target;
+            }
+            return InetSocketAddress.createUnresolved(config.dbHost(), config.dbPort());
+        });
         HttpServer http = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
         http.setExecutor(workers);
-        StudioServer server = new StudioServer(db, http, workers, http.getAddress().getPort(), config.graphMaxNodes(), config.tableMaxNodes());
+        StudioServer server = new StudioServer(db, http, workers, http.getAddress().getPort(), config.graphMaxNodes(), config.tableMaxNodes(),
+                new ComputeOpsClient(config.computeHost(), config.computePort(), config.computeUser(), config.computePassword()), cluster);
+        if (cluster != null) new io.cengyan.studio.cluster.ClusterApi(cluster,
+                new io.cengyan.studio.cluster.AdminAuth(java.nio.file.Path.of(config.home()).resolve("data"))).register(http);
         http.createContext("/api/ping", server::ping);
         http.createContext("/api/session", server::session);
         http.createContext("/api/config", server::config);
@@ -70,6 +87,7 @@ public final class StudioServer implements AutoCloseable {
         http.createContext("/api/queries", server::queries);
         http.createContext("/api/cancel", server::cancel);
         http.createContext("/api/admin", server::admin);
+        http.createContext("/api/ops/overview", server::opsOverview);
         http.createContext("/", server::page);
         http.start();
         return server;
@@ -83,6 +101,7 @@ public final class StudioServer implements AutoCloseable {
     public void close() {
         http.stop(0);
         workers.shutdownNow();
+        if (cluster != null) cluster.close();
     }
 
     private void ping(HttpExchange exchange) {
@@ -108,6 +127,8 @@ public final class StudioServer implements AutoCloseable {
         response.put("code", "OK");
         response.put("graphMaxNodes", graphMaxNodes);
         response.put("tableMaxNodes", tableMaxNodes);
+        response.put("computeOpsConfigured", computeOps.configured() || cluster != null);
+        response.put("clusterManaged", cluster != null);
         send(exchange, 200, response);
     }
 
@@ -120,6 +141,20 @@ public final class StudioServer implements AutoCloseable {
         request.put("op", "session");
         request.put("session", session(exchange, body));
         forward(exchange, request, 3000);
+    }
+
+    private void opsOverview(HttpExchange exchange) {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            send(exchange, 405, error("SYNTAX", "只接受 GET"));
+            return;
+        }
+        try {
+            JsonNode response = cluster != null ? cluster.opsOverview(5000) : computeOps.overview(5000);
+            int status = "OK".equals(response.path("code").asText()) ? 200 : 502;
+            send(exchange, status, response);
+        } catch (IOException ex) {
+            send(exchange, 503, error("OPS_UNAVAILABLE", ex.getMessage()));
+        }
     }
 
     private void login(HttpExchange exchange) {
@@ -149,6 +184,7 @@ public final class StudioServer implements AutoCloseable {
         request.put("op", "execute");
         request.put("session", session(exchange, body));
         request.put("query", query);
+        request.put("graph", text(body, "graph"));
         request.set("params", body.has("params") && body.get("params").isObject()
                 ? body.get("params") : MAPPER.createObjectNode());
         int timeoutMs = clampTimeout(body, QUERY_TIMEOUT_DEFAULT_MS, QUERY_TIMEOUT_MAX_MS);
@@ -194,9 +230,9 @@ public final class StudioServer implements AutoCloseable {
             return;
         }
         String command = text(body, "command");
-        if (!command.equals("stats") && !command.equals("storage") && !command.equals("rebuildIndex")
-                && !command.equals("showMembers") && !command.equals("addReplica")) {
-            send(exchange, 400, error("SYNTAX", "控制台只转发 stats、rebuildIndex、showMembers 和 addReplica"));
+        if (!Set.of("stats", "storage", "showMembers", "addReplica", "showNodes",
+                "drainStorage", "removeStorage", "drainCompute", "removeCompute").contains(command)) {
+            send(exchange, 400, error("SYNTAX", "控制台只转发 stats、storage、节点维护和索引/副本管理命令"));
             return;
         }
         ObjectNode request = MAPPER.createObjectNode();
@@ -205,6 +241,8 @@ public final class StudioServer implements AutoCloseable {
         request.put("command", command);
         request.put("index", text(body, "index"));
         request.put("graph", text(body, "graph"));
+        request.put("address", text(body, "address"));
+        if (body.hasNonNull("nodeId")) request.put("nodeId", body.path("nodeId").asText());
         JsonNode replicas = body.get("replicas");
         if (replicas != null && replicas.isNumber()) {
             request.put("replicas", replicas.asInt());
@@ -213,6 +251,8 @@ public final class StudioServer implements AutoCloseable {
             request.put("refresh", true);
         }
         int cap = command.equals("rebuildIndex") || command.equals("addReplica")
+                || command.equals("addStorage") || command.equals("removeStorage")
+                || command.equals("addCompute") || command.equals("removeCompute")
                 ? REBUILD_TIMEOUT_MS : STATS_TIMEOUT_MS;
         int timeoutMs = clampTimeout(body, cap, cap);
         if (timeoutMs <= 0) {

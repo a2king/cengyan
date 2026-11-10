@@ -23,6 +23,7 @@ public final class CengyanCli {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private String session = "";
+    private String graph = "";
 
     public static void main(String[] args) throws Exception {
         String host = "127.0.0.1";
@@ -100,7 +101,6 @@ public final class CengyanCli {
                 node.put("session", session);
                 node.put("command", command);
                 switch (command) {
-                    case "rebuildIndex" -> node.put("index", part(parts, 1));
                     case "createUser" -> {
                         node.put("user", part(parts, 1));
                         node.put("password", part(parts, 2));
@@ -115,16 +115,15 @@ public final class CengyanCli {
                         node.put("role", part(parts, 2));
                     }
                     case "dropUser" -> node.put("user", part(parts, 1));
-                    case "addStorage", "addCompute" -> node.put("address", part(parts, 1));
-                    case "drainStorage", "removeStorage", "drainCompute", "removeCompute" ->
-                            node.put("nodeId", parseInt(part(parts, 1)));
+                    case "addStorage", "addCompute", "setPartCount", "rebuildIndex" ->
+                            throw new IllegalArgumentException("旧单机管理命令已移除；新增节点请使用角色配置启动并自动 Join，分片数建图后固定");
+                    case "drainStorage", "removeStorage", "drainCompute", "removeCompute" -> {
+                        String target = part(parts, 1);
+                        node.put("nodeId", target);
+                    }
                     case "addReplica" -> {
                         node.put("graph", part(parts, 1));
                         node.put("replicas", parseInt(part(parts, 2)));
-                    }
-                    case "setPartCount" -> {
-                        node.put("graph", part(parts, 1));
-                        node.put("parts", parseInt(part(parts, 2)));
                     }
                     case "showMembers" -> node.put("graph", part(parts, 1));
                     case "stats" -> {
@@ -140,8 +139,13 @@ public final class CengyanCli {
             node.put("op", "execute");
             node.put("session", session);
             node.put("query", trimmed);
+            if (trimmed.matches("(?iu)^USE\\s+[\\p{L}][\\p{L}\\p{N}_]*\\s*;?$")) {
+                graph = trimmed.substring(3).trim().replaceFirst(";\\s*$", "");
+            }
             node.set("params", MAPPER.createObjectNode());
         }
+        if (!graph.isBlank() && !node.has("graph")) node.put("graph", graph);
+        node.put("requestId", java.util.UUID.randomUUID().toString());
         return MAPPER.writeValueAsString(node);
     }
 

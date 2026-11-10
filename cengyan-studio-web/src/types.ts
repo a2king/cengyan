@@ -21,6 +21,8 @@ export interface QueryResponse {
 export interface StudioConfig {
   graphMaxNodes: number;
   tableMaxNodes: number;
+  /** Studio 以 --home 启动，启用了服务器和节点管理。 */
+  clusterManaged?: boolean;
 }
 
 export interface GraphSpace {
@@ -58,4 +60,32 @@ export interface StatsRow {
   target: 'NODE' | 'REL';
   name: string;
   count: number;
+}
+
+export interface OpsOverview {
+  code: string;
+  message?: string;
+  nodeId?: string;
+  role?: string;
+  slots?: { capacity?: number; active?: number; reserved?: number; available?: number; memoryReserved?: number; diskReserved?: number };
+  queuePending?: number;
+  proxied?: number;
+  runningQueries?: number;
+  heapUsedBytes?: number;
+  heapMaxBytes?: number;
+  threadCount?: number;
+  processCpuLoad?: number;
+  systemCpuLoad?: number;
+  systemMemoryBytes?: number;
+  systemFreeMemoryBytes?: number;
+  diskTotalBytes?: number;
+  diskUsableBytes?: number;
+  clientRequestsTotal?: number;
+  clientCompletedTotal?: number;
+  clientFailedTotal?: number;
+  clientBytesInTotal?: number;
+  clientBytesOutTotal?: number;
+  computeNodes?: Array<Record<string, unknown>>;
+  storageNodes?: Array<Record<string, unknown>>;
+  shards?: Array<Record<string, unknown>>;
 }

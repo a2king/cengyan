@@ -131,6 +131,8 @@ class GqlSyntaxTest {
         Stmt.CreateType type = (Stmt.CreateType) Gql.parse(
                 "CREATE NODE TYPE Company COMMENT '企业节点' ID STRING(32) (name STRING NULL COMMENT '名称')");
         assertEquals("企业节点", type.comment());
+        assertEquals("STRING", type.idType());
+        assertEquals(32, type.idLength());
         assertEquals("名称", type.fields().get(0).comment());
     }
 }

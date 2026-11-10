@@ -1,4 +1,4 @@
-import type { QueryResponse, SessionInfo, StudioConfig } from './types';
+import type { OpsOverview, QueryResponse, SessionInfo, StudioConfig } from './types';
 
 const SESSION_KEY = 'cengyan.studio.session';
 const USER_KEY = 'cengyan.studio.user';
@@ -34,6 +34,7 @@ export const storage = {
 
 export class CengyanApi {
   private session: string;
+  private graph = storage.loadGraph();
   private readonly onSession: (session: string) => void;
   private readonly onUnauthorized: () => void;
 
@@ -57,7 +58,11 @@ export class CengyanApi {
   }
 
   async query(query: string, timeoutMs = 10000): Promise<QueryResponse> {
-    return this.request('/api/query', { query, timeoutMs });
+    const use = /^\s*USE\s+([\p{L}][\p{L}\p{N}_]*)\s*;?\s*$/iu.exec(query);
+    const target = use ? use[1] : this.graph;
+    const response = await this.request('/api/query', { query, timeoutMs, graph: target });
+    if (use) { this.graph = target; storage.saveGraph(target); }
+    return response;
   }
 
   async queries(): Promise<QueryResponse> {
@@ -72,6 +77,7 @@ export class CengyanApi {
     return this.request('/api/admin', {
       command,
       index,
+      graph: this.graph,
       ...(timeoutMs ? { timeoutMs } : {}),
       ...(refresh ? { refresh: true } : {}),
     });
@@ -83,6 +89,13 @@ export class CengyanApi {
 
   async addReplica(graph: string, replicas: number): Promise<QueryResponse> {
     return this.request('/api/admin', { command: 'addReplica', graph, replicas, timeoutMs: 120000 });
+  }
+
+  async opsOverview(): Promise<OpsOverview> {
+    const response = await fetch('/api/ops/overview');
+    const data = await response.json() as OpsOverview;
+    if (!response.ok || data.code !== 'OK') throw new Error(data.message || '集群运维数据读取失败');
+    return data;
   }
 
   async ping(): Promise<QueryResponse> {
@@ -99,7 +112,7 @@ export class CengyanApi {
     if (!response.ok || data.code !== 'OK' || !Number.isFinite(data.graphMaxNodes) || !Number.isFinite(data.tableMaxNodes)) {
       throw new Error('Studio 配置读取失败');
     }
-    return { graphMaxNodes: Number(data.graphMaxNodes), tableMaxNodes: Number(data.tableMaxNodes) };
+    return { graphMaxNodes: Number(data.graphMaxNodes), tableMaxNodes: Number(data.tableMaxNodes), clusterManaged: data.clusterManaged === true };
   }
 
   private async request(path: string, body: Record<string, unknown>): Promise<QueryResponse> {
@@ -121,7 +134,7 @@ export class CengyanApi {
       this.session = data.session;
       this.onSession(data.session);
     }
-    if (response.status === 401 || response.status === 403 || data.code === 'FORBIDDEN') {
+    if (response.status === 401 || response.status === 403 || data.code === 'FORBIDDEN' || data.code === 'UNAUTHENTICATED') {
       this.onUnauthorized();
     }
     if (!response.ok || data.code !== 'OK') {

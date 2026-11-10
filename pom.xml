@@ -11,11 +11,15 @@
     <name>cengyan</name>
 
     <modules>
-        <module>cengyan-store</module>
-        <module>cengyan-catalog</module>
+        <module>cengyan-common</module>
+        <module>cengyan-protocol</module>
+        <module>cengyan-rpc</module>
+        <module>cengyan-distributed</module>
+        <module>cengyan-raft</module>
+        <module>cengyan-compute</module>
+        <module>cengyan-storage</module>
         <module>cengyan-parser</module>
         <module>cengyan-query</module>
-        <module>cengyan-server</module>
         <module>cengyan-cli</module>
         <module>cengyan-studio</module>
     </modules>
@@ -33,18 +37,58 @@
         <slf4j.version>2.0.20</slf4j.version>
         <logback.version>1.5.38</logback.version>
         <junit.version>5.14.4</junit.version>
+        <protobuf.version>4.33.5</protobuf.version>
+        <ratis.version>3.3.1</ratis.version>
     </properties>
 
     <dependencyManagement>
         <dependencies>
             <dependency>
+                <groupId>io.cengyan</groupId><artifactId>cengyan-distributed</artifactId><version>${project.version}</version>
+            </dependency>
+            <dependency>
                 <groupId>io.cengyan</groupId>
-                <artifactId>cengyan-store</artifactId>
+                <artifactId>cengyan-protocol</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
                 <groupId>io.cengyan</groupId>
-                <artifactId>cengyan-catalog</artifactId>
+                <artifactId>cengyan-rpc</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.cengyan</groupId>
+                <artifactId>cengyan-raft</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.protobuf</groupId>
+                <artifactId>protobuf-java</artifactId>
+                <version>${protobuf.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.ratis</groupId>
+                <artifactId>ratis-server</artifactId>
+                <version>${ratis.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.ratis</groupId>
+                <artifactId>ratis-client</artifactId>
+                <version>${ratis.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.ratis</groupId>
+                <artifactId>ratis-netty</artifactId>
+                <version>${ratis.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.ratis</groupId>
+                <artifactId>ratis-metrics-default</artifactId>
+                <version>${ratis.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.cengyan</groupId>
+                <artifactId>cengyan-common</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
@@ -55,11 +99,6 @@
             <dependency>
                 <groupId>io.cengyan</groupId>
                 <artifactId>cengyan-query</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>io.cengyan</groupId>
-                <artifactId>cengyan-server</artifactId>
                 <version>${project.version}</version>
             </dependency>
 
@@ -108,6 +147,9 @@
     </dependencyManagement>
 
     <build>
+        <!-- 与 IDE 的 target/classes 隔离，避免后台增量编译覆盖 Maven/Surefire 正在加载的类。 -->
+        <outputDirectory>${project.build.directory}/maven-classes</outputDirectory>
+        <testOutputDirectory>${project.build.directory}/maven-test-classes</testOutputDirectory>
         <pluginManagement>
             <plugins>
                 <plugin>
@@ -125,9 +167,6 @@
                     <version>3.6.1</version>
                     <configuration>
                         <argLine>-Dfile.encoding=UTF-8</argLine>
-                        <systemPropertyVariables>
-                            <cengyan.report>${maven.multiModuleProjectDirectory}/docs/perf-report.md</cengyan.report>
-                        </systemPropertyVariables>
                     </configuration>
                 </plugin>
                 <plugin>

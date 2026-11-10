@@ -16,6 +16,17 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
+        <!-- Storage RPC client for maintenance status, membership and leader transfer. -->
+        <dependency>
+            <groupId>io.cengyan</groupId>
+            <artifactId>cengyan-distributed</artifactId>
+        </dependency>
+        <!-- Maintained JSch fork: rsa-sha2 / ed25519, required by OpenSSH 8.8+. -->
+        <dependency>
+            <groupId>com.github.mwiede</groupId>
+            <artifactId>jsch</artifactId>
+            <version>0.2.21</version>
+        </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>

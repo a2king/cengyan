@@ -53,3 +53,31 @@ require_java21() {
     fi
     return 0
 }
+
+# Unpack the JDK shipped in <app>/jdk/ for this CPU into <app>/runtime/jdk (once), then use it.
+use_bundled_jdk() {
+    local app_home="$1" arch archive runtime staging
+    case "$(uname -m)" in
+        x86_64|amd64) arch=x64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        *) echo "[ERROR] 发布包没有适用于 $(uname -m) 的 JDK，请安装 Java 21 并设置 JAVA_HOME" >&2; return 1 ;;
+    esac
+    archive="$app_home/jdk/jdk-21-linux-$arch.tar.gz"
+    runtime="$app_home/runtime/jdk"
+    if [[ ! -x "$runtime/bin/java" ]]; then
+        [[ -f "$archive" ]] || { echo "[ERROR] 未找到 $archive，请安装 Java 21 并设置 JAVA_HOME" >&2; return 1; }
+        staging="$app_home/runtime/jdk.unpacking"
+        rm -rf -- "$staging"
+        mkdir -p "$staging"
+        if ! tar -xzf "$archive" -C "$staging" --strip-components=1; then
+            rm -rf -- "$staging"
+            echo "[ERROR] 解压 $archive 失败" >&2
+            return 1
+        fi
+        rm -rf -- "$runtime"
+        mv -- "$staging" "$runtime"
+    fi
+    JAVA_HOME="$runtime"
+    export JAVA_HOME
+    require_java21
+}
