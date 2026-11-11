@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Card, Drawer, Input, InputNumber, List, Modal, Segmented, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd';
 import type { TableProps } from 'antd';
-import { History, KeyRound, Save, Undo2 } from 'lucide-react';
+import { CircleHelp, History, KeyRound, Save, Undo2 } from 'lucide-react';
 import { errorText, timeText } from '../clusterApi';
 import type { Catalog, CatalogEntry, Change, ConfigState, ConfigVersion, Role } from '../clusterApi';
 import type { ConsoleContext } from './ClusterConsole';
+import { configConflicts } from './configConflicts';
 
 const { Text, Paragraph } = Typography;
 type Draft = Pick<ConfigVersion, 'roleDefaults' | 'nodeOverrides'>;
@@ -52,6 +53,7 @@ export function ConfigTab({ ctx }: { ctx: ConsoleContext }) {
     const value = nodeValue ?? inherited;
     return { ...entry, value, inherited, source: nodeValue !== undefined ? 'node' : roleValue !== undefined ? 'role' : 'default' };
   }), [catalog, draft, role, scope]);
+  const conflicts = useMemo(() => configConflicts(role, rows), [role, rows]);
 
   const change = (entry: CatalogEntry, value: string) => setDraft((current) => {
     const next = structuredClone(current);
@@ -83,17 +85,28 @@ export function ConfigTab({ ctx }: { ctx: ConsoleContext }) {
   };
 
   const errorFor = (key: string) => errors[`${scope === 'role' ? role : scope}.${key}`];
+  const isModified = (row: Row) => scope === 'role' ? row.source === 'role' : row.source === 'node';
   const columns: TableProps<Row>['columns'] = [
-    { title: '参数', key: 'label', width: 300, render: (_, row) => <Space direction="vertical" size={2}>
-      <Space size={6}><Text strong>{row.label}</Text>
-        {row.source === 'node' && <Tag color="purple">本节点单独设置</Tag>}
-        {row.source === 'role' && scope === 'role' && <Tag color="blue">已修改</Tag>}
-      </Space>
-      <span className="code-pill">{row.key}</span>
-    </Space> },
-    { title: '说明', dataIndex: 'description', render: (text: string, row) => <Space direction="vertical" size={2}>
-      <Text type="secondary">{text}</Text>
-      <Text type="secondary" className="config-meta">默认 {row.defaultValue || '空'}{row.min != null ? ` · 范围 ${row.min} ~ ${row.max}` : ''}{scope !== 'role' ? ` · 角色值 ${row.inherited || '空'}` : ''} · 修改后需重启</Text>
+    { title: '参数', key: 'key', width: 280, render: (_, row) => <span className="code-pill">{row.key}</span> },
+    { title: '说明', key: 'description', width: 460, render: (_, row) => <Space size={8} wrap className="config-description">
+      <Text>{row.label}</Text>
+      <Tag color={isModified(row) ? 'blue' : 'default'}>{isModified(row) ? '已修改' : '未修改'}</Tag>
+      {conflicts[row.key] && <Tooltip title={<div className="config-tooltip">
+        <div>{conflicts[row.key].summary}</div>
+        <div>冲突规则：</div>
+        {conflicts[row.key].rules.map((rule) => <div key={rule}>{rule}</div>)}
+      </div>}>
+        <span className="config-conflict"><Tag color="orange">冲突失效</Tag></span>
+      </Tooltip>}
+      <Tooltip title={<div className="config-tooltip">
+        <div>{row.description}</div>
+        <div>默认值：{row.defaultValue || '空'}</div>
+        {row.min != null && <div>取值范围：{row.min} ~ {row.max}</div>}
+        {scope !== 'role' && <div>角色值：{row.inherited || '空'}</div>}
+        <div>修改后需重启节点生效</div>
+      </div>}>
+        <span className="config-help" aria-label={`${row.label}详情`}><CircleHelp size={15} /></span>
+      </Tooltip>
     </Space> },
     { title: '当前值', key: 'value', width: 300, render: (_, row) => {
       const error = errorFor(row.key);

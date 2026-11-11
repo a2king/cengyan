@@ -17,7 +17,7 @@ export function NodesTab({ ctx }: { ctx: ConsoleContext }) {
   const restart = (row: NodeRow) => Modal.confirm({
     title: `重启 ${row.id}？`,
     content: row.role === 'STORAGE'
-      ? '存储节点重启前集群进入维护模式（暂停写入），重启后比对本地数据文件，一致则不复制数据，完成后自动退出维护模式。'
+      ? '存储节点重启前集群进入维护模式（暂停写入）。数据由 Raft 日志和快照保留，重启后不需要重新导入，完成后自动退出维护模式。'
       : '计算节点先停止接收新查询并等待进行中的查询结束，然后重启。',
     okText: '重启',
     onOk: async () => { try { ctx.started(await ctx.api.restart([row.id])); } catch (reason) { Modal.error({ title: '无法重启', content: errorText(reason) }); } },
@@ -106,7 +106,7 @@ function AddNodeModal({ ctx, role, onClose }: { ctx: ConsoleContext; role: Role;
       </Space>
       <Form.Item name="dataDir" label="数据目录" extra="必须是不存在或为空的目录，添加后不能修改" rules={[{ required: true }, { pattern: /^\/[A-Za-z0-9_./-]+$/, message: '请填写绝对路径' }]}><Input /></Form.Item>
       {role === 'STORAGE' && ctx.overview.nodes.filter((n) => n.role === 'STORAGE').length < 2 &&
-        <Alert type="info" showIcon message="生产环境建议至少 3 个存储节点" description="副本数为 1 时，节点意外宕机会导致数据需要重新导入；维护模式下的计划重启不受影响。" />}
+        <Alert type="info" showIcon message="生产环境建议至少 3 个存储节点" description="副本数为 1 时，节点宕机期间它负责的分片不可用，数据仍由 Raft 日志和快照保留，恢复后不需要重新导入。" />}
       {error && <Alert type="error" showIcon message={error} style={{ marginTop: 12 }} />}
     </Form>
   </Modal>;

@@ -121,6 +121,12 @@ export function App() {
   const [inflightQuery, setInflightQuery] = useState('');
   const [graphMaxNodes, setGraphMaxNodes] = useState(2000);
   const [tableMaxNodes, setTableMaxNodes] = useState(2000);
+  const opsRefresh = useRef<() => void>(() => {});
+  const [opsRefreshing, setOpsRefreshing] = useState(false);
+  const bindOpsRefresh = useCallback((refresh: () => void, refreshing: boolean) => {
+    opsRefresh.current = refresh;
+    setOpsRefreshing(refreshing);
+  }, []);
   const [nodeHealth, setNodeHealth] = useState({ storageAlive: 0, storageTotal: 0, computeAlive: 0, computeTotal: 0, loading: true });
   const [clusterManaged, setClusterManaged] = useState(false);
   const [standaloneCluster, setStandaloneCluster] = useState(false);
@@ -291,9 +297,9 @@ export function App() {
       key: 'running',
       icon: <Activity size={18} />,
        label: <span className="menu-label"><span>运行查询</span><small>正在执行的语句</small></span>,
-    }, {
+     }, {
       key: 'ops',
-      icon: <Activity size={18} />,
+      icon: <Server size={18} />,
       label: <span className="menu-label"><span>集群运维</span><small>实时资源与拓扑</small></span>,
     }] : []),
     ...(clusterManaged ? [{
@@ -394,6 +400,9 @@ export function App() {
                 {activeNav === 'graph' && graphView === 'spaces' && writable && (
                   <Button type="primary" icon={<Plus size={16} />} onClick={() => setCreateGraphOpen(true)}>新建空间</Button>
                 )}
+                {activeNav === 'ops' && (
+                  <Button icon={<RefreshCw size={15} />} loading={opsRefreshing} onClick={() => opsRefresh.current()}>刷新</Button>
+                )}
               </div>
             </Header>
             <Content className="studio-content">
@@ -411,7 +420,7 @@ export function App() {
                 </div>
               )}
               {activeNav === 'running' && writable && <RunningQueries api={api} inflight={inflightQuery} />}
-              {activeNav === 'ops' && writable && <OpsDashboard api={api} />}
+              {activeNav === 'ops' && writable && <OpsDashboard api={api} bindRefresh={bindOpsRefresh} />}
               {activeNav === 'cluster' && clusterManaged && <ClusterConsole api={clusterApi} />}
             </Content>
           </Layout>
@@ -1042,6 +1051,34 @@ function percentText(value?: unknown) {
   return Number.isFinite(number) && number >= 0 ? `${(number * 100).toFixed(1)}%` : '—';
 }
 
+function rateText(value?: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? `${bytesText(number)}/s` : '—';
+}
+
+const computeResourceColumns: TableProps<Record<string, unknown>>['columns'] = [
+  { title: '节点', dataIndex: 'nodeId', width: 112, ellipsis: true },
+  { title: '角色', dataIndex: 'role', width: 88 },
+  { title: 'CPU', width: 72, className: 'ops-num-col', render: (_, row) => percentText(row.systemCpuLoad) },
+  { title: '堆内存', width: 168, className: 'ops-num-col', render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` },
+  { title: '执行中', width: 72, className: 'ops-num-col', render: (_, row) => String((row.slots as Record<string, unknown> | undefined)?.active ?? '—') },
+  { title: '排队', width: 64, className: 'ops-num-col', dataIndex: 'queuePending' },
+  { title: '网络流入', width: 128, className: 'ops-num-col ops-fixed-col', render: (_, row) => rateText(row.netInBytesPerSec) },
+  { title: '网络流出', width: 128, className: 'ops-num-col ops-fixed-col', render: (_, row) => rateText(row.netOutBytesPerSec) },
+];
+
+const storageResourceColumns: TableProps<Record<string, unknown>>['columns'] = [
+  { title: '节点', dataIndex: 'nodeId', width: 88, ellipsis: true },
+  { title: '角色', dataIndex: 'role', width: 88 },
+  { title: 'CPU', width: 56, className: 'ops-num-col', render: (_, row) => percentText(row.systemCpuLoad) },
+  { title: '堆内存', width: 148, className: 'ops-num-col', render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` },
+  { title: '磁盘可用', width: 84, className: 'ops-num-col', render: (_, row) => bytesText(row.diskUsableBytes) },
+  { title: '磁盘繁忙', width: 104, className: 'ops-num-col ops-fixed-col', render: (_, row) => percentText(row.diskBusy) },
+  { title: '读取速度', width: 128, className: 'ops-num-col ops-fixed-col', render: (_, row) => rateText(row.diskReadBytesPerSec) },
+  { title: '写入速度', width: 128, className: 'ops-num-col ops-fixed-col', render: (_, row) => rateText(row.diskWriteBytesPerSec) },
+  { title: 'Metadata Leader', dataIndex: 'metadataLeaderId', width: 140, ellipsis: true },
+];
+
 function numberValue(value: unknown): number | undefined {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : undefined;
@@ -1051,7 +1088,7 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' ? value as Record<string, unknown> : undefined;
 }
 
-function OpsDashboard({ api }: { api: CengyanApi }) {
+function OpsDashboard({ api, bindRefresh }: { api: CengyanApi; bindRefresh: (refresh: () => void, refreshing: boolean) => void }) {
   const [data, setData] = useState<OpsOverview | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -1062,6 +1099,7 @@ function OpsDashboard({ api }: { api: CengyanApi }) {
     finally { setLoading(false); }
   }, [api]);
   useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 5000); return () => window.clearInterval(timer); }, [load]);
+  useEffect(() => { bindRefresh(() => { void load(); }, loading); }, [bindRefresh, load, loading]);
   const storageNodes = data?.storageNodes || [];
   const computeNodes = data?.computeNodes || [];
   const shards = data?.shards || [];
@@ -1119,7 +1157,6 @@ function OpsDashboard({ api }: { api: CengyanApi }) {
   }, [computeNodes, data]);
   return <div className="page-stack workspace-page ops-dashboard">
     {error && <Alert type="warning" showIcon message="集群运维数据暂不可用" description={error} closable onClose={() => setError('')} />}
-    <div className="ops-toolbar"><Text type="secondary">每 5 秒刷新 · {data?.nodeId ? `当前 Compute ${data.nodeId}` : '未连接 Compute'}</Text><Button icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></div>
     <Card className="workspace-card ops-summary-card" bordered={false} title="计算资源汇总情况">
       <Row gutter={[16, 16]}>
         <Col xs={24} md={8}><Card className="metric-card"><Statistic title="平均 CPU 值" value={percentText(computeSummary.averageCpu)} prefix={<Activity size={18} />} /></Card></Col>
@@ -1130,8 +1167,8 @@ function OpsDashboard({ api }: { api: CengyanApi }) {
         <Col xs={24} md={8}><Card className="metric-card"><Statistic title="线程数情况" value={computeSummary.threadCount ?? '—'} prefix={<Workflow size={18} />} /></Card></Col>
       </Row>
     </Card>
-    <Card className="workspace-card" bordered={false} title="Compute 节点资源"><Table size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={computeNodes} columns={[{ title: '节点', dataIndex: 'nodeId' }, { title: '角色', dataIndex: 'role' }, { title: 'CPU', render: (_, row) => percentText(row.systemCpuLoad) }, { title: '堆内存', render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` }, { title: '执行中', render: (_, row) => String((row.slots as Record<string, unknown> | undefined)?.active ?? '—') }, { title: '排队', dataIndex: 'queuePending' }]} locale={{ emptyText: '没有 Compute 运维数据' }} /></Card>
-    <Card className="workspace-card" bordered={false} title="Storage 节点资源"><Table size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={storageNodes} columns={[{ title: '节点', dataIndex: 'nodeId' }, { title: '角色', dataIndex: 'role' }, { title: 'CPU', render: (_, row) => percentText(row.systemCpuLoad) }, { title: '堆内存', render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` }, { title: '磁盘可用', render: (_, row) => bytesText(row.diskUsableBytes) }, { title: 'Metadata Leader', dataIndex: 'metadataLeaderId' }]} locale={{ emptyText: '没有 Storage 运维数据' }} /></Card>
+    <Card className="workspace-card" bordered={false} title="Compute 节点资源"><Table className="ops-resource-table ops-compute-table" tableLayout="fixed" size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={computeNodes} columns={computeResourceColumns} scroll={{ x: 832 }} locale={{ emptyText: '没有 Compute 运维数据' }} /></Card>
+    <Card className="workspace-card" bordered={false} title="Storage 节点资源"><Table className="ops-resource-table ops-storage-table" tableLayout="fixed" size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={storageNodes} columns={storageResourceColumns} scroll={{ x: 964 }} locale={{ emptyText: '没有 Storage 运维数据' }} /></Card>
     <Card className="workspace-card" bordered={false} title="分片拓扑"><Table size="small" rowKey={(row) => `${row.graphId}-${row.partId}`} pagination={{ pageSize: 10, hideOnSinglePage: true }} dataSource={shards} columns={[{ title: '图', dataIndex: 'graph' }, { title: '分片', dataIndex: 'partId' }, { title: 'Leader', dataIndex: 'leaderId' }, { title: 'Term', dataIndex: 'term' }, { title: 'Applied Index', dataIndex: 'appliedIndex' }, { title: '副本', render: (_, row) => Array.isArray(row.members) ? (row.members as unknown[]).join(', ') : '—' }, { title: '状态', render: (_, row) => <Tag color={row.state === 'UNAVAILABLE' ? 'red' : 'green'}>{String(row.state || 'HEALTHY')}</Tag> }]} locale={{ emptyText: '没有分片拓扑数据' }} /></Card>
   </div>;
 }

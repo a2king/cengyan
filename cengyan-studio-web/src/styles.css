@@ -71,7 +71,6 @@ button, input, textarea, select { font-family: inherit; }
 .ops-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; margin-bottom: 16px; }
 .ops-dashboard .ant-row { row-gap: 5px !important; }
 .ops-dashboard > .workspace-card + .workspace-card { margin-top: 5px; }
-.ops-summary-card .ant-card-body { padding-top: 0; }
 .space-overview { display: flex; flex-direction: column; min-height: calc(100vh - 176px); }
 .page-heading h2, .query-heading h2 { margin: 5px 0 3px; color: #202b49; font-size: 27px; letter-spacing: -.035em; }
 .page-heading p, .query-heading p { margin: 0; }
@@ -104,8 +103,18 @@ button, input, textarea, select { font-family: inherit; }
 .workspace-card .ant-tabs-tabpane,
 .panel-stack { min-width: 0; max-width: 100%; }
 .workspace-card .ant-card-body { padding: 0 24px 24px; }
+.ops-summary-card.workspace-card > .ant-card-body { padding-top: 24px; }
 .workspace-card .ant-table-wrapper { max-width: 100%; }
 .workspace-card .ant-table-thead > tr > th { white-space: nowrap; }
+.ops-resource-table .ant-table { table-layout: fixed; }
+.ops-resource-table .ant-table-content { overflow-x: auto; }
+/* antd 会给表格写 min-width:100%，列宽会被拉满。锁成声明宽度后，新增的指标列不再被挤或被拉宽。 */
+.ops-compute-table .ant-table-content > table { width: 832px !important; min-width: 832px !important; max-width: 832px !important; }
+.ops-storage-table .ant-table-content > table { width: 964px !important; min-width: 964px !important; max-width: 964px !important; }
+.ops-resource-table .ant-table-thead > tr > th,
+.ops-resource-table .ant-table-tbody > tr > td { padding-inline: 8px; white-space: nowrap; }
+.ops-num-col { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ops-fixed-col { overflow: hidden; text-overflow: ellipsis; }
 .workspace-card .ant-table-cell .code-pill { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; white-space: nowrap; }
 .table-actions { display: inline-flex; white-space: nowrap; }
 .cell-ellipsis { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -123,7 +132,9 @@ button, input, textarea, select { font-family: inherit; }
 .checkbox-field { display: inline-flex; align-items: center; gap: 6px; margin: 0; color: #5e6782; white-space: nowrap; }
 .checkbox-field input { accent-color: var(--primary); }
 .metric-card { border: 1px solid var(--line); box-shadow: var(--shadow); }
-.metric-card .ant-statistic-title { margin-top: 10px; }
+.metric-card > .ant-card-body { padding: 24px; }
+.metric-card .ant-statistic-title { margin-top: 0; }
+.cluster-overview .metric-card > .ant-card-body { padding-top: 10px; }
 .metric-card .ant-statistic-content { color: #293352; }
 .metric-card .ant-statistic-content-prefix { color: #6576de; }
 .storage-card { justify-content: flex-start; gap: 13px; padding: 17px; border: 1px solid var(--line); background: #fbfcff; }
@@ -289,6 +300,11 @@ button, input, textarea, select { font-family: inherit; }
 .node-logs { min-height: 60vh; }
 .step-log { max-height: 280px; }
 .config-meta { font-size: 12px; }
+.config-description { white-space: normal; }
+.config-conflict { display: inline-flex; cursor: help; }
+.config-help { display: inline-flex; align-items: center; color: #8b93a7; cursor: help; }
+.config-help:hover { color: var(--primary); }
+.config-tooltip { max-width: 360px; line-height: 1.7; white-space: normal; }
 .config-scope-note { margin: -4px 0 0; }
 .root-card { align-items: center; margin-top: 0; }
 .root-card-body { flex: 1; display: flex; flex-direction: column; gap: 3px; }

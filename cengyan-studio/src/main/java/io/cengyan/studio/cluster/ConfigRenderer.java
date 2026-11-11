@@ -31,7 +31,7 @@ public final class ConfigRenderer {
             line(text, "业务 RPC 地址", "rpc_address", host + ":" + node.rpcPort());
             line(text, "Raft 地址", "raft_address", host + ":" + node.raftPort());
             line(text, "数据目录", "data_dir", node.dataDir());
-            line(text, "数据分片模式：重启后经维护模式比对或全量重建，Metadata 使用持久化 Raft", "data_storage_mode", "rebuild");
+            line(text, "数据分片模式：只支持 raft，重启后由 Raft 日志和快照恢复", "data_storage_mode", "raft");
             line(text, "Metadata 成员，格式 nodeId@Raft地址@业务RPC地址", "metadata_members", storageMembers(state, node));
         } else {
             line(text, "客户端地址", "client_address", host + ":" + node.clientPort());

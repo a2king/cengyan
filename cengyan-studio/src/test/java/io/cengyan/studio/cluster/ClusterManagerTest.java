@@ -115,7 +115,7 @@ class ClusterManagerTest {
         addNode(Role.STORAGE, "10.0.1.1", "storage-1");
         String first = file(a, "/opt/cengyan/nodes/storage-1/storage.properties");
         assertTrue(first.contains("metadata_members=storage-1@10.0.1.1:19700@10.0.1.1:19701"), first);
-        assertTrue(first.contains("data_storage_mode=rebuild"));
+        assertTrue(first.contains("data_storage_mode=raft"));
         assertTrue(first.contains("# 写入线程数"), "参数带中文注释");
         assertTrue(first.contains("rpc_address=10.0.1.1:19701"));
         String unit = file(a, "/etc/systemd/system/cengyan-storage-1.service");

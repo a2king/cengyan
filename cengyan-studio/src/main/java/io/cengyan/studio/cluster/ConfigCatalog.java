@@ -66,6 +66,11 @@ public final class ConfigCatalog {
             if (number(effective.get("query_temp_bytes")) > number(effective.get("node_temp_bytes")))
                 errors.put("query_temp_bytes", "单查询临时文件上限不能超过节点临时文件上限");
         }
+        if (role == Role.STORAGE) {
+            long plan = number(effective.get("transaction_plan_max_bytes"));
+            long rpc = number(effective.get("rpc_max_payload_bytes"));
+            if (plan * 2 + 65536 > rpc) errors.put("transaction_plan_max_bytes", "事务计划上限的两倍加 64KB 不能超过单个 RPC 最大字节数");
+        }
         return errors;
     }
 

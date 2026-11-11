@@ -80,6 +80,11 @@ export interface OpsOverview {
   systemFreeMemoryBytes?: number;
   diskTotalBytes?: number;
   diskUsableBytes?: number;
+  diskBusy?: number;
+  diskReadBytesPerSec?: number;
+  diskWriteBytesPerSec?: number;
+  netInBytesPerSec?: number;
+  netOutBytesPerSec?: number;
   clientRequestsTotal?: number;
   clientCompletedTotal?: number;
   clientFailedTotal?: number;
