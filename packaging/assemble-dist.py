@@ -108,11 +108,13 @@ def assemble(package, version):
         copy_file(ROOT / "docs" / name, package / "docs" / name)
     sdk = ROOT / "cengyan-cli-python"
     copy_file(sdk / "pyproject.toml", package / "sdk/python/pyproject.toml")
+    # pyproject 里声明了 readme = "README.md"，缺了它包内 `pip install` 会失败。
+    copy_file(sdk / "README.md", package / "sdk/python/README.md")
     for source in (sdk / "src").rglob("*.py"):
         copy_file(source, package / "sdk/python/src" / source.relative_to(sdk / "src"))
     try:
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip())
+        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, encoding="utf-8").strip()
+        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True, encoding="utf-8", errors="replace").strip())
     except (OSError, subprocess.CalledProcessError):
         revision, dirty = "unknown", True
     jars = {}
