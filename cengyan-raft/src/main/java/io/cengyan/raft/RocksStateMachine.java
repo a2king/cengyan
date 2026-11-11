@@ -25,6 +25,7 @@ import org.apache.ratis.statemachine.impl.SingleFileSnapshotInfo;
 import org.apache.ratis.util.MD5FileUtil;
 import org.rocksdb.*;
 import java.io.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -49,6 +50,10 @@ public final class RocksStateMachine extends BaseStateMachine {
     private static final String MANIFEST = "cengyan-snapshot.properties";
     private final SimpleStateMachineStorage storage = new SimpleStateMachineStorage();
     private final Object snapshotLock = new Object();
+    /** 读不挡住写，写不挡住其他分片。同一分片的 apply 仍然互斥。 */
+    private final ReentrantReadWriteLock dbLock = new ReentrantReadWriteLock();
+    private static final Cache BLOCK_CACHE = new LRUCache(256L * 1024 * 1024);
+    private static final Filter BLOOM = new BloomFilter(10);
     private Options options;
     private WriteOptions writes;
     private RocksDB db;
@@ -69,8 +74,8 @@ public final class RocksStateMachine extends BaseStateMachine {
         machine.rebuildOnly = true;
         try {
             Files.createDirectories(directory);
-            machine.options = new Options().setCreateIfMissing(true).setWriteBufferSize(4L * 1024 * 1024);
-            machine.writes = new WriteOptions().setDisableWAL(true);
+            machine.options = databaseOptions(true);
+            machine.writes = new WriteOptions().setDisableWAL(true).setSync(false);
             machine.db = RocksDB.open(machine.options, directory.toString());
             EntityCountStore.initialize(machine.db, machine.writes);
             return machine;
@@ -86,8 +91,8 @@ public final class RocksStateMachine extends BaseStateMachine {
         var machine = new RocksStateMachine();
         machine.rebuildOnly = true;
         try {
-            machine.options = new Options().setCreateIfMissing(false).setWriteBufferSize(4L * 1024 * 1024);
-            machine.writes = new WriteOptions().setDisableWAL(true);
+            machine.options = databaseOptions(false);
+            machine.writes = new WriteOptions().setDisableWAL(true).setSync(false);
             machine.db = RocksDB.open(machine.options, directory.toString());
             EntityCountStore.initialize(machine.db, machine.writes);
             return machine;
@@ -210,8 +215,9 @@ public final class RocksStateMachine extends BaseStateMachine {
                 }
                 Files.delete(next.resolve(MANIFEST));
             }
-            options = new Options().setCreateIfMissing(true).setWriteBufferSize(4L * 1024 * 1024);
-            writes = new WriteOptions().setSync(true);
+            options = databaseOptions(true);
+            // Raft 日志已经 fsync。状态机从快照加日志重放，不再为 memtable 写 WAL，也不在 apply 时再 fsync 一次。
+            writes = new WriteOptions().setDisableWAL(true).setSync(false);
             db = RocksDB.open(options, next.toString());
             byte[] applied = db.get(APPLIED);
             TermIndex position = applied == null ? TermIndex.INITIAL_VALUE
@@ -233,11 +239,14 @@ public final class RocksStateMachine extends BaseStateMachine {
         }
     }
 
-    @Override public synchronized CompletableFuture<Message> applyTransaction(TransactionContext trx) {
-        var entry = trx.getLogEntry();
-        try { return applyCommand(io.cengyan.protocol.proto.ClusterProtocol.WriteBatch.parseFrom(
-                entry.getStateMachineLogEntry().getLogData().toByteArray()), entry.getIndex(), entry.getTerm()); }
-        catch (Exception ex) { return CompletableFuture.failedFuture(ex); }
+    @Override public CompletableFuture<Message> applyTransaction(TransactionContext trx) {
+        dbLock.writeLock().lock();
+        try {
+            var entry = trx.getLogEntry();
+            try { return applyCommand(io.cengyan.protocol.proto.ClusterProtocol.WriteBatch.parseFrom(
+                    entry.getStateMachineLogEntry().getLogData().toByteArray()), entry.getIndex(), entry.getTerm()); }
+            catch (Exception ex) { return CompletableFuture.failedFuture(ex); }
+        } finally { dbLock.writeLock().unlock(); }
     }
 
     private CompletableFuture<Message> applyCommand(io.cengyan.protocol.proto.ClusterProtocol.WriteBatch command, long index, long term) {
@@ -312,15 +321,23 @@ public final class RocksStateMachine extends BaseStateMachine {
         }
     }
 
-    @Override public synchronized void notifyTermIndexUpdated(long term, long index) {
-        if (index <= getLastAppliedTermIndex().getIndex()) return;
+    @Override public void notifyTermIndexUpdated(long term, long index) {
+        dbLock.writeLock().lock();
         try {
-            db.put(writes, APPLIED, position(term, index));
-            updateLastAppliedTermIndex(term, index);
-        } catch (RocksDBException ex) { throw new IllegalStateException("无法持久化 Raft 控制日志进度", ex); }
+            if (index <= getLastAppliedTermIndex().getIndex()) return;
+            try {
+                db.put(writes, APPLIED, position(term, index));
+                updateLastAppliedTermIndex(term, index);
+            } catch (RocksDBException ex) { throw new IllegalStateException("无法持久化 Raft 控制日志进度", ex); }
+        } finally { dbLock.writeLock().unlock(); }
     }
 
-    @Override public synchronized CompletableFuture<Message> query(Message request) {
+    @Override public CompletableFuture<Message> query(Message request) {
+        dbLock.readLock().lock();
+        try { synchronized (scans) { return queryLocked(request); } }
+        finally { dbLock.readLock().unlock(); }
+    }
+    private CompletableFuture<Message> queryLocked(Message request) {
         try {
             var key = ReadKey.parseFrom(request.getContent().toByteArray());
             if (key.getEntityCounts()) {
@@ -433,7 +450,8 @@ public final class RocksStateMachine extends BaseStateMachine {
     private long snapshotLocked() throws IOException {
         Path checkpoint = stateDirectory.resolve("checkpoint-" + UUID.randomUUID());
         final TermIndex position;
-        synchronized (this) {
+        dbLock.writeLock().lock();
+        try {
             position = getLastAppliedTermIndex();
             if (position.getIndex() < 0) return -1;
             var current = storage.getLatestSnapshot();
@@ -446,8 +464,6 @@ public final class RocksStateMachine extends BaseStateMachine {
                     break;
                 } catch (RocksDBException ex) {
                     failure = ex;
-                    // Windows 文件扫描器可能短暂占用 Checkpoint 内部的临时目录。
-                    // 只清理本次随机路径，失败快照从不发布，也不推进可清日志位置。
                     deleteOwnedTree(checkpoint);
                     deleteOwnedTree(checkpoint.resolveSibling(checkpoint.getFileName() + ".tmp"));
                     if (attempt < 2) {
@@ -457,7 +473,7 @@ public final class RocksStateMachine extends BaseStateMachine {
                 }
             }
             if (failure != null) throw new IOException("无法创建 RocksDB Checkpoint", failure);
-        }
+        } finally { dbLock.writeLock().unlock(); }
         Path target = storage.getSnapshotFile(position.getTerm(), position.getIndex()).toPath();
         Path temporary = target.resolveSibling(target.getFileName() + ".tmp-" + UUID.randomUUID());
         // SST 打包和校验不持有状态机锁，源 Leader 可以继续应用新写入。
@@ -525,6 +541,12 @@ public final class RocksStateMachine extends BaseStateMachine {
         }
     }
 
+    private static Options databaseOptions(boolean create) {
+        var table = new BlockBasedTableConfig().setFilterPolicy(BLOOM).setBlockCache(BLOCK_CACHE).setCacheIndexAndFilterBlocks(true);
+        return new Options().setCreateIfMissing(create).setWriteBufferSize(32L * 1024 * 1024).setMaxWriteBufferNumber(2)
+                .setCompressionType(CompressionType.LZ4_COMPRESSION).setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)
+                .setTableFormatConfig(table);
+    }
     private static byte[] namespace(byte prefix, byte[] key) {
         return ByteBuffer.allocate(1 + key.length).put(prefix).put(key).array();
     }
@@ -555,7 +577,12 @@ public final class RocksStateMachine extends BaseStateMachine {
         ScanCursor cursor = scans.remove(id);
         if (cursor != null && db != null) db.releaseSnapshot(cursor.snapshot());
     }
-    @Override public synchronized void close() {
+    @Override public void close() {
+        dbLock.writeLock().lock();
+        try { closeHeld(); }
+        finally { dbLock.writeLock().unlock(); }
+    }
+    private void closeHeld() {
         if (rebuildOnly) { closeDatabase(); return; }
         closeDatabase();
         if (getLifeCycle().getCurrentState() != org.apache.ratis.util.LifeCycle.State.CLOSED) {

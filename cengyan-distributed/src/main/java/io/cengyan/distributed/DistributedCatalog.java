@@ -10,6 +10,12 @@ import java.util.*;
 public final class DistributedCatalog {
     private final StorageGateway storage;
     public DistributedCatalog(StorageGateway storage) { this.storage = storage; }
+    private static String dataMode(List<Node> nodes) {
+        if (nodes.stream().anyMatch(node -> "rebuild".equals(node.getDataMode()) || "replicated".equals(node.getDataMode()))) {
+            throw new ClusterException("CONFIG_MISMATCH", "rebuild 数据模式已移除。请把 data_storage_mode 改为 raft，清空数据目录后重新建图导入");
+        }
+        return "raft";
+    }
     public static ByteString graphKey(String name) { return TransactionEngine.text("catalog/graph/" + name); }
 
     public GraphDefinition graph(String name) {
@@ -65,8 +71,8 @@ public final class DistributedCatalog {
         if (existing != null) {
             GraphDefinition stored = parseGraph(existing);
             if (stored.getState().equals("DROPPED")) {
-                // DROP 只逻辑删除目录，旧 Data Group/历史版本仍受租约和 GC 管理。
                 // 同名重建必须分配新 graphId，绝不能复用旧分片的 Raft 身份。
+                // 旧目录由 Storage 后台在租约结束后隔离并清空。
                     definition = allocate(name, requestId, partitions, replicas, vertexType, edgeType, comment, existing);
             } else {
                 definition = graph(name);
@@ -86,10 +92,7 @@ public final class DistributedCatalog {
             definition = allocate(name, requestId, partitions, replicas, vertexType, edgeType, comment, null);
         }
         for (int part = 0; part < definition.getPartitions(); part++) {
-            String mode = nodes.stream().allMatch(node -> node.getDataMode().equals("rebuild")) ? "rebuild" : "raft";
-            if (nodes.stream().anyMatch(node -> node.getDataMode().equals("rebuild")) && !mode.equals("rebuild"))
-                throw new ClusterException("CONFIG_MISMATCH", "不能混用 raft/rebuild Storage 模式");
-            DataGroupSpec.Builder spec = DataGroupSpec.newBuilder().setGraphId(definition.getId()).setPartId(part).setDataMode(mode);
+            DataGroupSpec.Builder spec = DataGroupSpec.newBuilder().setGraphId(definition.getId()).setPartId(part).setDataMode(dataMode(nodes));
             Map<String, Integer> rotation = new HashMap<>();
             for (int i = 0; i < nodes.size(); i++) rotation.put(nodes.get(i).getNodeId(), Math.floorMod(i - part, nodes.size()));
             for (int r = 0; r < definition.getReplicas(); r++) spec.addMembers(ReplicaPlacement.choose(nodes, spec.getMembersList(), rotation));
@@ -129,9 +132,7 @@ public final class DistributedCatalog {
         ByteString allocation = TransactionEngine.text("catalog/nextGraphId");
         ByteString expected = expectedGraph;
         List<Node> storageNodes = nodes();
-        String mode = storageNodes.stream().allMatch(node -> node.getDataMode().equals("rebuild")) ? "rebuild" : "raft";
-        if (storageNodes.stream().anyMatch(node -> node.getDataMode().equals("rebuild")) && !mode.equals("rebuild"))
-            throw new ClusterException("CONFIG_MISMATCH", "不能混用 raft/rebuild Storage 模式");
+        String mode = dataMode(storageNodes);
         for (;;) {
             ByteString counter = storage.get(0, 0, allocation);
             long next = counter == null ? 1 : Long.parseLong(counter.toStringUtf8());
@@ -233,26 +234,9 @@ public final class DistributedCatalog {
         GraphDefinition graph = graph(name);
         requireWritable(graph);
         update(requestId, graph, graph.toBuilder().setState("DROPPED").build());
-        // 先持久化 DROPPED 和写栅栏，再逐副本删除本地 Data Group。删除只影响该 graphId，
-        // 同名重建会获得新的 graphId，不会误删新图；历史 Metadata 记录仍保留用于审计。
-        for (int part = 0; part < graph.getPartitions(); part++) {
-            ByteString routeKey = StorageGateway.groupKey(graph.getId(), part);
-            ByteString routeBytes = storage.get(0, 0, routeKey);
-            DataGroupSpec route;
-            try { route = DataGroupSpec.parseFrom(routeBytes); }
-            catch (Exception ex) { throw new ClusterException("CORRUPT_DATA", "图分片路由损坏", ex); }
-            try {
-                storage.write(graph.getId(), part,
-                        StorageGateway.batch("graph.dropgate/" + requestId + "/" + part)
-                                .addMutations(TransactionEngine.put(TransactionEngine.text("__schema/writeGate"), TransactionEngine.text("DROPPED"))).build());
-            } catch (ClusterException ex) {
-                if (!ex.code().equals("DATA_LOST")) throw ex;
-            }
-            for (Node member : route.getMembersList()) {
-                RpcResponse removed = storage.direct(address(member), "data.removeGroup", route.toByteString(), Duration.ofMinutes(2));
-                if (!removed.getCode().equals("OK")) throw new ClusterException(removed.getCode(), removed.getMessage());
-            }
-        }
+        // 状态提交后立即返回。清空 RocksDB 和 Raft 文件可能很慢，同步等完会超时，目录却留下。
+        // 各 Storage 看到 DROPPED 后，在后台等 Schema 租约结束，卸下 Group，再按带宽删除文件。
+        // 删除只针对这个 graphId；同名重建会得到新 graphId。历史 Metadata 记录仍保留。
     }
 
     public void update(String requestId, GraphDefinition old, GraphDefinition next) {

@@ -106,7 +106,8 @@ class ConcurrentTransactionsTest {
             assertEquals(5120, data.statistics(definition).getTotalNodes());
             Set<Integer> coordinators = new HashSet<>();
             for (int i = 0; i < 10; i++) {
-                RequestTicket ticket = RequestTicket.parseFrom(storage.get(0, 0, TransactionEngine.text("requests/batch-" + i)));
+                RequestTicket ticket = RequestTicket.parseFrom(storage.get(definition.getId(),
+                        DistributedGraph.ticketPart(definition, "batch-" + i), TransactionEngine.text("requests/batch-" + i)));
                 coordinators.add(ticket.getPlan().getCoordinatorPart());
                 assertEquals(512, data.put("batch-" + i, "G", batches.get(i), false, Duration.ofSeconds(30)).affected());
             }
@@ -135,11 +136,14 @@ class ConcurrentTransactionsTest {
             for (int i = 0; i < 5000; i++) batch.add(entity("large-" + i, "x".repeat(740)));
             var data = new DistributedGraph(storage);
             assertEquals(5000, data.put("org-v2-" + "a".repeat(64), "G", batch, false, Duration.ofSeconds(60)).affected());
-            RequestTicket ticket = RequestTicket.parseFrom(storage.get(0, 0,
-                    TransactionEngine.text("requests/org-v2-" + "a".repeat(64))));
-            var preparing = TransactionRecord.newBuilder().setPlan(ticket.getPlan()).setState(TransactionState.PREPARING).build();
-            var decided = preparing.toBuilder().setState(TransactionState.COMMITTED).setDecidedAtMs(1).build();
-            var txKey = TransactionEngine.transactionKey(ticket.getPlan().getTransactionId());
+            String requestId = "org-v2-" + "a".repeat(64);
+            RequestTicket ticket = RequestTicket.parseFrom(storage.get(definition.getId(),
+                    DistributedGraph.ticketPart(definition, requestId), TransactionEngine.text("requests/" + requestId)));
+            var txKey = TransactionEngine.transactionKey(requestId);
+            TransactionRecord stored = TransactionRecord.parseFrom(storage.get(definition.getId(), ticket.getPlan().getCoordinatorPart(),
+                    TransactionEngine.transactionPlanKey(requestId)));
+            var preparing = stored.toBuilder().setState(TransactionState.PREPARING).setFinalized(false).clearDecidedAtMs().build();
+            var decided = stored.toBuilder().setState(TransactionState.COMMITTED).setDecidedAtMs(1).setFinalized(true).build();
             var cas = StorageGateway.batch("size-proof").addConditions(StorageGateway.condition(txKey, preparing.toByteString()))
                     .addMutations(TransactionEngine.put(txKey, decided.toByteString())).build();
             assertTrue(cas.getSerializedSize() > 8 * 1024 * 1024, "回归批次必须实际跨过旧 8 MiB CAS 上限");

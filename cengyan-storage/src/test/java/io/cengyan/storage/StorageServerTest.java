@@ -67,10 +67,11 @@ class StorageServerTest {
                 """);
         var config = StorageConfig.load(file);
         assertEquals(10, config.writeThreads());
-        assertEquals(32 * 1024 * 1024, config.rpcMaxPayload());
+        assertEquals(64 * 1024 * 1024, config.rpcMaxPayload());
+        assertEquals(16 * 1024 * 1024, io.cengyan.distributed.TransactionEngine.planMaxBytes());
         assertFalse(config.rebuildData());
         Files.writeString(file, Files.readString(file) + "\ndata_storage_mode=rebuild\n");
-        assertTrue(StorageConfig.load(file).rebuildData());
+        assertThrows(java.io.IOException.class, () -> StorageConfig.load(file));
         Files.writeString(file, Files.readString(file).replace("data_storage_mode=rebuild", "data_storage_mode=invalid"));
         assertThrows(IllegalArgumentException.class, () -> StorageConfig.load(file));
         Files.writeString(file, Files.readString(file).replace("data_storage_mode=invalid", "data_storage_mode=raft"));

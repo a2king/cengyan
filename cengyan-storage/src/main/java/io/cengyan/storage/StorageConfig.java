@@ -55,12 +55,18 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
         return RaftGroup.valueOf(GroupIds.metadata(clusterId), members);
     }
     public long recoveryTimeoutMs() { return operationalNumber("replica_recovery_timeout_ms", 1800000); }
-    public long idempotencyWindowMs() { return operationalNumber("idempotency_window_ms", 3600000); }
+    public long idempotencyWindowMs() { return operationalNumber("idempotency_window_ms", io.cengyan.distributed.StorageGateway.DEFAULT_IDEMPOTENCY_WINDOW_MS); }
     public long backgroundIntervalMs() { return operationalNumber("background_interval_ms", 10000); }
     public long backgroundBytesPerSecond() { return operationalNumber("background_bytes_per_second", 64L * 1024 * 1024); }
+    /** 已提交历史版本在分片库里的保留期；到期后压缩成基线以回收空间。 */
+    public long versionRetentionMs() { return operationalNumber("version_retention_ms", io.cengyan.distributed.VersionMaintenance.DEFAULT_RETENTION_MS); }
     public String zone() { return operationalText("zone"); }
     public String rack() { return operationalText("rack"); }
+    /** @return true 表示配置仍写着已删除的 rebuild 模式，启动必须失败 */
     public boolean rebuildData() { return operationalText("data_storage_mode").equals("rebuild"); }
+    public long readProtectionMs() {
+        return operationalNumber("version_read_protection_ms", io.cengyan.distributed.VersionMaintenance.DEFAULT_READ_PROTECTION_MS);
+    }
     private String operationalText(String key) {
         Path file = directory.resolve("operations.properties");
         if (!Files.exists(file)) return "";
@@ -97,19 +103,22 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
         if (!directory.isAbsolute()) directory = file.toAbsolutePath().getParent().resolve(directory);
         StorageConfig config = new StorageConfig(required(p, "cluster_id"), required(p, "node_id"),
                 endpoint(required(p, "rpc_address")), endpoint(required(p, "raft_address")), directory, members,
-                new RaftSettings(number(p, "raft_log_segment_bytes", 64L * 1024 * 1024),
-                        number(p, "raft_snapshot_entries", 100_000), number(p, "raft_log_retained_entries", 10_000),
+                new RaftSettings(number(p, "raft_log_segment_bytes", 16L * 1024 * 1024),
+                        number(p, "raft_snapshot_entries", 2_000), number(p, "raft_log_retained_entries", 1_000),
                         Math.toIntExact(number(p, "raft_snapshot_retained", 2))),
-                Math.toIntExact(number(p, "rpc_max_payload_bytes", 32L * 1024 * 1024)),
+                Math.toIntExact(number(p, "rpc_max_payload_bytes", 64L * 1024 * 1024)),
                 Math.toIntExact(number(p, "rpc_max_inflight", 128)),
                 Math.toIntExact(number(p, "admission_threads", 2)), Math.toIntExact(number(p, "admission_queue", 256)),
                 Math.toIntExact(number(p, "write_threads", 10)));
+        io.cengyan.distributed.TransactionEngine.setPlanMaxBytes(Math.toIntExact(number(p, "transaction_plan_max_bytes",
+                io.cengyan.distributed.TransactionEngine.DEFAULT_PLAN_MAX_BYTES)));
         Properties operations = new Properties();
         String dataMode = p.getProperty("data_storage_mode", "raft").trim();
-        if (!Set.of("raft", "rebuild").contains(dataMode)) throw new IllegalArgumentException("data_storage_mode 必须为 raft 或 rebuild");
+        if (dataMode.equals("rebuild") || dataMode.equals("replicated")) throw new IOException("rebuild 数据模式已移除。请改为 data_storage_mode=raft，清空数据目录后重新建图导入");
+        if (!dataMode.equals("raft")) throw new IllegalArgumentException("data_storage_mode 必须为 raft");
         operations.setProperty("data_storage_mode", dataMode);
         for (String key : List.of("replica_recovery_timeout_ms", "background_interval_ms", "background_bytes_per_second",
-                "idempotency_window_ms", "zone", "rack")) {
+                "idempotency_window_ms", "version_retention_ms", "version_read_protection_ms", "zone", "rack")) {
             if (p.containsKey(key)) operations.setProperty(key, p.getProperty(key));
         }
         if (!operations.isEmpty()) {
@@ -141,3 +150,4 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
         } catch (RuntimeException ex) { throw new IllegalArgumentException("节点地址应为 host:port，IPv6 使用方括号", ex); }
     }
 }
+

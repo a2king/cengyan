@@ -19,7 +19,7 @@ public record RaftSettings(long segmentBytes, long snapshotEntries, long retaine
         }
     }
 
-    public static RaftSettings defaults() { return new RaftSettings(64L * 1024 * 1024, 100_000, 10_000, 2); }
+    public static RaftSettings defaults() { return new RaftSettings(16L * 1024 * 1024, 2_000, 1_000, 2); }
 
     public RaftProperties properties(Path directory, String host, int port) {
         RaftProperties properties = new RaftProperties();
@@ -46,7 +46,8 @@ public record RaftSettings(long segmentBytes, long snapshotEntries, long retaine
         RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(properties, snapshotEntries);
         RaftServerConfigKeys.Snapshot.setRetentionFileNum(properties, retainedSnapshots);
         RaftServerConfigKeys.Read.setOption(properties, RaftServerConfigKeys.Read.Option.LINEARIZABLE);
-        RaftServerConfigKeys.Read.setLeaderLeaseEnabled(properties, false);
+        // 租约有效时读不再等一轮心跳。多机必须同步时钟，这是部署前提。
+        RaftServerConfigKeys.Read.setLeaderLeaseEnabled(properties, true);
         RaftServerConfigKeys.Rpc.setTimeoutMin(properties, TimeDuration.valueOf(600, TimeUnit.MILLISECONDS));
         RaftServerConfigKeys.Rpc.setTimeoutMax(properties, TimeDuration.valueOf(1200, TimeUnit.MILLISECONDS));
         return properties;
