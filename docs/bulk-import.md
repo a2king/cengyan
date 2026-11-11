@@ -1,107 +1,86 @@
-# 批量导入
+# 通过 Compute 批量导入
 
-## 设计目标
+单机和多机都使用 `ClusterClient`，不使用旧 GraphSession、HTTP 单机入口或本地 WriteBatch 导入。
+数据经 Compute 校验和规划，由 Storage 的事务协调器处理跨分片准备、提交和恢复。
 
-`bulkInsert` 是导入协议，不是把很多条 GQL 拼在一个字符串里。一个请求包含一个类型的一批行，服务端完成：
+发布配置现采用 Data 分片重建模式，生命周期及迁移方式见 [Data 分片重建模式](rebuild-data-mode.md)。
 
-1. JSON 解码；
-2. Schema 和值类型校验；
-3. 唯一索引校验；
-4. 节点字符串 ID 映射；
-5. 节点或边拓扑键、属性键、索引键组装；
-6. 一次 RocksDB `WriteBatch` 提交。
+## 并发写入配置
 
-默认单批上限为 10000 行，请求体上限为 16 MiB。对于 10 亿级数据，建议：
+每个 Storage 的 `storage.properties` 支持：
 
-```text
-Spark 分区 / 外部任务
-    → 512～4096 行一个 bulkInsert
-    → 每个分区复用一个连接和登录会话
-    → 通过 repartition 控制并发
+```properties
+write_threads=10
+rpc_max_payload_bytes=33554432
 ```
 
-不要创建十亿条 GQL 字符串，也不要让一个批次无限增长。批次大小要同时受以下因素约束：
+默认值为 10，必须是正整数，重启 Storage 后生效。该值分别控制两个独立线程池：
+写事务协调池和分片写入执行池，各 10 个线程；不是整个进程合计 10 个线程。
+租约校验、认证和控制请求使用独立的控制线程池，不占用写事务协调名额。
 
-- 网络请求体大小（16 MiB）；
-- JVM 堆和 Jackson 对象；
-- RocksDB WriteBatch 内存；
-- 单条属性大小；
-- WAL 写入延迟；
-- 服务端查询线程数。
+- 批量实体旧值按分片 `getMany` 读取；prepare 的锁快照也批量读取。
+- 同一事务每轮最多并行 4 个参与分片，所有事务共享上述分片执行池；队列有界。
+- prepare 全部成功后才提交决定；失败时先等待本轮已发出的 prepare 返回，再决定回滚。
+- finalize 按最多 64 个变更键、计划字节预算分块，批量读取锁/实体并提交 CAS；完整写命令过大时继续拆块。
+- 新批次按 requestId 在参与分片中分散选择协调者；重放和恢复保留已持久化的协调者。
+- 原子可见性、唯一约束、请求幂等和同步持久化仍生效。
 
-## 节点请求
+`ops.metrics` 的 Storage 指标新增 `writeThreads`、`writeActive`、`writeQueued`、
+`writeParticipantActive`、`writeParticipantQueued`。Compute 的 `query_slots` 和 Spark 实际
+active tasks 是另外两层并发限制，调整 `write_threads` 不会自动修改它们。
+
+升级需要使用同一版本的 Compute 和 Storage JAR（两者均包含 distributed 模块）。
+已有 Storage 配置若显式写着旧值，需要改为 `rpc_max_payload_bytes=33554432` 并重启所有 Storage。
+事务计划上限 6 MiB，而事务决定和 finalized 的 CAS 同时包含旧、新完整记录，内部命令可超过 8 MiB；
+内部 RPC 默认上限为 32 MiB，Raft 日志缓冲为 16 MiB 级别，可容纳当前事务计划生成的状态 CAS。外部 bulkInsert 的 4 MiB 上限仍然有效，
+5000 行是否能作为一个请求还取决于属性字节数和生成的事务计划大小。
+验证包含 32 分片、单副本、10 个并发批次、每批 512 个节点，以及计数、幂等重放和锁清理。
+该验证是正确性测试，不能作为目标机器的吞吐承诺。历史事务读视图扫描及属性索引逐键规划仍存在，
+长期导入性能还需按真实数据及索引配置测量。
+
+## SDK 示例
+
+```python
+from cengyan import ClusterClient
+
+with ClusterClient([('127.0.0.1', 19669)], password='你的密码', timeout=60) as client:
+    graph = client.graph('Company')
+    nodes = graph.insert_nodes('N', [
+        {'id': 'a', 'name': 'Alice'}, {'id': 'b', 'name': 'Bob'},
+    ], batch_size=1024)
+    edges = graph.insert_edges('E', [
+        {'id': 'e1', 'src': 'a', 'dst': 'b'},
+    ], batch_size=1024, skip_missing_endpoints=False)
+    print(nodes, edges)
+```
+
+先创建图和类型；ID 的 INT64/STRING 类型必须符合建图定义。边 ID 必须显式提供。
+同 ID 完整覆盖属性，不能更改既有类型或边端点；属性和唯一约束冲突不会被跳过。
+只有边端点缺失可以通过 `skip_missing_endpoints=True` 跳过。
+
+## 边界
+
+- 单个网络批次最多 10000 行，Compute 限制序列化请求不超过 4 MiB。
+- SDK 默认按 1024 行和 4 MiB 估算分批；建议留出字段封装开销，必要时降低 max_batch_bytes。
+- 每个网络批次有独立稳定 requestId；同批写重试复用该 ID，不能重新生成。
+- 多个网络批次不构成一个全局事务。失败后停止后续批次，仅报告已确认进度。
+- 不要把十亿条数据装进一个列表：传入生成器，通过 Spark 分区或外部任务限制并发。
+- 节点 ID、边 ID、出入邻接、唯一索引可落在不同分片，不再是旧单机“一次本地 WriteBatch”语义。
+
+协议示例：
 
 ```json
 {
   "op": "bulkInsert",
-  "session": "session-id",
-  "kind": "node",
-  "type": "Person",
-  "rows": [
-    {"id": "p-001", "name": "Alice"},
-    {"id": "p-002", "name": "Bob"}
-  ]
-}
-```
-
-## 边请求
-
-```json
-{
-  "op": "bulkInsert",
-  "session": "session-id",
+  "token": "登录令牌",
+  "requestId": "本批次稳定ID",
+  "graph": "Company",
   "kind": "edge",
-  "type": "knows",
-  "rows": [
-    {"src": "p-001", "dst": "p-002", "rank": 0, "score": 0.5}
-  ]
+  "type": "E",
+  "skipMissing": false,
+  "rows": [{"id": "e1", "src": "a", "dst": "b"}]
 }
 ```
 
-边的 `src` / `dst` 使用已注册的节点 ID。两端可以落在不同分片。尚未注册的字符串端点默认让整批失败；`skipMissing=true` 时跳过这些边。
-
-## 原子性
-
-单批内部是原子的：
-
-- 节点：ID 映射、节点属性和节点索引一起提交；
-- 边：同一分片的出边、入边、边属性和边索引一起提交；跨分片边先提交出边一侧，再提交入边；
-- 类型错误、非空属性缺失、唯一索引冲突会导致整个批次失败。`skipMissing=true` 时，未注册的字符串端点不计入失败。
-
-批次之间不自动组成跨批事务。导入器应记录已经成功提交的批次，失败后从批次边界重试。重复导入可以在业务层使用稳定 ID，或者传 `ignoreExisting=true` 跳过已有元素。
-
-## 当前限制与运维建议
-
-- 单批最多 10000 行，单行协议帧最大约 16 MiB；应优先按请求体大小而不是只按行数切批。
-- 节点批次的字符串 ID 映射、属性和索引在同一个 `WriteBatch` 中提交。
-- 边批次允许 `src` 和 `dst` 位于不同分片。跨分片写入使用补偿标记，进程在两步之间退出时，下次启动会补上入边。
-- 批次之间没有跨批事务。导入器必须保存分区号、批次号和提交结果，失败后从批次边界重试。
-- `--batch` 是 `data_init_node.py` / `data_init_edge.py` 的服务端批大小，不是本地列表的装饰参数。
-- 10 亿级数据应通过 Spark `repartition`、稳定业务 ID、分批重试和导入后的索引重建进行规划。
-
-## Python/Spark 示例
-
-### Physical shard layout
-
-The server keeps catalog/auth/index metadata in the root RocksDB and stores graph data in a graph/partition hierarchy:
-
-```text
-data/
-  data/                         # root metadata database
-    <graph-name>/
-      part-0/db/                # one RocksDB per physical partition
-      part-1/db/
-```
-
-On startup, legacy graph data in the root database is migrated into this layout. Changing a graph's partition count rewrites graph keys between the stable `part-<id>` directories; the partition-count value is metadata, not part of the path.
-
-The number of files inside `part-<id>/db` is still controlled by RocksDB (SST/WAL/manifest files); those files are not additional logical partitions.
-
-```bash
-spark-submit --py-files dev-scripts/cengyan.py dev-scripts/data_init_node.py \
-  --sql "select id, name from company_source" \
-  --host 127.0.0.1 --port 19669 --user root --password cengyan \
-  --space Company --node-type Person --id-field id \
-  --property-fields name --batch 2048 --repartition 16
-```
-
+优先使用 SDK 生成 requestId 和管理连接。最终 `FAILED` 可能表示提交状态未知，不能据此认定数据全部回滚。
+源码中 `dev-scripts/` 下的历史私有导入工具未作为发布 SDK，迁移前应核对其调用是否符合当前协议。

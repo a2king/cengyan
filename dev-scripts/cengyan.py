@@ -20,9 +20,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import time
+import uuid
 from decimal import Decimal
 from pathlib import Path
 
@@ -56,6 +58,8 @@ class Client:
         self.password = password
         self.timeout_ms = timeout_ms
         self.session = ""
+        # Compute is stateless with respect to USE; attach this graph to every request.
+        self.graph = ""
         self._sock = None
         self._buf = b""
 
@@ -85,6 +89,9 @@ class Client:
         if body.get("op") != "ping":
             body["timeoutMs"] = timeout_ms
             body.setdefault("session", self.session)
+            body.setdefault("requestId", str(uuid.uuid4()))
+            if self.graph:
+                body.setdefault("graph", self.graph)
         # timeoutMs=0 means that the server does not impose a query deadline.
         # Use a blocking socket in that mode so large Spark imports are not
         # accidentally cut off by a client-side 30 second timeout.
@@ -125,12 +132,26 @@ class Client:
         return response
 
     def execute(self, query, params=None, timeout_ms=None):
-        return self.request(
-            {"op": "execute", "query": query, "params": params or {}},
-            timeout_ms=timeout_ms,
-        )
+        selected = re.fullmatch(r"\s*USE\s+([\w]+)\s*;?\s*", query, flags=re.IGNORECASE)
+        payload = {"op": "execute", "query": query, "params": params or {}}
+        if selected:
+            # Validate the proposed graph without losing the old selection on failure.
+            payload["graph"] = selected.group(1)
+        response = self.request(payload, timeout_ms=timeout_ms)
+        if selected and response.get("code") == "OK":
+            self.graph = selected.group(1)
+        return response
 
-    def bulk_insert(self, kind, type_name, rows, *, ignore_existing=False, skip_missing=False, timeout_ms=None):
+    def validate_target(self, graph, type_name, *, node=True):
+        """Read-only preflight. Fails before launching a distributed Spark import."""
+        for value in (graph, type_name):
+            if not re.fullmatch(r"[^\W\d]\w*", value, flags=re.UNICODE):
+                raise ValueError("非法图或类型名称：" + repr(value))
+        expect_ok(self.execute("USE " + graph))
+        return expect_ok(self.execute("DESCRIBE " + ("NODE" if node else "REL") + " TYPE " + type_name))
+
+    def bulk_insert(self, kind, type_name, rows, *, ignore_existing=False, skip_missing=False,
+                    timeout_ms=None, request_id=None):
         """Atomically write one bounded node/edge batch on the server.
 
         ``skip_missing`` 只对边生效。为真时，端点字符串 ID 尚未注册的边会被跳过，
@@ -142,17 +163,24 @@ class Client:
             raise ValueError("bulk rows must not be empty")
         if len(rows) > 10_000:
             raise ValueError("bulk rows must be at most 10000")
-        return self.request(
-            {
+        if not self.graph:
+            raise ValueError("批量导入必须先成功 USE 图名；每批请求必须显式携带 graph")
+        if ignore_existing:
+            raise ValueError("Compute 不支持 ignore_existing；相同 ID 的写入是完整属性替换")
+        payload = {
                 "op": "bulkInsert",
-                "kind": kind,
+                "graph": self.graph,
+                "kind": "edge" if kind == "rel" else kind,
                 "type": type_name,
                 "rows": rows,
                 "ignoreExisting": ignore_existing,
                 "skipMissing": skip_missing,
-            },
-            timeout_ms=timeout_ms,
-        )
+            }
+        if request_id is not None:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", request_id):
+                raise ValueError("request_id 格式无效")
+            payload["requestId"] = request_id
+        return self.request(payload, timeout_ms=timeout_ms)
 
     def admin(self, command, index="", user="", password="", role="", timeout_ms=None):
         return self.request(
