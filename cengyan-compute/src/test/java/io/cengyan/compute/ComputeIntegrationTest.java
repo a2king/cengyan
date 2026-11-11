@@ -32,7 +32,6 @@ class ComputeIntegrationTest {
                 2, 32, 10000, 60000, 64L * 1024 * 1024, 128L * 1024 * 1024, 1024L * 1024 * 1024, 2L * 1024 * 1024 * 1024,
                 10000, 1024 * 1024, "secret");
         java.nio.file.Files.createDirectories(storage.directory());
-        java.nio.file.Files.writeString(storage.directory().resolve("operations.properties"), "data_storage_mode=rebuild\n");
         try (var storageServer = new StorageServer(storage); var computeServer = new ComputeServer(compute); var socket = new Socket("127.0.0.1", ports[2])) {
             socket.setSoTimeout(60000);
             var writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));

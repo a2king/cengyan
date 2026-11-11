@@ -52,7 +52,7 @@ public final class ComputeServer implements AutoCloseable {
     private final ExecutorService execution;
     private final ExecutorService ingress;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
-    private final EventLoopGroup boss = new NioEventLoopGroup(1), io = new NioEventLoopGroup(2);
+    private final EventLoopGroup boss = new NioEventLoopGroup(1), io = new NioEventLoopGroup(4);
     private final ChannelGroup clients = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
     private final Channel listener;
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -64,6 +64,7 @@ public final class ComputeServer implements AutoCloseable {
     private final AtomicLong clientFailed = new AtomicLong();
     private final AtomicLong clientBytesIn = new AtomicLong();
     private final AtomicLong clientBytesOut = new AtomicLong();
+    private final HostMetrics hostMetrics = new HostMetrics();
     private record AuthCache(TokenAuthority.User user, long expiresAt) { }
     private final ConcurrentMap<String, AuthCache> authCache = new ConcurrentHashMap<>();
     private volatile String publicKey;
@@ -79,6 +80,7 @@ public final class ComputeServer implements AutoCloseable {
     public ComputeServer(ComputeConfig config) throws Exception {
         this.config = config;
         storage = new StorageGateway(config.clusterId(), config.storageSeeds());
+        storage.limit(Math.max(StorageGateway.MAX_RPC_PAYLOAD, TransactionEngine.planMaxBytes() + 1024 * 1024), 128);
         catalog = new DistributedCatalog(storage); graph = new DistributedGraph(storage);
         var bootstrap = new ArrayList<>(config.members().stream().map(ComputeConfig.Peer::raftPeer).toList());
         boolean joining = bootstrap.stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()));
@@ -90,7 +92,8 @@ public final class ComputeServer implements AutoCloseable {
         slots = new ExecutionSlots(config.slots(), config.nodeMemory(), config.nodeDisk(), Duration.ofSeconds(5));
         queue = new AdmissionQueue<>(config.queueCapacity(), Duration.ofMillis(config.queueTimeoutMs()));
         execution = new ThreadPoolExecutor(config.slots(), config.slots(), 0, TimeUnit.MILLISECONDS, new SynchronousQueue<>(), daemon("compute-execution"), new ThreadPoolExecutor.AbortPolicy());
-        ingress = new ThreadPoolExecutor(4, 4, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(config.queueCapacity()), daemon("compute-ingress"), new ThreadPoolExecutor.AbortPolicy());
+        int ingressThreads = Math.max(4, config.slots());
+        ingress = new ThreadPoolExecutor(ingressThreads, ingressThreads, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(config.queueCapacity()), daemon("compute-ingress"), new ThreadPoolExecutor.AbortPolicy());
         Path requests = config.directory().resolve("requests"); Files.createDirectories(requests);
         try (var files = Files.list(requests)) { for (Path old : files.toList()) if (Files.isDirectory(old) && !Files.isSymbolicLink(old)) deleteTemporary(old); }
         rpc = new RpcServer(config.rpc(), config.clusterId(), Math.max(8 * 1024 * 1024, config.resultMaxBytes() + 1024), 128, this::internal);
@@ -156,6 +159,7 @@ public final class ComputeServer implements AutoCloseable {
             }
             org.slf4j.LoggerFactory.getLogger(ComputeServer.class).error("Compute 节点未能加入控制面");
         });
+        hostMetrics.watch(config.directory());
     }
 
     private CompletableFuture<ObjectNode> external(ObjectNode original) {
@@ -284,11 +288,11 @@ public final class ComputeServer implements AutoCloseable {
                     if (remainingNanos <= 0) throw new ClusterException("QUERY_TIMEOUT", "请求在入口校验期间已超时");
                     if (request.hasNonNull("graph") && !request.path("graph").asText().isBlank()
                             && !op.equals("createGraph") && !(op.equals("execute") && request.path("query").asText().stripLeading().toUpperCase(Locale.ROOT).startsWith("CREATE GRAPH"))) {
-                        ObjectNode leaseBody = JSON.createObjectNode().put("graph", request.path("graph").asText())
-                                .put("deadline", System.currentTimeMillis() + TimeUnit.NANOSECONDS.toMillis(remainingNanos)).put("write", write);
-                        RpcResponse acquired = storage.call(0, 0, "schema.acquire", id, ByteString.copyFrom(JSON.writeValueAsBytes(leaseBody)),
-                                Duration.ofNanos(Math.min(TimeUnit.SECONDS.toNanos(15), remainingNanos)));
-                        request.put("_schemaLease", Base64.getEncoder().encodeToString(acquired.getBody().toByteArray()));
+                        String graphName = request.path("graph").asText();
+                        // 建表会推进 schema 版本。只有不会改 schema 的批量写入才复用租约。
+                        if (!op.equals("bulkInsert")) schemaLeases.remove(graphName);
+                        request.put("_schemaLease", Base64.getEncoder().encodeToString(schemaLease(graphName, id,
+                                System.currentTimeMillis() + TimeUnit.NANOSECONDS.toMillis(remainingNanos), write, remainingNanos).toByteArray()));
                     }
                     remainingNanos = deadline - System.nanoTime();
                     if (remainingNanos <= 0) throw new ClusterException("QUERY_TIMEOUT", "请求在 Schema 校验期间已超时");
@@ -310,13 +314,30 @@ public final class ComputeServer implements AutoCloseable {
         return response;
     }
 
+    private final ConcurrentMap<String, SchemaLease> schemaLeases = new ConcurrentHashMap<>();
+    /** 同一图的租约在过期前复用，导入时不再每个批次都写 Metadata。 */
+    private SchemaLease schemaLease(String graph, String requestId, long deadline, boolean write, long remainingNanos) throws IOException {
+        long now = System.currentTimeMillis();
+        SchemaLease cached = schemaLeases.get(graph);
+        if (cached != null && cached.getExpiresAtMs() > now + 5_000 && cached.getHardDeadlineMs() >= deadline) return cached;
+        long leaseDeadline = Math.min(now + TimeUnit.MINUTES.toMillis(30), Math.max(deadline, now + TimeUnit.MINUTES.toMillis(10)));
+        ObjectNode leaseBody = JSON.createObjectNode().put("graph", graph).put("deadline", leaseDeadline).put("write", write);
+        RpcResponse acquired = storage.call(0, 0, "schema.acquire", requestId, ByteString.copyFrom(JSON.writeValueAsBytes(leaseBody)),
+                Duration.ofNanos(Math.min(TimeUnit.SECONDS.toNanos(15), remainingNanos)));
+        SchemaLease lease = SchemaLease.parseFrom(acquired.getBody());
+        schemaLeases.put(graph, lease);
+        return lease;
+    }
     private void dispatch() {
-        if (closed.get()) return;
+        for (int started = 0; started < 64 && dispatchOne(); started++) { }
+    }
+    private boolean dispatchOne() {
+        if (closed.get()) return false;
         AdmissionQueue.Ticket<Work> ticket = queue.poll();
-        if (ticket == null) return;
+        if (ticket == null) return false;
         try {
             Work work = ticket.request();
-            if (System.nanoTime() - work.deadline >= 0) { queue.sweep(); return; }
+            if (System.nanoTime() - work.deadline >= 0) { queue.sweep(); return false; }
             record Candidate(ComputeConfig.Peer peer, int available) { }
             List<Candidate> candidates = new ArrayList<>();
             for (var peer : membership.members()) {
@@ -332,21 +353,33 @@ public final class ComputeServer implements AutoCloseable {
                     if (load.path("available").asInt() > 0) candidates.add(new Candidate(peer, load.path("available").asInt()));
                 } catch (Exception ignored) { }
             }
-            candidates.sort(Comparator.comparingInt(Candidate::available).reversed().thenComparing(c -> c.peer.id()));
+            candidates.sort(Comparator.<Candidate, Boolean>comparing(c -> !c.peer.id().equals(config.nodeId()))
+                    .thenComparing(Comparator.comparingInt(Candidate::available).reversed()).thenComparing(c -> c.peer.id()));
             for (Candidate candidate : candidates) {
                 JsonNode reservation;
+                ExecutionSlots.Reservation localReservation = null;
                 try {
                     long left = work.deadline - System.nanoTime();
-                    if (left <= 0) { queue.sweep(); return; }
-                    reservation = peerCall(candidate.peer, "compute.reserve", JSON.createObjectNode().put("requestId", ticket.requestId()),
-                            Duration.ofNanos(Math.min(TimeUnit.MILLISECONDS.toNanos(500), left)));
+                    if (left <= 0) { queue.sweep(); return false; }
+                    if (candidate.peer.id().equals(config.nodeId())) {
+                        localReservation = slots.reserve(ticket.requestId(), config.queryMemory(), config.queryDisk());
+                        reservation = localReservation == null ? JSON.createObjectNode() : JSON.valueToTree(localReservation);
+                    } else {
+                        reservation = peerCall(candidate.peer, "compute.reserve", JSON.createObjectNode().put("requestId", ticket.requestId()),
+                                Duration.ofNanos(Math.min(TimeUnit.MILLISECONDS.toNanos(500), left)));
+                    }
                 } catch (Exception ex) { continue; }
                 if (!reservation.hasNonNull("token")) continue;
-                if (!queue.start(ticket)) { peerCall(candidate.peer, "compute.release", (ObjectNode) reservation, Duration.ofMillis(500)); return; }
+                if (!queue.start(ticket)) {
+                    if (localReservation != null) slots.cancelReservation(localReservation);
+                    else peerCall(candidate.peer, "compute.release", (ObjectNode) reservation, Duration.ofMillis(500));
+                    return false;
+                }
                 ObjectNode forwarded = work.request.deepCopy();
                 forwarded.put("_reservation", reservation.path("token").asText());
                 forwarded.put("remainingTimeoutMs", Math.max(1, TimeUnit.NANOSECONDS.toMillis(work.deadline - System.nanoTime())));
-                CompletableFuture<RpcResponse> execution = peerClient(candidate.peer).call(rpcRequest("compute.execute", forwarded), Duration.ofMillis(forwarded.path("remainingTimeoutMs").asLong()));
+                CompletableFuture<RpcResponse> execution = candidate.peer.id().equals(config.nodeId())
+                        ? startExecution(forwarded) : peerClient(candidate.peer).call(rpcRequest("compute.execute", forwarded), Duration.ofMillis(forwarded.path("remainingTimeoutMs").asLong()));
                 runningRpc.put(ticket.requestId(), execution);
                 runningDescriptions.put(ticket.requestId(), new Running(work.request.path("_user").asText(),
                         work.request.path("query").asText(work.request.path("op").asText()), System.nanoTime()));
@@ -359,10 +392,11 @@ public final class ComputeServer implements AutoCloseable {
                     } catch (Exception ex) { queue.finish(ticket, new AdmissionQueue.Outcome("FAILED", ex.getMessage())); work.result.complete(error(ex)); }
                     finally { runningRpc.remove(ticket.requestId(), execution); runningDescriptions.remove(ticket.requestId()); queue.cleanupComplete(ticket); }
                 });
-                return;
+                return true;
             }
             queue.retryReservation(ticket);
         } catch (Exception ex) { queue.retryReservation(ticket); }
+        return false;
     }
     /** Cached cluster maintenance id; Storage remains the authority for rejecting data writes. */
     private void refreshMaintenance() {
@@ -415,8 +449,13 @@ public final class ComputeServer implements AutoCloseable {
                 slots.cancelReservation(JSON.treeToValue(body, ExecutionSlots.Reservation.class)); return completed(ok());
             }
             if (!request.getMethod().equals("compute.execute")) return completed(error(new ClusterException("UNSUPPORTED", "未知 Compute RPC")));
+            return startExecution(body);
+        } catch (Exception ex) { return completed(error(ex)); }
+    }
+    private CompletableFuture<RpcResponse> startExecution(ObjectNode body) {
+        try {
             var reservation = new ExecutionSlots.Reservation(body.path("_reservation").asText(), body.path("requestId").asText());
-            if (!slots.start(reservation)) return completed(error(new ClusterException("RESERVATION_EXPIRED", "执行名额预留已失效或已消费")));
+            if (!slots.start(reservation)) return CompletableFuture.completedFuture(RpcResponse.newBuilder().setCode("OK").setBody(ByteString.copyFromUtf8(error(new ClusterException("RESERVATION_EXPIRED", "执行名额预留已失效或已消费")).toString())).build());
             CompletableFuture<RpcResponse> result = new CompletableFuture<>();
             final boolean writing = isWrite(body);
             long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.min(config.executionTimeoutMs(), body.path("remainingTimeoutMs").asLong(config.executionTimeoutMs())));
@@ -476,6 +515,7 @@ public final class ComputeServer implements AutoCloseable {
                     IdType.valueOf(request.path("vertexIdType").asText("INT64")), IdType.valueOf(request.path("edgeIdType").asText("INT64")));
             return ok().put("graphId", definition.getId()).put("rowsAffected", 1);
         }
+        if (op.equals("bulkTopology")) return bulkTopology(graphName);
         if (op.equals("bulkInsert")) {
             if (!Set.of("node", "edge").contains(request.path("kind").asText()) || !request.path("rows").isArray()
                     || request.path("rows").isEmpty() || request.path("rows").size() > 10000) {
@@ -493,8 +533,15 @@ public final class ComputeServer implements AutoCloseable {
                 entities.add(encoded);
                 StorageGateway.charge(encoded.getSerializedSize() * 3L + 128);
             }
-            var result = graph.put(id, graphName, entities, request.path("skipMissing").asBoolean(false), Duration.ofMillis(request.path("remainingTimeoutMs").asLong()));
-            return ok().put("rowsAffected", result.affected()).put("duplicates", result.duplicates()).put("skipped", result.skipped());
+            long started = System.nanoTime();
+            WriteTimings.begin();
+            try {
+                var result = graph.put(id, graphName, entities, request.path("skipMissing").asBoolean(false), Duration.ofMillis(request.path("remainingTimeoutMs").asLong()));
+                ObjectNode response = ok().put("rowsAffected", result.affected()).put("duplicates", result.duplicates()).put("skipped", result.skipped());
+                response.set("timings", JSON.valueToTree(WriteTimings.finish()));
+                response.put("totalMs", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+                return response;
+            } catch (RuntimeException ex) { WriteTimings.finish(); throw ex; }
         }
         if (op.equals("admin") && request.path("command").asText().equals("addReplica")) {
             storage.call(0, 0, "metadata.resize", id, ByteString.copyFrom(JSON.writeValueAsBytes(request)), Duration.ofMinutes(5));
@@ -581,6 +628,34 @@ public final class ComputeServer implements AutoCloseable {
         throw new ClusterException("UNSUPPORTED", "分布式入口尚不支持该操作：" + op);
     }
 
+    private ObjectNode bulkTopology(String graphName) throws Exception {
+        GraphDefinition graph = catalog.graph(graphName);
+        Map<String, Node> nodes = new HashMap<>();
+        for (Node node : catalog.nodes()) nodes.put(node.getNodeId(), node);
+        List<java.util.function.Supplier<ObjectNode>> tasks = new ArrayList<>();
+        for (int part = 0; part < graph.getPartitions(); part++) {
+            int selected = part;
+            tasks.add(() -> {
+                try {
+                    RpcResponse status = storage.call(graph.getId(), selected, "data.status", "topo-" + graph.getId() + "-" + selected, ByteString.EMPTY, Duration.ofSeconds(5));
+                    GroupStatus group = GroupStatus.parseFrom(status.getBody());
+                    ObjectNode item = JSON.createObjectNode().put("part", selected).put("leaderId", group.getLeaderId());
+                    Node leader = nodes.get(group.getLeaderId());
+                    if (leader != null) item.put("host", leader.getRpc().getHost()).put("port", leader.getRpc().getPort());
+                    return item;
+                } catch (Exception ex) { throw ex instanceof RuntimeException runtime ? runtime : new ClusterException("FAILED", "分片状态不可用", ex); }
+            });
+        }
+        ObjectNode result = ok().put("partitions", graph.getPartitions()).put("vertexIdType", graph.getVertexIdType().name()).put("edgeIdType", graph.getEdgeIdType().name());
+        var leaders = result.putArray("leaders");
+        for (ObjectNode item : StorageGateway.parallel(tasks)) leaders.add(item);
+        var computes = result.putArray("computes");
+        for (var peer : membership.members()) {
+            String host = peer.client().getAddress() == null ? peer.client().getHostString() : peer.client().getAddress().getHostAddress();
+            computes.addObject().put("host", host).put("port", peer.client().getPort());
+        }
+        return result;
+    }
     private JsonNode auth(String method, ObjectNode body, String id) throws IOException {
         RpcResponse response = storage.call(0, 0, method, id, ByteString.copyFrom(JSON.writeValueAsBytes(body)), Duration.ofSeconds(15));
         return response.getBody().isEmpty() ? JSON.createObjectNode() : JSON.readTree(response.getBody().toByteArray());
@@ -635,6 +710,7 @@ public final class ComputeServer implements AutoCloseable {
             result.put("diskTotalBytes", disk.getTotalSpace());
             result.put("diskUsableBytes", disk.getUsableSpace());
         } catch (IOException ignored) { }
+        hostMetrics.current().putNet(result);
         return result;
     }
 
@@ -707,7 +783,7 @@ public final class ComputeServer implements AutoCloseable {
             try { return Gql.parseAll(request.path("query").asText()).stream().anyMatch(stmt -> !readOnly(stmt)); }
             catch (Exception ex) { return true; }
         }
-        return !Set.of("ping", "session", "queries", "cancel", "members").contains(op);
+        return !Set.of("ping", "session", "queries", "cancel", "members", "bulkTopology").contains(op);
     }
     private static String endpointText(java.net.InetSocketAddress endpoint) {
         String host = endpoint.getAddress() == null ? endpoint.getHostString() : endpoint.getAddress().getHostAddress();
@@ -740,6 +816,7 @@ public final class ComputeServer implements AutoCloseable {
     }
     @Override public void close() throws Exception {
         if (!closed.compareAndSet(false, true)) return;
+        hostMetrics.close();
         listener.close().awaitUninterruptibly(); clients.close().awaitUninterruptibly(); scheduler.shutdownNow(); rpc.close();
         ingress.shutdownNow(); execution.shutdownNow(); peers.values().forEach(RpcClient::close);
         control.close(); storage.close(); io.shutdownGracefully(0, 2, TimeUnit.SECONDS).awaitUninterruptibly(); boss.shutdownGracefully(0, 2, TimeUnit.SECONDS).awaitUninterruptibly();
