@@ -12,57 +12,101 @@ import java.util.concurrent.*;
  * 已提交版本不立即物化删除，读者对每个事务固定一次决定，旧版本仍可读取。
  */
 public final class TransactionEngine {
+    /** 单份事务计划的默认上限。提交时新旧记录各带一份，因此 Storage 的 RPC 上限至少要到两倍加 64KB。 */
+    public static final int DEFAULT_PLAN_MAX_BYTES = 16 * 1024 * 1024;
+    public static final int MIN_PLAN_MAX_BYTES = 1024 * 1024;
+    public static final int MAX_PLAN_MAX_BYTES = 64 * 1024 * 1024;
+    private static volatile int planMaxBytes = DEFAULT_PLAN_MAX_BYTES;
     public static final ByteString TX_PREFIX = text("__tx/");
+    /** 已结束事务的完整计划。键不在 {@link #TX_PREFIX} 下，扫描协调记录时不会读到它。 */
+    public static final ByteString TX_PLAN_PREFIX = text("__txplan/");
+    /** 还没做过版本压缩的已结束事务。恢复只扫这些小记录，到期后再点读计划。 */
+    public static final ByteString TX_GC_PREFIX = text("__txgc/");
     private final StorageGateway storage;
     private final Executor participants;
+    /** 本进程正在执行的事务。恢复线程跳过它们，避免把进行中的提交再跑一遍。 */
+    private static final java.util.Set<String> ACTIVE = java.util.concurrent.ConcurrentHashMap.newKeySet();
     public TransactionEngine(StorageGateway storage) { this(storage, Runnable::run); }
     public TransactionEngine(StorageGateway storage, Executor participants) {
         this.storage = storage; this.participants = participants;
     }
+    public static boolean active(String id) { return ACTIVE.contains(id); }
+    /** @return false 表示其他线程仍在执行该事务 */
+    public static boolean acquire(String id) {
+        for (int i = 0; i < 200; i++) {
+            if (ACTIVE.add(id)) return true;
+            try { Thread.sleep(2); }
+            catch (InterruptedException ex) { Thread.currentThread().interrupt(); throw new ClusterException("QUERY_CANCELED", "事务执行被中断", ex); }
+        }
+        return false;
+    }
+    public static void release(String id) { ACTIVE.remove(id); }
 
     /** Drain every submitted operation before deciding or returning: cancellation is not rollback. */
     private void phase(TransactionPlan plan, java.util.function.Consumer<ParticipantPlan> action) {
         RuntimeException failure = null;
-        // Bound each transaction's queued fan-out; ten writers must not enqueue 320 tasks at once.
-        for (int offset = 0; offset < plan.getParticipantsCount(); offset += 4) {
-            List<CompletableFuture<Void>> pending = new ArrayList<>();
-            for (ParticipantPlan participant : plan.getParticipantsList().subList(offset, Math.min(offset + 4, plan.getParticipantsCount()))) {
-                try {
-                    pending.add(CompletableFuture.runAsync(StorageGateway.contextual(() -> action.accept(participant)), participants));
-                } catch (RejectedExecutionException ex) {
-                    failure = new ClusterException("BUSY", "分片写入队列已满，事务等待恢复", ex); break;
-                }
+        List<CompletableFuture<Void>> pending = new ArrayList<>();
+        for (ParticipantPlan participant : plan.getParticipantsList()) {
+            try {
+                pending.add(CompletableFuture.runAsync(StorageGateway.contextual(() -> action.accept(participant)), participants));
+            } catch (RejectedExecutionException ex) {
+                failure = new ClusterException("BUSY", "分片写入队列已满，事务等待恢复", ex); break;
             }
-            for (var future : pending) {
-                try { future.get(); }
-                catch (InterruptedException ex) {
-                    // Shutdown leaves the persisted PREPARING/decision record for recovery.
-                    Thread.currentThread().interrupt();
-                    throw new ClusterException("QUERY_CANCELED", "事务执行中断，等待持久化事务恢复", ex);
-                } catch (ExecutionException ex) {
-                    RuntimeException cause = ex.getCause() instanceof RuntimeException runtime ? runtime
-                            : new ClusterException("FAILED", "分片写入失败", ex.getCause());
-                    // An uncertain operation must not be hidden by a deterministic conflict.
-                    if (failure == null || !deterministic(cause)) failure = cause;
-                }
-            }
-            if (failure != null) throw failure;
         }
+        for (var future : pending) {
+            try { future.get(); }
+            catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new ClusterException("QUERY_CANCELED", "事务执行中断，等待持久化事务恢复", ex);
+            } catch (ExecutionException ex) {
+                RuntimeException cause = ex.getCause() instanceof RuntimeException runtime ? runtime
+                        : new ClusterException("FAILED", "分片写入失败", ex.getCause());
+                if (failure == null || !deterministic(cause)) failure = cause;
+            }
+        }
+        if (failure != null) throw failure;
     }
     private static boolean deterministic(RuntimeException ex) {
         return ex instanceof ClusterException cluster
                 && Set.of("WRITE_CONFLICT", "INVALID_ARGUMENT", "REQUEST_CONFLICT", "TRANSACTION_TIMEOUT").contains(cluster.code());
     }
     public static ByteString text(String value) { return ByteString.copyFromUtf8(value); }
+    /** 由 Storage 与 Compute 启动时按 transaction_plan_max_bytes 设置，两边必须一致。 */
+    public static void setPlanMaxBytes(int bytes) {
+        if (bytes < MIN_PLAN_MAX_BYTES || bytes > MAX_PLAN_MAX_BYTES) {
+            throw new IllegalArgumentException("事务计划上限必须在 1 MiB 到 64 MiB 之间：" + bytes);
+        }
+        planMaxBytes = bytes;
+    }
+    public static int planMaxBytes() { return planMaxBytes; }
     public static ByteString transactionKey(String id) { return text("__tx/" + id); }
+    public static ByteString transactionPlanKey(String id) { return text("__txplan/" + id); }
+    public static ByteString transactionGcKey(String id) { return text("__txgc/" + id); }
     private static ByteString lockKey(ByteString key) { return text("__lock/").concat(key); }
     private static ByteString participantKey(String id) { return text("__participant/" + id); }
 
     public TransactionRecord execute(TransactionPlan input) {
         TransactionPlan plan = normalize(input);
+        if (!acquire(plan.getTransactionId())) throw new ClusterException("BUSY", "事务正在执行，请稍后用同一 requestId 重试");
+        try { return executeHeld(plan); }
+        finally { release(plan.getTransactionId()); }
+    }
+    private TransactionRecord executeHeld(TransactionPlan plan) {
         long graph = plan.getGraphId(); int coordinator = plan.getCoordinatorPart();
         ByteString key = transactionKey(plan.getTransactionId());
         ByteString encoded = storage.get(graph, coordinator, key);
+        if (encoded == null && fastEligible(plan) && System.currentTimeMillis() < plan.getDeadlineMs()) {
+            try { return fastCommit(plan); }
+            catch (ClusterException ex) {
+                if (!ex.code().equals("WRITE_CONFLICT")) throw ex;
+                encoded = storage.get(graph, coordinator, key);
+                if (encoded != null) {
+                    TransactionRecord winner = parseRecord(encoded);
+                    if (!winner.getPlan().getContentDigest().equals(plan.getContentDigest())) throw new ClusterException("REQUEST_CONFLICT", "相同事务 ID 对应不同写入计划");
+                    if (winner.getFinalized()) return winner;
+                }
+            }
+        }
         TransactionRecord record;
         if (encoded == null) {
             record = TransactionRecord.newBuilder().setPlan(plan).setState(TransactionState.PREPARING).build();
@@ -78,6 +122,43 @@ public final class TransactionEngine {
         else record = record(graph, coordinator, plan.getTransactionId());
         if (!record.getPlan().getContentDigest().equals(plan.getContentDigest())) throw new ClusterException("REQUEST_CONFLICT", "相同事务 ID 对应不同写入计划");
         return resume(record);
+    }
+    /** 单分片、无并发预留时一次条件写提交。语义与两阶段提交相同：整批同时可见，冲突则退回两阶段。 */
+    private static boolean fastEligible(TransactionPlan plan) {
+        return plan.getParticipantsCount() == 1 && !plan.getSchemaMigration() && !plan.getCompensation();
+    }
+    private TransactionRecord fastCommit(TransactionPlan plan) {
+        long started = System.nanoTime();
+        ParticipantPlan participant = plan.getParticipants(0);
+        long graph = plan.getGraphId(); int part = participant.getPartId();
+        List<ConditionalMutation> changes = participant.getChangesList();
+        List<ByteString> locks = storage.getMany(graph, part, changes.stream().map(change -> lockKey(change.getKey())).toList());
+        for (ByteString lock : locks) if (lock != null) throw new ClusterException("WRITE_CONFLICT", "键已被其他事务预留");
+        long decidedAt = plan.getDeadlineMs();
+        TransactionRecord record = TransactionRecord.newBuilder().setPlan(plan).setState(TransactionState.COMMITTED)
+                .setFinalized(true).setDecidedAtMs(decidedAt).build();
+        ByteString txKey = transactionKey(plan.getTransactionId());
+        var command = StorageGateway.batch("tx.fast/" + plan.getTransactionId());
+        command.addConditions(StorageGateway.condition(text("__schema/writeGate"), null));
+        command.addConditions(StorageGateway.condition(text("__schema/generation"), plan.getGeneration() == 0 ? null : text(Long.toString(plan.getGeneration()))));
+        command.addConditions(StorageGateway.condition(text("__schema/writeEpoch"), plan.getWriteEpoch() == 0 ? null : text(Long.toString(plan.getWriteEpoch()))));
+        command.addConditions(StorageGateway.condition(txKey, null));
+        command.addMutations(put(txKey, record.toByteString()));
+        int position = 0;
+        for (ConditionalMutation change : changes) {
+            ByteString expected = change.getExpectedPresent() ? change.getExpectedCell() : null;
+            command.addConditions(StorageGateway.condition(change.getKey(), expected));
+            command.addConditions(StorageGateway.condition(lockKey(change.getKey()), locks.get(position++)));
+            if (change.getReadOnly()) continue;
+            VersionedCell old = expected == null ? VersionedCell.getDefaultInstance() : parseCell(expected);
+            var version = CellVersion.newBuilder().setTransactionId(plan.getTransactionId()).setCoordinatorPart(plan.getCoordinatorPart())
+                    .setValue(change.getValue()).setDeleted(change.getDelete()).setCommittedAtMs(decidedAt);
+            command.addMutations(put(change.getKey(), old.toBuilder().addVersions(version).build().toByteString()));
+        }
+        BatchResult result = storage.write(graph, part, command.build());
+        if (!result.getCode().equals("OK")) throw new ClusterException(result.getCode(), result.getMessage());
+        WriteTimings.add("fastCommitMs", System.nanoTime() - started);
+        return record;
     }
 
     public TransactionRecord resume(TransactionRecord initial) {
@@ -102,10 +183,19 @@ public final class TransactionEngine {
             TransactionRecord decided = record;
             phase(plan, participant -> finalizeParticipant(decided, participant));
             ByteString key = transactionKey(plan.getTransactionId());
+            ByteString planKey = transactionPlanKey(plan.getTransactionId());
+            ByteString gcKey = transactionGcKey(plan.getTransactionId());
             var complete = record.toBuilder().setFinalized(true).build();
+            // 协调键只留决定。完整参与者计划挪走，否则下一次批量写入的读视图会把全部历史计划再解析一遍。
+            var summary = complete.toBuilder().setPlan(complete.getPlan().toBuilder().clearParticipants()).build();
             try {
                 storage.write(plan.getGraphId(), plan.getCoordinatorPart(), StorageGateway.batch("tx.finalized/" + plan.getTransactionId())
-                        .addConditions(StorageGateway.condition(key, record.toByteString())).addMutations(put(key, complete.toByteString())).build());
+                        .addConditions(StorageGateway.condition(key, record.toByteString()))
+                        .addConditions(StorageGateway.condition(planKey, null))
+                        .addConditions(StorageGateway.condition(gcKey, null))
+                        .addMutations(put(key, summary.toByteString()))
+                        .addMutations(put(planKey, complete.toByteString()))
+                        .addMutations(put(gcKey, summary.toByteString())).build());
             } catch (ClusterException ex) { if (!ex.code().equals("WRITE_CONFLICT")) throw ex; }
             record = record(plan.getGraphId(), plan.getCoordinatorPart(), plan.getTransactionId());
         }
@@ -189,24 +279,10 @@ public final class TransactionEngine {
     }
 
     private void finalizeParticipant(TransactionRecord record, ParticipantPlan participant) {
-        TransactionPlan plan = record.getPlan();
-        // 在释放锁前持久化终态栅栏，拒绝网络中迟到的 PREPARE。
-        ByteString stateKey = participantKey(plan.getTransactionId());
-        for (;;) {
-            ByteString old = storage.get(plan.getGraphId(), participant.getPartId(), stateKey);
-            ByteString decided = text(record.getState().name());
-            if (decided.equals(old)) break;
-            try {
-                storage.write(plan.getGraphId(), participant.getPartId(), StorageGateway.batch("tx.fence/" + plan.getTransactionId()
-                                + "/" + participant.getPartId() + "/" + (old == null ? "empty" : "prepared"))
-                        .addConditions(StorageGateway.condition(stateKey, old)).addMutations(put(stateKey, decided)).build());
-                break;
-            } catch (ClusterException ex) { if (!ex.code().equals("WRITE_CONFLICT")) throw ex; }
-        }
         List<ConditionalMutation> chunk = new ArrayList<>();
         int bytes = 0;
         for (ConditionalMutation change : participant.getChangesList()) {
-            if (!chunk.isEmpty() && (chunk.size() >= 64 || bytes + change.getSerializedSize() > 512 * 1024)) {
+            if (!chunk.isEmpty() && bytes + change.getSerializedSize() > 512 * 1024) {
                 finalizeChunk(record, participant.getPartId(), chunk);
                 chunk.clear(); bytes = 0;
             }
@@ -220,9 +296,12 @@ public final class TransactionEngine {
         ReservationOwner owner = ReservationOwner.newBuilder().setTransactionId(plan.getTransactionId()).setCoordinatorPart(plan.getCoordinatorPart()).build();
         List<ByteString> keys = new ArrayList<>();
         for (var change : changes) { keys.add(lockKey(change.getKey())); keys.add(change.getKey()); }
+        ByteString stateKey = participantKey(plan.getTransactionId());
         for (int attempt = 0; attempt < 32; attempt++) {
             List<ByteString> values = storage.getMany(plan.getGraphId(), part, keys);
             var command = StorageGateway.batch("tx.release.v3/" + plan.getTransactionId() + "/" + part);
+            // 终态栅栏和释放锁在同一批，迟到的 PREPARE 看不到锁已释放而栅栏还没写上的窗口。
+            command.addMutations(put(stateKey, text(record.getState().name())));
             int position = 0;
             for (ConditionalMutation change : changes) {
                 ByteString lock = lockKey(change.getKey());
@@ -329,8 +408,12 @@ public final class TransactionEngine {
 
     public static TransactionPlan normalize(TransactionPlan input) {
         if (input.getTransactionId().isBlank() || input.getTransactionId().length() > 120 || input.getGraphId() <= 0
-                || input.getParticipantsCount() == 0 || input.getDeadlineMs() <= 0) throw new ClusterException("INVALID_ARGUMENT", "事务计划无效");
-        if (input.getSerializedSize() > 6 * 1024 * 1024 || input.getParticipantsCount() > 65535) throw new ClusterException("BATCH_TOO_LARGE", "事务计划超过允许大小");
+                || input.getParticipantsCount() == 0 || input.getDeadlineMs() <= 0) {
+            throw new ClusterException("INVALID_ARGUMENT", "事务计划无效");
+        }
+        if (input.getSerializedSize() > planMaxBytes || input.getParticipantsCount() > 65535) {
+            throw new ClusterException("BATCH_TOO_LARGE", "事务计划超过允许大小：" + input.getSerializedSize() + " > " + planMaxBytes);
+        }
         var participants = new ArrayList<>(input.getParticipantsList());
         participants.sort(Comparator.comparingInt(ParticipantPlan::getPartId));
         Set<Integer> parts = new HashSet<>();

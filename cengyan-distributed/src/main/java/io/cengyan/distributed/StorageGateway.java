@@ -10,11 +10,14 @@ import java.util.concurrent.*;
 
 /** 连接池及 Leader 缓存。路由错误可重定向，不在此层重算查询或生成新的写 requestId。 */
 public final class StorageGateway implements AutoCloseable {
-    // A transaction CAS carries both the old and new record (each may contain a 6 MiB plan).
+    // 未配置时的发送帧上限。事务计划默认 16 MiB，单次发送仍放得下；提交 CAS 含新旧两份，由 Storage 的 rpc_max_payload_bytes 约束。
     public static final int MAX_RPC_PAYLOAD = 32 * 1024 * 1024;
     public record Partition(long graph, int part) { }
     private final String cluster;
     private final List<InetSocketAddress> seeds;
+    /** 发起请求时的帧大小上限与每连接并发上限，可由节点配置覆盖。 */
+    private volatile int maxPayload = MAX_RPC_PAYLOAD;
+    private volatile int maxInflight = 128;
     private final ConcurrentMap<InetSocketAddress, RpcClient> connections = new ConcurrentHashMap<>();
     private final java.util.concurrent.locks.ReentrantLock[] connectionLocks = java.util.stream.IntStream.range(0, 32)
             .mapToObj(i -> new java.util.concurrent.locks.ReentrantLock()).toArray(java.util.concurrent.locks.ReentrantLock[]::new);
@@ -158,6 +161,18 @@ public final class StorageGateway implements AutoCloseable {
         this.cluster = cluster;
         this.seeds = List.copyOf(seeds);
     }
+    /**
+     * 本网关发起请求时的帧大小与并发上限。默认沿用协议固定值；节点可用
+     * rpc_max_payload_bytes / rpc_max_inflight 覆盖，使配置真正生效。
+     * 集群内各节点应保持一致，否则大请求会被对端拒绝。
+     */
+    public void limit(int maxPayload, int maxInflight) {
+        if (maxPayload < 1024 || maxInflight < 1) throw new IllegalArgumentException("网关 RPC 上限无效：" + maxPayload + "/" + maxInflight);
+        connections.values().forEach(RpcClient::close);
+        connections.clear();
+        this.maxPayload = maxPayload;
+        this.maxInflight = maxInflight;
+    }
     public String clusterId() { return cluster; }
     public void route(long graph, int part, List<InetSocketAddress> replicas) {
         if (replicas.isEmpty()) throw new IllegalArgumentException("副本列表不能为空");
@@ -275,8 +290,8 @@ public final class StorageGateway implements AutoCloseable {
                 RpcRequest request = RpcRequest.newBuilder().setContext(context(graph, part, requestId,
                         Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining))))
                         .setMethod(method).setBody(body).build();
-                if (request.getSerializedSize() > MAX_RPC_PAYLOAD) throw new ClusterException("BATCH_TOO_LARGE",
-                        "Storage RPC 超过上限；method=" + method + " bytes=" + request.getSerializedSize() + " limit=" + MAX_RPC_PAYLOAD);
+                if (request.getSerializedSize() > maxPayload) throw new ClusterException("BATCH_TOO_LARGE",
+                        "Storage RPC 超过上限；method=" + method + " bytes=" + request.getSerializedSize() + " limit=" + maxPayload);
                 submitted = true;
                 sentAt = System.nanoTime();
                 pendingCall = client.call(request, Duration.ofNanos(remaining));
@@ -482,7 +497,9 @@ public final class StorageGateway implements AutoCloseable {
      * 幂等记录保留窗口。只有在窗口内重复提交同一个 requestId 才会被判为重复；
      * 窗口越短，分片库里为去重保存的记录越少。由各节点启动时按配置设置，默认 1 小时。
      */
-    private static volatile long idempotencyWindowMs = TimeUnit.HOURS.toMillis(1);
+    /** 幂等记录默认保留窗口，配置项 idempotency_window_ms 缺省时使用。 */
+    public static final long DEFAULT_IDEMPOTENCY_WINDOW_MS = TimeUnit.HOURS.toMillis(1);
+    private static volatile long idempotencyWindowMs = DEFAULT_IDEMPOTENCY_WINDOW_MS;
 
     public static void setIdempotencyWindowMs(long millis) {
         if (millis < TimeUnit.MINUTES.toMillis(1) || millis > TimeUnit.DAYS.toMillis(7)) {
@@ -515,7 +532,7 @@ public final class StorageGateway implements AutoCloseable {
                 previous = connections.get(address);
                 if (previous != null && previous.isActive()) return previous;
                 if (previous != null && connections.remove(address, previous)) previous.close();
-                RpcClient created = new RpcClient(address, MAX_RPC_PAYLOAD, 128, timeLeft(deadline));
+                RpcClient created = new RpcClient(address, maxPayload, maxInflight, timeLeft(deadline));
                 if (closed) { created.close(); throw new IllegalStateException("StorageGateway 已关闭"); }
                 connections.put(address, created);
                 return created;

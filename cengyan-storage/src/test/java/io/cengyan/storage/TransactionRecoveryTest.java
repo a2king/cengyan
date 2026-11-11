@@ -30,6 +30,10 @@ class TransactionRecoveryTest {
             var seed = plan("seed", graph.getId(),
                     participant(0, change(a, null, "old-a")), participant(1, change(b, null, "old-b")));
             assertEquals(TransactionState.COMMITTED, tx.execute(seed).getState());
+            TransactionRecord seedRecord = tx.record(graph.getId(), 0, "seed");
+            assertEquals(0, seedRecord.getPlan().getParticipantsCount(), "已结束事务的协调记录只留摘要");
+            TransactionRecord seedPlan = TransactionRecord.parseFrom(storage.get(graph.getId(), 0, TransactionEngine.transactionPlanKey("seed")));
+            assertTrue(seedPlan.getPlan().getParticipantsCount() > 0);
             ByteString oldA = storage.get(graph.getId(), 0, a);
             var conflict = plan("conflict", graph.getId(), participant(0, change(a, oldA, "new-a")),
                     participant(1, change(b, null, "new-b")));
@@ -55,6 +59,8 @@ class TransactionRecoveryTest {
             assertTrue(compacted.getVersions(0).getBaseline());
             assertEquals("next-a", tx.new QueryScope(graph.getId(), 2).value(storage.get(graph.getId(), 0, a)).toStringUtf8());
             assertEquals(0, tx.record(graph.getId(), 0, "after-abort").getPlan().getParticipantsCount());
+            assertNull(storage.get(graph.getId(), 0, TransactionEngine.transactionPlanKey("after-abort")));
+            assertNull(storage.get(graph.getId(), 0, TransactionEngine.transactionGcKey("after-abort")));
         }
     }
     private static TransactionPlan plan(String id, long graph, ParticipantPlan... participants) {

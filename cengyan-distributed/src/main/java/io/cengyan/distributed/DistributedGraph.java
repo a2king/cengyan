@@ -29,10 +29,8 @@ public final class DistributedGraph {
         if (encoded == null) return null;
         try {
             RequestTicket ticket = RequestTicket.parseFrom(encoded);
-            long graphId = catalog.graph(graphName).getId();
-            if (ticket.hasPlan() && ticket.getPlan().getGraphId() != graphId) throw new ClusterException("REQUEST_CONFLICT", "请求目标图不匹配");
-            replay(encoded, requestId, graphId, timeout);
-            return new BulkResult(ticket.getAffected(), ticket.getDuplicates(), ticket.getSkipped());
+            if (ticket.hasPlan() && ticket.getPlan().getGraphId() != target.getId()) throw new ClusterException("REQUEST_CONFLICT", "请求目标图不匹配");
+            return replayTicket(target, ticket, requestId, timeout);
         } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "写请求票据损坏", ex); }
     }
     public Entity get(GraphDefinition graph, boolean node, Value id, TransactionEngine.QueryScope scope) {
@@ -235,16 +233,12 @@ public final class DistributedGraph {
             try {
                 RequestTicket savedTicket = RequestTicket.parseFrom(ticket);
                 if (!savedTicket.getInputDigest().equals(inputDigest)) throw new ClusterException("REQUEST_CONFLICT", "相同 requestId 对应不同写入内容");
-                if (!savedTicket.hasPlan()) return new BulkResult(savedTicket.getAffected(), savedTicket.getDuplicates(), savedTicket.getSkipped());
-                TransactionPlan saved = savedTicket.getPlan();
-                if (saved.getGraphId() != graph.getId()) throw new ClusterException("REQUEST_CONFLICT", "写请求目标图改变");
-                RpcResponse response = storage.call(graph.getId(), saved.getCoordinatorPart(), "tx.execute", requestId, saved.toByteString(), timeout);
-                TransactionRecord result = TransactionRecord.parseFrom(response.getBody());
-                if (result.getState() != TransactionState.COMMITTED) throw new ClusterException(result.getErrorCode(), result.getErrorMessage());
-                return new BulkResult(savedTicket.getAffected(), savedTicket.getDuplicates(), savedTicket.getSkipped());
+                BulkResult replayed = replayTicket(graph, savedTicket, requestId, timeout);
+                if (replayed != null) return replayed;
             } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "提交票据损坏", ex); }
         }
-        var scope = readScope(graph.getId());
+        // 覆盖按主键点读。版本可见性只点查这些单元格里的事务 id，不扫描全部分片的 __tx/。
+        var scope = transactions.new QueryScope(graph.getId());
         Map<ByteString, Entity> expected = new HashMap<>();
         for (Entity entity : expectedEntities) expected.put(EntityCodec.key(entity.getNode(), entity.getId(), graph), entity);
         LinkedHashMap<ByteString, Entity> unique = new LinkedHashMap<>(); long duplicates = 0, skipped = 0;
@@ -256,9 +250,10 @@ public final class DistributedGraph {
             if (previous != null) { sameStructure(previous, entity); duplicates++; }
         }
         Map<Located, ConditionalMutation> changes = new LinkedHashMap<>();
-        Map<Located, ByteString> entitySnapshots = snapshots(graph, unique.values());
+        Map<Located, ByteString> cells = new HashMap<>(snapshots(graph, unique.values()));
+        preloadEdges(graph, unique.values(), cells);
         for (Entity entity : unique.values()) {
-            if (entity.getNode()) addEntity(graph, entity, scope, changes, expected, entitySnapshots);
+            if (entity.getNode()) addEntity(graph, entity, scope, changes, expected, cells);
         }
         for (Entity entity : unique.values()) {
             if (entity.getNode()) continue;
@@ -266,7 +261,12 @@ public final class DistributedGraph {
             for (Value endpoint : List.of(entity.getSource(), entity.getTarget())) {
                 ByteString endpointKey = EntityCodec.key(true, endpoint, graph);
                 Entity local = unique.get(endpointKey);
-                if (local == null) local = get(graph, true, endpoint, scope);
+                if (local == null) {
+                    Located location = new Located(EntityCodec.part(true, endpoint, graph), endpointKey);
+                    ByteString encoded = cached(graph, cells, location);
+                    ByteString visible = scope.value(encoded);
+                    local = visible == null ? null : EntityCodec.entity(visible);
+                }
                 if (local == null) { missing = true; break; }
                 if (!local.getState().equals("ACTIVE")) throw new ClusterException("NODE_DELETING", "端点正在删除，禁止创建边");
             }
@@ -274,22 +274,21 @@ public final class DistributedGraph {
                 if (skipMissing) { skipped++; continue; }
                 throw new ClusterException("ENDPOINT_NOT_FOUND", "边的起点或终点不存在");
             }
-            addEntity(graph, entity, scope, changes, expected, entitySnapshots);
+            addEntity(graph, entity, scope, changes, expected, cells);
             Entity hint = entity.toBuilder().clearProperties().build();
-            add(graph, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.adjacency(true, entity.getSource(), entity.getId(), graph), hint.toByteString(), false, changes);
-            add(graph, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.adjacency(false, entity.getTarget(), entity.getId(), graph), hint.toByteString(), false, changes);
-            // 首版使用端点版本预留，确保校验之后的节点删除/覆盖不能穿过本次建边。
+            add(graph, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.adjacency(true, entity.getSource(), entity.getId(), graph), hint.toByteString(), false, changes, cells);
+            add(graph, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.adjacency(false, entity.getTarget(), entity.getId(), graph), hint.toByteString(), false, changes, cells);
             for (Value endpoint : List.of(entity.getSource(), entity.getTarget())) {
                 Located location = new Located(EntityCodec.part(true, endpoint, graph), EntityCodec.key(true, endpoint, graph));
                 if (!changes.containsKey(location)) {
-                    ByteString encoded = storage.get(graph.getId(), location.part, location.key);
+                    ByteString encoded = cached(graph, cells, location);
                     ByteString visible = scope.value(encoded);
-                    ByteString latest = transactions.new QueryScope(graph.getId()).value(encoded);
-                    if (visible == null || !Objects.equals(visible, latest)) throw new ClusterException("WRITE_CONFLICT", "端点在建边规划期间已被更新或删除");
+                    if (visible == null) throw new ClusterException("WRITE_CONFLICT", "端点在建边规划期间已被更新或删除");
                     Entity existing = EntityCodec.entity(visible);
                     if (!existing.getState().equals("ACTIVE")) throw new ClusterException("NODE_DELETING", "端点正在删除");
-                    changes.put(location, ConditionalMutation.newBuilder().setKey(location.key).setExpectedPresent(true)
-                            .setExpectedCell(encoded).setReadOnly(true).build());
+                    var reserved = ConditionalMutation.newBuilder().setKey(location.key).setExpectedPresent(true).setReadOnly(true);
+                    if (encoded != null) reserved.setExpectedCell(encoded);
+                    changes.put(location, reserved.build());
                 }
             }
         }
@@ -348,9 +347,6 @@ public final class DistributedGraph {
         if (planned != null && !planned.equals(previous)) {
             throw new ClusterException("WRITE_CONFLICT", "GQL 读取的实体在提交规划前已改变，拒绝覆盖并发更新");
         }
-        if (expectedEntity != null && !Objects.equals(visibleEntity, transactions.new QueryScope(graph.getId()).value(expectedEntity))) {
-            throw new ClusterException("WRITE_CONFLICT", "实体在本次写入规划期间已被其它事务更新");
-        }
         if (previous != null) {
             sameStructure(previous, entity);
             if (previous.getState().equals("DELETING")) throw new ClusterException("NODE_DELETING", "实体正在删除，禁止覆盖");
@@ -371,7 +367,7 @@ public final class DistributedGraph {
                         ? (changes.get(location).getExpectedPresent() ? changes.get(location).getExpectedCell() : null)
                         : storage.get(graph.getId(), part, newKey);
                 ByteString owner = changes.containsKey(location) ? (changes.get(location).getDelete() ? null : changes.get(location).getValue())
-                        : transactions.new QueryScope(graph.getId()).value(expected);
+                        : scope.value(expected);
                 ByteString id = entity.getId().toByteString();
                 if (index.getUnique() && owner != null && !owner.equals(id)) throw new ClusterException("UNIQUE_VIOLATION", "唯一索引冲突：" + index.getName());
                 var change = ConditionalMutation.newBuilder().setKey(newKey).setExpectedPresent(expected != null).setValue(id);
@@ -610,7 +606,11 @@ public final class DistributedGraph {
     }
     public void deleteEdge(String requestId, GraphDefinition graph, Value edgeId, Duration timeout) {
         ByteString ticket = storage.get(ticketGraph(graph), ticketPart(graph, requestId), TransactionEngine.text("requests/" + requestId));
-        if (ticket != null) { replay(ticket, requestId, graph.getId(), timeout); return; }
+        if (ticket != null) {
+            try {
+                if (replayTicket(graph, RequestTicket.parseFrom(ticket), requestId, timeout) != null) return;
+            } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "重试票据损坏", ex); }
+        }
         var scope = readScope(graph.getId());
         Entity edge = get(graph, false, edgeId, scope);
         if (edge == null) return;
@@ -624,14 +624,6 @@ public final class DistributedGraph {
         }
         commit(requestId, graph, changes, timeout, inputDigest(graph, List.of(edge), false), new BulkResult(1, 0, 0));
     }
-    private void replay(ByteString ticket, String requestId, long graphId, Duration timeout) {
-        try {
-            RequestTicket saved = RequestTicket.parseFrom(ticket);
-            if (!saved.hasPlan()) return;
-            storage.call(graphId, saved.getPlan().getCoordinatorPart(), "tx.execute", requestId, saved.getPlan().toByteString(), timeout);
-        } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "重试票据损坏", ex); }
-    }
-
     public void deleteNode(String requestId, GraphDefinition graph, Value vertexId) {
         int part = EntityCodec.part(true, vertexId, graph);
         ByteString taskKey = TransactionEngine.text("__delete/" + requestId);
@@ -775,12 +767,79 @@ public final class DistributedGraph {
         storage.call(target.getId(), normalized.getCoordinatorPart(), "tx.execute", requestId, normalized.toByteString(), Duration.ofMinutes(5));
     }
     private void add(GraphDefinition graph, int part, ByteString key, ByteString value, boolean delete, Map<Located, ConditionalMutation> changes) {
+        add(graph, part, key, value, delete, changes, null);
+    }
+    private void add(GraphDefinition graph, int part, ByteString key, ByteString value, boolean delete, Map<Located, ConditionalMutation> changes,
+                     Map<Located, ByteString> cells) {
         Located location = new Located(part, key);
         ConditionalMutation existing = changes.get(location);
-        ByteString expected = existing == null ? storage.get(graph.getId(), part, key) : (existing.getExpectedPresent() ? existing.getExpectedCell() : null);
+        ByteString expected = existing != null ? (existing.getExpectedPresent() ? existing.getExpectedCell() : null) : cached(graph, cells, location);
         var mutation = ConditionalMutation.newBuilder().setKey(key).setExpectedPresent(expected != null).setValue(value).setDelete(delete);
         if (expected != null) mutation.setExpectedCell(expected);
         changes.put(location, mutation.build());
+    }
+    private ByteString cached(GraphDefinition graph, Map<Located, ByteString> cells, Located location) {
+        if (cells != null && cells.containsKey(location)) return cells.get(location);
+        ByteString value = storage.get(graph.getId(), location.part, location.key);
+        if (cells != null) cells.put(location, value);
+        return value;
+    }
+    private void preloadEdges(GraphDefinition graph, Collection<Entity> entities, Map<Located, ByteString> cells) {
+        Map<Integer, List<ByteString>> grouped = new LinkedHashMap<>();
+        for (Entity entity : entities) {
+            if (entity.getNode()) continue;
+            remember(graph, cells, grouped, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.key(true, entity.getSource(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.key(true, entity.getTarget(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.adjacency(true, entity.getSource(), entity.getId(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.adjacency(false, entity.getTarget(), entity.getId(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(false, entity.getId(), graph), EntityCodec.key(false, entity.getId(), graph));
+        }
+        if (grouped.isEmpty()) return;
+        List<java.util.function.Supplier<Map<Located, ByteString>>> reads = new ArrayList<>();
+        grouped.forEach((part, keys) -> reads.add(() -> {
+            List<ByteString> values = storage.getMany(graph.getId(), part, keys);
+            Map<Located, ByteString> result = new HashMap<>();
+            for (int i = 0; i < keys.size(); i++) result.put(new Located(part, keys.get(i)), values.get(i));
+            return result;
+        }));
+        for (var partition : StorageGateway.parallel(reads)) cells.putAll(partition);
+    }
+    private static void remember(GraphDefinition graph, Map<Located, ByteString> cells, Map<Integer, List<ByteString>> grouped, int part, ByteString key) {
+        if (cells.containsKey(new Located(part, key))) return;
+        List<ByteString> keys = grouped.computeIfAbsent(part, ignored -> new ArrayList<>());
+        if (!keys.contains(key)) keys.add(key);
+    }
+    /** 票据里的计划没有参与者时只是协调分片定位；真正的计划在事务记录里。已结束则直接返回统计。 */
+    private BulkResult replayTicket(GraphDefinition graph, RequestTicket saved, String requestId, Duration timeout) {
+        if (!saved.hasPlan()) return new BulkResult(saved.getAffected(), saved.getDuplicates(), saved.getSkipped());
+        TransactionPlan stub = saved.getPlan();
+        if (stub.getGraphId() != graph.getId()) throw new ClusterException("REQUEST_CONFLICT", "写请求目标图改变");
+        if (stub.getParticipantsCount() > 0) {
+            RpcResponse response = storage.call(graph.getId(), stub.getCoordinatorPart(), "tx.execute", requestId, stub.toByteString(), timeout);
+            try {
+                TransactionRecord result = TransactionRecord.parseFrom(response.getBody());
+                if (result.getState() != TransactionState.COMMITTED) throw new ClusterException(result.getErrorCode(), result.getErrorMessage());
+            } catch (ClusterException ex) { throw ex; }
+            catch (Exception ex) { throw new ClusterException("PROTOCOL_ERROR", "事务响应损坏", ex); }
+            return new BulkResult(saved.getAffected(), saved.getDuplicates(), saved.getSkipped());
+        }
+        ByteString encoded = storage.get(graph.getId(), stub.getCoordinatorPart(), TransactionEngine.transactionKey(requestId));
+        if (encoded == null) return null;
+        try {
+            TransactionRecord existing = TransactionRecord.parseFrom(encoded);
+            if (!existing.getFinalized() || existing.getState() != TransactionState.COMMITTED) {
+                if (existing.getPlan().getParticipantsCount() == 0) {
+                    ByteString savedPlan = storage.get(graph.getId(), existing.getPlan().getCoordinatorPart(), TransactionEngine.transactionPlanKey(requestId));
+                    if (savedPlan == null) return null;
+                    existing = TransactionRecord.parseFrom(savedPlan);
+                }
+                RpcResponse response = storage.call(graph.getId(), existing.getPlan().getCoordinatorPart(), "tx.execute", requestId, existing.getPlan().toByteString(), timeout);
+                TransactionRecord result = TransactionRecord.parseFrom(response.getBody());
+                if (result.getState() != TransactionState.COMMITTED) throw new ClusterException(result.getErrorCode(), result.getErrorMessage());
+            }
+            return new BulkResult(saved.getAffected(), saved.getDuplicates(), saved.getSkipped());
+        } catch (ClusterException ex) { throw ex; }
+        catch (Exception ex) { throw new ClusterException("CORRUPT_DATA", "事务记录损坏", ex); }
     }
     private TransactionRecord commit(String requestId, GraphDefinition graph, Map<Located, ConditionalMutation> changes, Duration timeout,
                                      ByteString inputDigest, BulkResult statistics) {
@@ -800,17 +859,25 @@ public final class DistributedGraph {
         participants.values().forEach(part -> plan.addParticipants(part.build()));
         TransactionPlan normalized = TransactionEngine.normalize(plan.build());
         ByteString ticketKey = TransactionEngine.text("requests/" + requestId);
+        // 票据只保存摘要、统计和协调分片。完整计划只在事务记录里写一份。
+        TransactionPlan locator = TransactionPlan.newBuilder().setTransactionId(requestId).setGraphId(graph.getId())
+                .setCoordinatorPart(normalized.getCoordinatorPart()).setDeadlineMs(normalized.getDeadlineMs())
+                .setContentDigest(normalized.getContentDigest()).build();
         try {
             storage.write(ticketGraph(graph), ticketPart(graph, requestId), StorageGateway.batch("request.ticket/" + requestId)
                     .addConditions(StorageGateway.condition(ticketKey, null)).addMutations(TransactionEngine.put(ticketKey,
-                            RequestTicket.newBuilder().setPlan(normalized).setInputDigest(inputDigest).setAffected(statistics.affected())
+                            RequestTicket.newBuilder().setPlan(locator).setInputDigest(inputDigest).setAffected(statistics.affected())
                                     .setDuplicates(statistics.duplicates()).setSkipped(statistics.skipped()).build().toByteString())).build());
         } catch (ClusterException ex) {
             if (!Set.of("WRITE_CONFLICT", "REQUEST_CONFLICT").contains(ex.code())) throw ex;
             try {
                 RequestTicket saved = RequestTicket.parseFrom(storage.get(ticketGraph(graph), ticketPart(graph, requestId), ticketKey));
                 if (!saved.getInputDigest().equals(inputDigest)) throw new ClusterException("REQUEST_CONFLICT", "请求内容已改变");
-                normalized = saved.getPlan();
+                if (saved.hasPlan() && saved.getPlan().getParticipantsCount() > 0) normalized = saved.getPlan();
+                else if (saved.hasPlan() && !saved.getPlan().getContentDigest().isEmpty()
+                        && !saved.getPlan().getContentDigest().equals(normalized.getContentDigest())) {
+                    throw new ClusterException("REQUEST_CONFLICT", "请求内容已改变");
+                }
             }
             catch (ClusterException conflict) { throw conflict; }
             catch (Exception invalid) { throw new ClusterException("CORRUPT_DATA", "事务提交票据不可用", invalid); }
@@ -837,9 +904,10 @@ public final class DistributedGraph {
             return ByteString.copyFrom(digest.digest());
         } catch (Exception ex) { throw new IllegalStateException(ex); }
     }
-    static long ticketGraph(GraphDefinition graph) { return graph.getDataMode().equals("rebuild") ? graph.getId() : 0; }
-    static int ticketPart(GraphDefinition graph, String requestId) {
-        return graph.getDataMode().equals("rebuild") ? Math.floorMod(requestId.hashCode(), graph.getPartitions()) : 0;
+    /** 请求票据写在数据分片上，不再进入 Metadata 日志。 */
+    public static long ticketGraph(GraphDefinition graph) { return graph.getId(); }
+    public static int ticketPart(GraphDefinition graph, String requestId) {
+        return Math.floorMod(requestId.hashCode(), graph.getPartitions());
     }
     private static void sameStructure(Entity old, Entity next) {
         if (old.getNode() != next.getNode() || !old.getType().equals(next.getType())

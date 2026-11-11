@@ -82,7 +82,7 @@ class ParallelTransactionTest {
             assertTrue(finished.getFinalized());
             assertEquals(conflict ? TransactionState.ABORTED : TransactionState.COMMITTED, finished.getState());
             assertEquals(1, finished.getPlan().getCoordinatorPart(), "持久化协调者不能被 normalize 改回分片 0");
-            assertEquals(conflict ? 1 : 2, releases.get(), "每分片 64 个键应一次批量收尾");
+            assertEquals(2, releases.get(), "每个参与分片一次收尾；准备失败的分片也要写入终态栅栏");
             assertEquals(0, pointLocks.get());
             synchronized (mutex) {
                 for (var values : partitions.values()) {

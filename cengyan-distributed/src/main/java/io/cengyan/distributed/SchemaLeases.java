@@ -10,6 +10,8 @@ public final class SchemaLeases {
     private static final long TTL = 30_000, WINDOW = 60_000, MAX_QUERY = TimeUnit.MINUTES.toMillis(30), SKEW = 5_000;
     private final StorageGateway storage;
     private final DistributedCatalog catalog;
+    /** 授权窗口只增不减。进程内共享，避免每个 RPC 都新建对象后缓存失效。 */
+    private static final java.util.concurrent.ConcurrentMap<String, Long> RETAIN_UNTIL = new java.util.concurrent.ConcurrentHashMap<>();
     public SchemaLeases(StorageGateway storage) { this.storage = storage; catalog = new DistributedCatalog(storage); }
 
     public SchemaLease acquire(String graphName, String requestId, long deadline, long epoch, boolean write) {
@@ -54,10 +56,15 @@ public final class SchemaLeases {
                 || lease.getExpiresAtMs() <= now || lease.getHardDeadlineMs() <= now || lease.getIssuedAtMs() > now + SKEW) {
             throw new ClusterException("SCHEMA_VERSION_MISMATCH", "Schema Lease 已失效或不匹配");
         }
+        long needed = lease.getHardDeadlineMs() + SKEW;
+        String cacheKey = graph + "/" + version;
+        Long cached = RETAIN_UNTIL.get(cacheKey);
+        if (cached != null && cached >= needed) return;
         ByteString encoded = storage.get(0, 0, key(graph, version));
-        if (encoded == null || parse(encoded).getRetainUntilMs() < lease.getHardDeadlineMs() + SKEW) {
+        if (encoded == null || parse(encoded).getRetainUntilMs() < needed) {
             throw new ClusterException("SCHEMA_VERSION_MISMATCH", "Schema 版本保留边界不存在");
         }
+        RETAIN_UNTIL.put(cacheKey, parse(encoded).getRetainUntilMs());
     }
     public static ByteString key(long graph, long version) { return TransactionEngine.text("schema/lease/" + graph + "/" + version); }
     private static LeaseHorizon parse(ByteString bytes) {

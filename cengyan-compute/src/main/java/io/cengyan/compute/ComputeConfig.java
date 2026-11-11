@@ -48,10 +48,13 @@ public record ComputeConfig(String clusterId, String nodeId, InetSocketAddress c
         Path directory = Path.of(required(p, "data_dir"));
         if (!directory.isAbsolute()) directory = file.toAbsolutePath().getParent().resolve(directory);
         // 写入批次自带的幂等有效期；与 Storage 端使用同一个配置键。
-        io.cengyan.distributed.StorageGateway.setIdempotencyWindowMs(number(p, "idempotency_window_ms", 3600000));
+        io.cengyan.distributed.StorageGateway.setIdempotencyWindowMs(number(p, "idempotency_window_ms",
+                io.cengyan.distributed.StorageGateway.DEFAULT_IDEMPOTENCY_WINDOW_MS));
+        io.cengyan.distributed.TransactionEngine.setPlanMaxBytes(Math.toIntExact(number(p, "transaction_plan_max_bytes",
+                io.cengyan.distributed.TransactionEngine.DEFAULT_PLAN_MAX_BYTES)));
         return new ComputeConfig(required(p, "cluster_id"), required(p, "node_id"), address(required(p, "client_address")),
                 address(required(p, "rpc_address")), address(required(p, "raft_address")), directory, members, seeds,
-                (int) number(p, "query_slots", 4), (int) number(p, "queue_capacity", 128), number(p, "queue_timeout_ms", 30000),
+                (int) number(p, "query_slots", 16), (int) number(p, "queue_capacity", 128), number(p, "queue_timeout_ms", 30000),
                 number(p, "max_execution_time_ms", 1800000), number(p, "query_memory_bytes", 67108864), number(p, "node_memory_bytes", 536870912),
                 number(p, "query_temp_bytes", 1073741824), number(p, "node_temp_bytes", 8589934592L),
                 (int) number(p, "result_max_rows", 100000), (int) number(p, "result_max_bytes", 16777216), required(p, "root_password"));
