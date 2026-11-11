@@ -3,11 +3,37 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cengyan"
-version = "0.1.0"
-description = "Official synchronous Python SDK for Cengyan graph database"
+name = "pycengyan"
+version = "1.0.0"
+description = "Official synchronous Python SDK for Cengyan graph database (import pycengyan)"
+readme = "README.md"
 requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Database :: Database Engines/Servers",
+]
 dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7", "ruff>=0.5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# 不设 PYTHONPATH 也能直接 pytest：源码是 src 布局。
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# cluster_process_smoke.py 需要先构建 JAR，不参与默认收集。
+norecursedirs = ["*.egg-info"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# E701：异常类用单行 `class X: pass` 更紧凑；E501 由 line-length 只管提示不拦截。
+ignore = ["E501", "E701"]
