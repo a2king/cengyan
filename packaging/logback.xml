@@ -11,6 +11,7 @@
         </encoder>
     </appender>
     <logger name="io.cengyan" level="INFO"/>
+    <logger name="io.cengyan.query.DuckResult" level="DEBUG"/>
     <logger name="io.netty" level="WARN"/>
     <logger name="org.apache.ratis" level="WARN"/>
     <root level="INFO">

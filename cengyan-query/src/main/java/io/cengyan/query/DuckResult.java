@@ -4,6 +4,8 @@ import io.cengyan.CancelToken;
 import io.cengyan.CengyanException;
 import io.cengyan.ErrorCode;
 import io.cengyan.parser.Stmt;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -30,6 +32,7 @@ import java.util.stream.Stream;
  * 不在这里扩大扫描范围。内存放不下时写到临时目录。
  */
 final class DuckResult {
+    private static final Logger log = LoggerFactory.getLogger(DuckResult.class);
     private DuckResult() {
     }
 
@@ -73,7 +76,9 @@ final class DuckResult {
             try {
                 create(held.connection, distinct, width, keys);
                 insert(held.connection, rows, sortKeys, distinct, keys, cancel);
-                return read(held.connection, query(distinct, width, sorts, offset, limit), rows, cancel);
+                String sql = query(distinct, width, sorts, offset, limit);
+                log.debug("DuckDB SQL arrange rows={} sql={}", rows.size(), sql);
+                return read(held.connection, sql, rows, cancel);
             } finally {
                 if (settings.beforeClose() != null) {
                     settings.beforeClose().accept(settings.tempDirectory());
@@ -120,7 +125,9 @@ final class DuckResult {
             try {
                 createAggregate(held.connection, columns);
                 insertAggregate(held.connection, rows, columns, cancel);
-                return readAggregate(held.connection, aggregateSql(kinds), kinds, integral, cancel);
+                String sql = aggregateSql(kinds);
+                log.debug("DuckDB SQL aggregate rows={} sql={}", rows.size(), sql);
+                return readAggregate(held.connection, sql, kinds, integral, cancel);
             } finally {
                 if (settings.beforeClose() != null) {
                     settings.beforeClose().accept(settings.tempDirectory());
