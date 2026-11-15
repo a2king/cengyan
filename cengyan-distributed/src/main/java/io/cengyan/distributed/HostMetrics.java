@@ -20,6 +20,24 @@ import java.util.function.Predicate;
  * 速率是相邻两次计数的差，后台约 2 秒采样一次，运维页打开时就能读到当前速度。
  */
 public final class HostMetrics {
+    /** 服务器主机名。优先读 Linux 的 /etc/hostname，避免把节点 ID 或反向解析出的地址当成主机名。 */
+    public static String hostname() {
+        if (LINUX) {
+            try {
+                String file = Files.readString(ETC_HOSTNAME).trim();
+                if (!file.isEmpty()) return file;
+            } catch (IOException ignored) { }
+        }
+        String env = System.getenv("HOSTNAME");
+        if (env != null && !env.isBlank()) return env.strip();
+        try {
+            String resolved = java.net.InetAddress.getLocalHost().getHostName();
+            return resolved == null ? "" : resolved.strip();
+        } catch (Exception ex) {
+            return "";
+        }
+    }
+
     /** kernel diskstats 的扇区单位固定是 512 字节，与物理扇区大小无关。 */
     static final long SECTOR_BYTES = 512;
     static final long MIN_INTERVAL_NS = 200_000_000L;
@@ -30,6 +48,7 @@ public final class HostMetrics {
     private static final Path NETDEV = Path.of("/proc/net/dev");
     private static final Path SYS_CLASS_NET = Path.of("/sys/class/net");
     private static final boolean LINUX = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux");
+    private static final Path ETC_HOSTNAME = Path.of("/etc/hostname");
     /** 容器网卡和主机网卡会把同一份流量各记一遍，这些前缀不计入节点流量。 */
     private static final String[] VIRTUAL_PREFIXES = {
             "veth", "docker", "br-", "virbr", "flannel", "cni", "cali", "lxc", "dummy",

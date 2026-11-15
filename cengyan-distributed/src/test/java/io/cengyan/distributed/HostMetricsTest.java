@@ -10,6 +10,13 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** 磁盘和网卡速率只依赖 procfs 文本，不读取本机设备。 */
 class HostMetricsTest {
+    @Test void 主机名不为空且不包含换行() {
+        String name = HostMetrics.hostname();
+        assertNotNull(name);
+        assertFalse(name.isBlank());
+        assertFalse(name.contains("\n"));
+    }
+
     private static final String MOUNTS = """
             31 1 8:0 / / rw - ext4 /dev/sda rw
             25 1 8:1 / /data rw - ext4 /dev/sda1 rw
