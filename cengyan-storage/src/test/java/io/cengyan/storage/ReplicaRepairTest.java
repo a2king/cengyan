@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import java.net.*;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
@@ -25,8 +26,14 @@ class ReplicaRepairTest {
         } finally { for (var socket : reserved) socket.close(); }
         List<StorageServer> servers = new ArrayList<>();
         try (var gateway = new StorageGateway("repair", List.of(addr(ports[1]), addr(ports[3]), addr(ports[5]), addr(ports[7])))) {
-            for (int i = 0; i < 4; i++) servers.add(new StorageServer(new StorageConfig("repair", "s" + i,
-                    addr(ports[2*i+1]), addr(ports[2*i]), home.resolve("s" + i), peers, RaftSettings.defaults(), 8 * 1024 * 1024, 128, 4, 128)));
+            // 本用例由测试显式 reconcile；把后台拓扑间隔拉大，避免 recover() 与测试并发 resume 同一副本任务。
+            for (int i = 0; i < 4; i++) {
+                Path dir = home.resolve("s" + i);
+                Files.createDirectories(dir);
+                Files.writeString(dir.resolve("operations.properties"), "background_interval_ms=86400000\n");
+                servers.add(new StorageServer(new StorageConfig("repair", "s" + i,
+                        addr(ports[2*i+1]), addr(ports[2*i]), dir, peers, RaftSettings.defaults(), 8 * 1024 * 1024, 128, 4, 128)));
+            }
             var catalog = new DistributedCatalog(gateway);
             var graph = catalog.create("create", "G", 1, 3, IdType.STRING, IdType.STRING);
             graph = catalog.addType("type", "G", TypeDefinition.newBuilder().setNode(true).setName("N").build());

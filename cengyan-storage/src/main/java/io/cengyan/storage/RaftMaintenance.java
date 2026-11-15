@@ -18,8 +18,8 @@ import java.time.Duration;
 import java.util.UUID;
 
 /**
- * Raft 数据在重启后由日志和快照恢复，不再比对或丢弃本地文件。
- * 维护模式只暂停写入，并给滚动重启提供“已封存 / 已恢复”的进度。
+ * Raft 数据在重启后直接打开本地库，未刷盘的尾部由 Raft 日志重放。
+ * 维护模式只暂停写入，并给滚动重启提供“已刷盘 / 已恢复”的进度。
  */
 final class RaftMaintenance {
     private static final ObjectMapper JSON = new ObjectMapper();

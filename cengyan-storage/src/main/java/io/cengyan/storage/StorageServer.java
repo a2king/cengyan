@@ -53,17 +53,16 @@ public final class StorageServer implements AutoCloseable {
     private final Object topologyController = new Object();
     private final java.util.concurrent.ConcurrentMap<RaftGroupId, Object> configurationLocks = new java.util.concurrent.ConcurrentHashMap<>();
     private long lastIdempotencyCleanup;
-    private final ThreadPoolExecutor coordinators = new ThreadPoolExecutor(4, 4, 0, TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue<>(256), runnable -> {
-                Thread thread = new Thread(runnable, "storage-coordinator"); thread.setDaemon(true); return thread;
-            }, new ThreadPoolExecutor.AbortPolicy());
+    private final ThreadPoolExecutor coordinators;
+    /** 事务恢复单独跑，不占用协调线程。调度线程只负责按间隔派发。 */
+    private final ThreadPoolExecutor recoveryWorkers;
     private final ScheduledExecutorService recovery = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "storage-transaction-recovery"); t.setDaemon(true); return t;
     });
     private final ScheduledExecutorService topologyRecovery = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "storage-topology-recovery"); t.setDaemon(true); return t;
     });
-    /** Every Storage: seal before a planned restart, compare sealed files after it. */
+    /** Every Storage flushes its local database before a planned restart. */
     private final ScheduledExecutorService maintenance = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "storage-maintenance"); t.setDaemon(true); return t;
     });
@@ -102,6 +101,11 @@ public final class StorageServer implements AutoCloseable {
                     thread.setDaemon(true);
                     return thread;
                 }, new ThreadPoolExecutor.AbortPolicy());
+        coordinators = new ThreadPoolExecutor(config.coordinatorThreads(), config.coordinatorThreads(), 0, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(256), runnable -> {
+                    Thread thread = new Thread(runnable, "storage-coordinator"); thread.setDaemon(true); return thread;
+                }, new ThreadPoolExecutor.AbortPolicy());
+        recoveryWorkers = writePool(config.transactionRecoveryThreads(), "storage-transaction-recovery");
         try {
             rpc = new RpcServer(config.rpcAddress(), config.clusterId(), config.rpcMaxPayload(), config.rpcMaxInflight(), new RpcServer.StreamingService() {
                 @Override public CompletionStage<RpcResponse> handle(RpcRequest request) { return StorageServer.this.handle(request); }
@@ -156,6 +160,7 @@ public final class StorageServer implements AutoCloseable {
             node.close();
             gateway.close();
             recovery.shutdownNow();
+            recoveryWorkers.shutdownNow();
             coordinators.shutdownNow();
             writers.shutdownNow();
             writeParticipants.shutdownNow();
@@ -166,11 +171,12 @@ public final class StorageServer implements AutoCloseable {
             if (dropCleanup != null) dropCleanup.close();
             throw ex;
         }
-        recovery.scheduleWithFixedDelay(this::recoverTransactions, 2000, config.backgroundIntervalMs(), TimeUnit.MILLISECONDS);
+        recovery.scheduleWithFixedDelay(this::recoverTransactions, 2000, config.transactionRecoveryIntervalMs(), TimeUnit.MILLISECONDS);
         maintenance.scheduleWithFixedDelay(() -> {
             try { maintenanceGate.tick(); }
             catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).debug("维护标记等待重试：{}", ex.toString()); }
         }, 1000, 1000, TimeUnit.MILLISECONDS);
+        maintenance.scheduleWithFixedDelay(this::expireImports, 1, 1, TimeUnit.MINUTES);
         coordinators.execute(() -> {
             try {
                 Node local = localDescriptor();
@@ -178,6 +184,7 @@ public final class StorageServer implements AutoCloseable {
                         .addMutations(TransactionEngine.put(TransactionEngine.text("nodes/descriptor/" + config.nodeId()), local.toByteString())).build());
             } catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("节点信息注册暂未成功：{}", ex.toString()); }
         });
+        long topologyInterval = Math.max(2000, config.backgroundIntervalMs());
         topologyRecovery.scheduleWithFixedDelay(() -> {
             if (closed.get()) return;
             try {
@@ -194,7 +201,7 @@ public final class StorageServer implements AutoCloseable {
                     }
                 }
             } catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("后台拓扑任务等待恢复：{}", ex.toString()); }
-        }, 2000, config.backgroundIntervalMs(), TimeUnit.MILLISECONDS);
+        }, topologyInterval, topologyInterval, TimeUnit.MILLISECONDS);
         if (config.metadataMembers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()))) {
             ScheduledFuture<?>[] retry = new ScheduledFuture<?>[1];
             long interval = Math.max(2000, config.backgroundIntervalMs());
@@ -221,6 +228,25 @@ public final class StorageServer implements AutoCloseable {
     private CompletionStage<RpcResponse> handle(RpcRequest request) {
         if (request.getMethod().equals("ping")) return CompletableFuture.completedFuture(response("OK", "", ByteString.EMPTY));
         if (request.getMethod().equals("maintenance.boot")) return CompletableFuture.completedFuture(response("OK", "", ByteString.copyFromUtf8(maintenanceGate.bootId())));
+        if (request.getMethod().equals("maintenance.flush") || request.getMethod().equals("import.finish")) {
+            CompletableFuture<RpcResponse> pending = new CompletableFuture<>();
+            String method = request.getMethod();
+            com.google.protobuf.ByteString body = request.getBody();
+            maintenance.execute(() -> {
+                try {
+                    if (method.equals("maintenance.flush")) {
+                        for (io.cengyan.raft.RocksStateMachine machine : node.importMachines()) machine.flushForRestart();
+                    } else {
+                        var beat = io.cengyan.protocol.proto.ClusterProtocol.ImportHeartbeat.parseFrom(body);
+                        for (io.cengyan.raft.RocksStateMachine machine : node.importMachines()) machine.finishImport(beat.getSessionId());
+                    }
+                    pending.complete(response("OK", "", com.google.protobuf.ByteString.EMPTY));
+                } catch (Exception ex) {
+                    pending.complete(response("FAILED", ex.getMessage() == null ? "存储维护操作失败" : ex.getMessage(), com.google.protobuf.ByteString.EMPTY));
+                }
+            });
+            return pending;
+        }
         SchemaLease lease = request.getContext().hasSchemaLease() ? request.getContext().getSchemaLease() : null;
         if (lease != null) request = request.toBuilder().setContext(request.getContext().toBuilder().clearSchemaLease()).build();
         final RpcRequest inbound = request;
@@ -233,7 +259,7 @@ public final class StorageServer implements AutoCloseable {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout);
         try {
             (inbound.getMethod().equals("tx.execute") ? writers
-                    : inbound.getContext().getGraphId() > 0 && (inbound.getMethod().startsWith("kv.") || inbound.getMethod().equals("data.status")) ? dataRequests
+                    : inbound.getContext().getGraphId() > 0 && (inbound.getMethod().startsWith("kv.") || inbound.getMethod().equals("data.status") || inbound.getMethod().equals("import.stage") || inbound.getMethod().equals("import.heartbeat")) ? dataRequests
                     : inbound.getMethod().startsWith("auth.") || inbound.getMethod().equals("data.configure")
                     || inbound.getMethod().startsWith("metadata.") || inbound.getMethod().startsWith("schema.") ? coordinators : admission).execute(() -> {
                 if (result.isCancelled()) return;
@@ -331,6 +357,8 @@ public final class StorageServer implements AutoCloseable {
                                     var spec = DataGroupSpec.parseFrom(gateway.get(0, 0, StorageGateway.groupKey(graph.getId(), part)));
                                     if (spec.getMembersList().stream().anyMatch(member -> member.getNodeId().equals(target))) throw new ClusterException("NODE_NOT_DRAINED", "节点仍持有分片");
                                 }
+                                var listeners = division.getRaftConf().getCurrentPeers(org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER).stream()
+                                        .filter(peer -> !peer.getId().toString().equals(target)).toList();
                                 var remaining = division.getRaftConf().getCurrentPeers().stream().filter(peer -> !peer.getId().toString().equals(target)).toList();
                                 if (remaining.isEmpty()) throw new ClusterException("NODE_NOT_DRAINED", "不能移除最后一个存储节点");
                                 try (var client = node.client(RaftGroup.valueOf(GroupIds.metadata(config.clusterId()), division.getRaftConf().getAllPeers()))) {
@@ -338,8 +366,9 @@ public final class StorageServer implements AutoCloseable {
                                         var transferred = client.admin().transferLeadership(remaining.getFirst().getId(), 10000);
                                         if (!transferred.isSuccess()) throw new ClusterException("FAILED", "Metadata Leader 转移失败");
                                     }
-                                    if (!client.admin().setConfiguration(remaining, java.util.List.of()).isSuccess()) throw new ClusterException("FAILED", "存储成员移除未确认");
+                                    if (!client.admin().setConfiguration(remaining, listeners).isSuccess()) throw new ClusterException("FAILED", "存储成员移除未确认");
                                 }
+                                clearNodeMarkers(target);
                             }
                         }
                         result.complete(response("OK", "", ByteString.EMPTY)); return;
@@ -372,16 +401,24 @@ public final class StorageServer implements AutoCloseable {
                                 || !joining.getNodeId().matches("[A-Za-z0-9_-]+")) throw new ClusterException("INVALID_ARGUMENT", "加入节点身份无效");
                         synchronized (topologyController) {
                             var voters = new java.util.ArrayList<>(division.getRaftConf().getCurrentPeers());
-                            if (voters.stream().noneMatch(peer -> peer.getId().toString().equals(joining.getNodeId()))) {
-                                var group = RaftGroup.valueOf(GroupIds.metadata(config.clusterId()), division.getRaftConf().getAllPeers());
-                                try (var client = node.client(group)) {
-                                    var staged = client.admin().setConfiguration(voters, java.util.List.of(raftPeer(joining, true)));
-                                    if (!staged.isSuccess()) throw new ClusterException("FAILED", "Metadata learner 加入失败");
-                                    voters.add(raftPeer(joining, false));
-                                    var promoted = client.admin().setConfiguration(voters, java.util.List.of());
-                                    if (!promoted.isSuccess()) throw new ClusterException("FAILED", "Metadata 投票成员加入失败");
+                            var listeners = new java.util.ArrayList<>(division.getRaftConf().getCurrentPeers(org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER));
+                            String joiningId = joining.getNodeId();
+                            boolean voter = voters.removeIf(peer -> peer.getId().toString().equals(joiningId));
+                            boolean listener = listeners.removeIf(peer -> peer.getId().toString().equals(joiningId));
+                            var group = RaftGroup.valueOf(GroupIds.metadata(config.clusterId()), division.getRaftConf().getAllPeers());
+                            try (var client = node.client(group)) {
+                                // 同名节点删掉数据后日志是空的。若成员表里还留着旧身份，先摘掉再作为新成员追快照。
+                                if (voter || listener) {
+                                    if (voters.isEmpty()) throw new ClusterException("FAILED", "不能移除最后一个 Metadata 成员");
+                                    if (!client.admin().setConfiguration(voters, listeners).isSuccess()) throw new ClusterException("FAILED", "重新加入前移除旧 Metadata 成员失败");
                                 }
+                                listeners.add(raftPeer(joining, true));
+                                if (!client.admin().setConfiguration(voters, listeners).isSuccess()) throw new ClusterException("FAILED", "Metadata learner 加入失败");
+                                voters.add(raftPeer(joining, false));
+                                listeners.removeIf(peer -> peer.getId().toString().equals(joiningId));
+                                if (!client.admin().setConfiguration(voters, listeners).isSuccess()) throw new ClusterException("FAILED", "Metadata 投票成员加入失败");
                             }
+                            clearNodeMarkers(joiningId);
                         }
                         result.complete(response("OK", "", ByteString.EMPTY)); return;
                     }
@@ -393,6 +430,26 @@ public final class StorageServer implements AutoCloseable {
                             replicaController.resize(inbound.getContext().getRequestId(), body.path("graph").asText(), body.path("replicas").asInt());
                         }
                         result.complete(response("OK", "", ByteString.EMPTY)); return;
+                    }
+                    if (inbound.getMethod().equals("import.heartbeat")) {
+                        var beat = io.cengyan.protocol.proto.ClusterProtocol.ImportHeartbeat.parseFrom(inbound.getBody());
+                        for (RocksStateMachine machine : node.importMachines()) machine.heartbeatImport(beat.getSessionId());
+                        result.complete(response("OK", "", ByteString.EMPTY));
+                        return;
+                    }
+                    if (inbound.getMethod().equals("import.stage")) {
+                        var chunk = io.cengyan.protocol.proto.ClusterProtocol.ImportChunk.parseFrom(inbound.getBody());
+                        var context = inbound.getContext();
+                        long graphId = chunk.getGraphId() != 0 ? chunk.getGraphId() : context.getGraphId();
+                        int partId = chunk.getGraphId() != 0 ? chunk.getPartId() : context.getPartId();
+                        var division = node.server().getDivision(GroupIds.data(config.clusterId(), graphId, partId));
+                        if (!(division.getStateMachine() instanceof RocksStateMachine machine)) {
+                            result.complete(response("GROUP_UNAVAILABLE", "分片状态机不能接收导入文件", ByteString.EMPTY));
+                            return;
+                        }
+                        machine.stageImport(chunk);
+                        result.complete(response("OK", "", ByteString.EMPTY));
+                        return;
                     }
                     if (inbound.getMethod().equals("data.status")) {
                         var context = inbound.getContext();
@@ -595,7 +652,7 @@ public final class StorageServer implements AutoCloseable {
 
     private com.google.protobuf.ByteString metrics() {
         var json = new com.fasterxml.jackson.databind.ObjectMapper().createObjectNode();
-        json.put("code", "OK").put("nodeId", config.nodeId()).put("role", "STORAGE");
+        json.put("code", "OK").put("nodeId", config.nodeId()).put("hostname", HostMetrics.hostname()).put("role", "STORAGE");
         json.put("dataStorageMode", "raft");
         var memory = ManagementFactory.getMemoryMXBean();
         var threads = ManagementFactory.getThreadMXBean();
@@ -605,6 +662,9 @@ public final class StorageServer implements AutoCloseable {
         json.put("threadCount", threads.getThreadCount());
         json.put("daemonThreadCount", threads.getDaemonThreadCount());
         json.put("writeThreads", config.writeThreads());
+        json.put("coordinatorThreads", config.coordinatorThreads());
+        json.put("transactionRecoveryThreads", config.transactionRecoveryThreads());
+        json.put("transactionRecoveryIntervalMs", config.transactionRecoveryIntervalMs());
         json.put("writeActive", writers.getActiveCount());
         json.put("writeQueued", writers.getQueue().size());
         json.put("writeParticipantActive", writeParticipants.getActiveCount());
@@ -628,7 +688,73 @@ public final class StorageServer implements AutoCloseable {
             json.put("metadataAppliedIndex", metadata.getInfo().getLastAppliedIndex());
             if (metadata.getInfo().getLeaderId() != null) json.put("metadataLeaderId", metadata.getInfo().getLeaderId().toString());
         } catch (Exception ignored) { }
+        appendShards(json);
         return com.google.protobuf.ByteString.copyFromUtf8(json.toString());
+    }
+
+    /** 本机 Metadata 状态机里的分片身份，加上本机 Raft 进度。不向其他 Storage 发请求。 */
+    private void appendShards(com.fasterxml.jackson.databind.node.ObjectNode json) {
+        var shards = json.putArray("shards");
+        try {
+            var metadata = node.server().getDivision(GroupIds.metadata(config.clusterId()));
+            if (!(metadata.getStateMachine() instanceof RocksStateMachine rocks)) return;
+            var names = new java.util.HashMap<Long, String>();
+            scan(rocks, "catalog/graph/", entry -> {
+                try {
+                    GraphDefinition graph = GraphDefinition.parseFrom(entry.getValue());
+                    if (!"DROPPED".equals(graph.getState())) names.put(graph.getId(), graph.getName());
+                } catch (Exception ignored) { }
+            });
+            var hosted = new java.util.HashSet<RaftGroupId>();
+            for (var id : node.server().getGroupIds()) hosted.add(id);
+            scan(rocks, "catalog/group/", entry -> {
+                try {
+                    DataGroupSpec spec = DataGroupSpec.parseFrom(entry.getValue());
+                    if (spec.getGraphId() <= 0) return;
+                    RaftGroupId id = GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId());
+                    if (!hosted.contains(id)) return;
+                    var division = node.server().getDivision(id);
+                    var info = division.getInfo();
+                    var shard = shards.addObject();
+                    shard.put("graphId", spec.getGraphId());
+                    shard.put("graph", names.getOrDefault(spec.getGraphId(), ""));
+                    shard.put("partId", spec.getPartId());
+                    shard.put("term", info.getCurrentTerm());
+                    shard.put("appliedIndex", info.getLastAppliedIndex());
+                    if (info.getLeaderId() != null) shard.put("leaderId", info.getLeaderId().toString());
+                    shard.put("leader", info.isLeader());
+                    var members = shard.putArray("members");
+                    for (var peer : division.getRaftConf().getCurrentPeers()) members.add(peer.getId().toString());
+                } catch (Exception ignored) { }
+            });
+        } catch (Exception ignored) { }
+    }
+
+    private void scan(RocksStateMachine rocks, String prefix, java.util.function.Consumer<KeyValue> consumer) throws Exception {
+        String cursor = "";
+        ByteString after = ByteString.EMPTY;
+        boolean more = false;
+        try {
+            for (int page = 0; page < 50; page++) {
+                var key = ReadKey.newBuilder().setKey(ByteString.copyFromUtf8(prefix)).setScan(true).setLimit(200).setMaxBytes(1024 * 1024);
+                if (cursor.isEmpty()) key.setScanId(java.util.UUID.randomUUID().toString());
+                else key.setCursorId(cursor).setAfterKey(after);
+                var reply = rocks.query(RocksStateMachine.message(key.build().toByteArray())).get(500, TimeUnit.MILLISECONDS);
+                ScanPage scanned = ScanPage.parseFrom(reply.getContent().toByteArray());
+                for (var entry : scanned.getEntriesList()) consumer.accept(entry);
+                more = scanned.getMore();
+                if (!more) return;
+                cursor = scanned.getCursorId();
+                after = scanned.getLastKey();
+            }
+        } finally {
+            if (more && !cursor.isEmpty()) {
+                try {
+                    rocks.query(RocksStateMachine.message(ReadKey.newBuilder().setCloseCursor(true).setCursorId(cursor).build().toByteArray()))
+                            .get(500, TimeUnit.MILLISECONDS);
+                } catch (Exception ignored) { }
+            }
+        }
     }
     private Node localDescriptor() {
         return Node.newBuilder().setClusterId(config.clusterId()).setNodeId(config.nodeId()).setRole(NodeRole.STORAGE)
@@ -653,75 +779,107 @@ public final class StorageServer implements AutoCloseable {
         } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "成员变更任务损坏", ex); }
     }
 
+    /** 超过 30 分钟没有心跳的导入会话，删除各分片上的暂存文件。 */
+    private void expireImports() {
+        if (closed.get()) return;
+        long now = System.currentTimeMillis();
+        for (RocksStateMachine machine : node.importMachines()) {
+            try { machine.expireImports(now); }
+            catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).debug("导入暂存清理等待重试：{}", ex.toString()); }
+        }
+    }
+
     private void recoverTransactions() {
         if (closed.get()) return;
         boolean purgeDue = System.currentTimeMillis() - lastIdempotencyCleanup > TimeUnit.MINUTES.toMillis(5);
+        var leaders = new ArrayList<org.apache.ratis.protocol.RaftGroupId>();
         try {
             for (var groupId : node.server().getGroupIds()) {
-                var division = node.server().getDivision(groupId);
-                if (!division.getInfo().isLeader()) continue;
-                var read = ReadKey.newBuilder().setKey(TransactionEngine.TX_PREFIX).setScan(true).setLimit(100).setMaxBytes(7 * 1024 * 1024).build();
-                ByteString after = ByteString.EMPTY;
-                String cursor = "";
-                do {
-                    var request = RaftClientRequest.newBuilder().setClientId(clientId).setServerId(node.server().getId()).setGroupId(groupId)
-                            .setCallId(calls.incrementAndGet()).setType(RaftClientRequest.readRequestType()).setTimeoutMs(5000)
-                            .setMessage(RocksStateMachine.message(read.toBuilder().setAfterKey(after).setCursorId(cursor).build().toByteArray())).build();
-                    var reply = node.server().submitClientRequestAsync(request).get(5, TimeUnit.SECONDS);
-                    if (!reply.isSuccess()) break;
-                    ScanPage page = ScanPage.parseFrom(reply.getMessage().getContent().toByteArray());
-                    for (var row : page.getEntriesList()) {
-                        TransactionRecord record = TransactionRecord.parseFrom(row.getValue());
-                        if (!record.getFinalized() && TransactionEngine.acquire(record.getPlan().getTransactionId())) {
-                            try { transactions.resume(record); }
-                            finally { TransactionEngine.release(record.getPlan().getTransactionId()); }
-                        }
-                        else if (record.getPlan().getParticipantsCount() > 0) versions.collect(record, System.currentTimeMillis());
-                    }
-                    if (!page.getMore()) break;
-                    after = page.getLastKey();
-                    cursor = page.getCursorId();
-                } while (!closed.get());
-                ByteString gcAfter = ByteString.EMPTY;
-                String gcCursor = "";
-                do {
-                    var request = RaftClientRequest.newBuilder().setClientId(clientId).setServerId(node.server().getId()).setGroupId(groupId)
-                            .setCallId(calls.incrementAndGet()).setType(RaftClientRequest.readRequestType()).setTimeoutMs(5000)
-                            .setMessage(RocksStateMachine.message(ReadKey.newBuilder().setKey(TransactionEngine.TX_GC_PREFIX).setScan(true)
-                                    .setLimit(100).setMaxBytes(1024 * 1024).setAfterKey(gcAfter).setCursorId(gcCursor).build().toByteArray())).build();
-                    var reply = node.server().submitClientRequestAsync(request).get(5, TimeUnit.SECONDS);
-                    if (!reply.isSuccess()) break;
-                    ScanPage page = ScanPage.parseFrom(reply.getMessage().getContent().toByteArray());
-                    for (var row : page.getEntriesList()) versions.collect(TransactionRecord.parseFrom(row.getValue()), System.currentTimeMillis());
-                    if (!page.getMore()) break;
-                    gcAfter = page.getLastKey();
-                    gcCursor = page.getCursorId();
-                } while (!closed.get());
-                ByteString deleteAfter = ByteString.EMPTY;
-                String deleteCursor = "";
-                do {
-                    var request = RaftClientRequest.newBuilder().setClientId(clientId).setServerId(node.server().getId()).setGroupId(groupId)
-                            .setCallId(calls.incrementAndGet()).setType(RaftClientRequest.readRequestType()).setTimeoutMs(5000)
-                            .setMessage(RocksStateMachine.message(ReadKey.newBuilder().setKey(TransactionEngine.text("__delete/")).setScan(true)
-                                    .setLimit(100).setMaxBytes(4 * 1024 * 1024).setAfterKey(deleteAfter).setCursorId(deleteCursor).build().toByteArray())).build();
-                    var reply = node.server().submitClientRequestAsync(request).get(5, TimeUnit.SECONDS);
-                    if (!reply.isSuccess()) break;
-                    ScanPage page = ScanPage.parseFrom(reply.getMessage().getContent().toByteArray());
-                    for (var row : page.getEntriesList()) {
-                        DeleteTask task = DeleteTask.parseFrom(row.getValue());
-                        if (!task.getCompleted()) new DistributedGraph(gateway).resumeDelete(task);
-                    }
-                    if (!page.getMore()) break;
-                    deleteAfter = page.getLastKey();
-                    deleteCursor = page.getCursorId();
-                } while (!closed.get());
-                if (purgeDue) {
-                    cleanupIdempotency(groupId);
-                }
+                if (node.server().getDivision(groupId).getInfo().isLeader()) leaders.add(groupId);
             }
+        } catch (Exception ex) {
+            org.slf4j.LoggerFactory.getLogger(StorageServer.class).debug("事务恢复等待下次重试：{}", ex.toString());
+            return;
+        }
+        if (leaders.isEmpty()) {
             if (purgeDue) lastIdempotencyCleanup = System.currentTimeMillis();
-        } catch (InterruptedException ex) { Thread.currentThread().interrupt(); }
-        catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).debug("事务恢复等待下次重试：{}", ex.toString()); }
+            return;
+        }
+        var done = new CountDownLatch(leaders.size());
+        for (var groupId : leaders) {
+            try {
+                recoveryWorkers.execute(() -> {
+                    try { recoverGroup(groupId, purgeDue); }
+                    catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).debug("分片事务恢复等待下次重试：{}", ex.toString()); }
+                    finally { done.countDown(); }
+                });
+            } catch (RejectedExecutionException ex) { done.countDown(); }
+        }
+        try { done.await(); }
+        catch (InterruptedException ex) { Thread.currentThread().interrupt(); return; }
+        if (purgeDue) lastIdempotencyCleanup = System.currentTimeMillis();
+    }
+
+    private void recoverGroup(org.apache.ratis.protocol.RaftGroupId groupId, boolean purgeDue) throws Exception {
+        var read = ReadKey.newBuilder().setKey(TransactionEngine.TX_PREFIX).setScan(true).setLimit(100).setMaxBytes(7 * 1024 * 1024).build();
+        ByteString after = ByteString.EMPTY;
+        String cursor = "";
+        do {
+            if (closed.get()) return;
+            var request = RaftClientRequest.newBuilder().setClientId(clientId).setServerId(node.server().getId()).setGroupId(groupId)
+                    .setCallId(calls.incrementAndGet()).setType(RaftClientRequest.readRequestType()).setTimeoutMs(5000)
+                    .setMessage(RocksStateMachine.message(read.toBuilder().setAfterKey(after).setCursorId(cursor).build().toByteArray())).build();
+            var reply = node.server().submitClientRequestAsync(request).get(5, TimeUnit.SECONDS);
+            if (!reply.isSuccess()) break;
+            ScanPage page = ScanPage.parseFrom(reply.getMessage().getContent().toByteArray());
+            for (var row : page.getEntriesList()) {
+                TransactionRecord record = TransactionRecord.parseFrom(row.getValue());
+                if (!record.getFinalized() && TransactionEngine.acquire(record.getPlan().getTransactionId())) {
+                    try { transactions.resume(record); }
+                    finally { TransactionEngine.release(record.getPlan().getTransactionId()); }
+                }
+                else if (record.getPlan().getParticipantsCount() > 0) versions.collect(record, System.currentTimeMillis());
+            }
+            if (!page.getMore()) break;
+            after = page.getLastKey();
+            cursor = page.getCursorId();
+        } while (!closed.get());
+        ByteString gcAfter = ByteString.EMPTY;
+        String gcCursor = "";
+        do {
+            if (closed.get()) return;
+            var request = RaftClientRequest.newBuilder().setClientId(clientId).setServerId(node.server().getId()).setGroupId(groupId)
+                    .setCallId(calls.incrementAndGet()).setType(RaftClientRequest.readRequestType()).setTimeoutMs(5000)
+                    .setMessage(RocksStateMachine.message(ReadKey.newBuilder().setKey(TransactionEngine.TX_GC_PREFIX).setScan(true)
+                            .setLimit(100).setMaxBytes(1024 * 1024).setAfterKey(gcAfter).setCursorId(gcCursor).build().toByteArray())).build();
+            var reply = node.server().submitClientRequestAsync(request).get(5, TimeUnit.SECONDS);
+            if (!reply.isSuccess()) break;
+            ScanPage page = ScanPage.parseFrom(reply.getMessage().getContent().toByteArray());
+            for (var row : page.getEntriesList()) versions.collect(TransactionRecord.parseFrom(row.getValue()), System.currentTimeMillis());
+            if (!page.getMore()) break;
+            gcAfter = page.getLastKey();
+            gcCursor = page.getCursorId();
+        } while (!closed.get());
+        ByteString deleteAfter = ByteString.EMPTY;
+        String deleteCursor = "";
+        do {
+            if (closed.get()) return;
+            var request = RaftClientRequest.newBuilder().setClientId(clientId).setServerId(node.server().getId()).setGroupId(groupId)
+                    .setCallId(calls.incrementAndGet()).setType(RaftClientRequest.readRequestType()).setTimeoutMs(5000)
+                    .setMessage(RocksStateMachine.message(ReadKey.newBuilder().setKey(TransactionEngine.text("__delete/")).setScan(true)
+                            .setLimit(100).setMaxBytes(4 * 1024 * 1024).setAfterKey(deleteAfter).setCursorId(deleteCursor).build().toByteArray())).build();
+            var reply = node.server().submitClientRequestAsync(request).get(5, TimeUnit.SECONDS);
+            if (!reply.isSuccess()) break;
+            ScanPage page = ScanPage.parseFrom(reply.getMessage().getContent().toByteArray());
+            for (var row : page.getEntriesList()) {
+                DeleteTask task = DeleteTask.parseFrom(row.getValue());
+                if (!task.getCompleted()) new DistributedGraph(gateway).resumeDelete(task);
+            }
+            if (!page.getMore()) break;
+            deleteAfter = page.getLastKey();
+            deleteCursor = page.getCursorId();
+        } while (!closed.get());
+        if (purgeDue) cleanupIdempotency(groupId);
     }
     private void cleanupIdempotency(org.apache.ratis.protocol.RaftGroupId groupId) throws Exception {
         ByteString after = ByteString.EMPTY; String cursor = "";
@@ -780,12 +938,27 @@ public final class StorageServer implements AutoCloseable {
         node.addGroup(RaftGroup.valueOf(GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId()), peers));
     }
 
+    /** 删掉节点后清掉排空、描述和离线标记，同名节点才能再次加入并接收副本。 */
+    private void clearNodeMarkers(String nodeId) {
+        for (String prefix : java.util.List.of("nodes/draining/", "nodes/descriptor/", "health/offline/")) {
+            ByteString key = TransactionEngine.text(prefix + nodeId);
+            ByteString current = gateway.get(0, 0, key);
+            if (current == null) continue;
+            try {
+                gateway.write(0, 0, StorageGateway.batch("node.forget/" + nodeId + "/" + prefix)
+                        .addConditions(StorageGateway.condition(key, current))
+                        .addMutations(Mutation.newBuilder().setKey(key).setDelete(true)).build());
+            } catch (ClusterException ex) {
+                if (!ex.code().equals("WRITE_CONFLICT")) throw ex;
+            }
+        }
+    }
+
     private void removeGroup(RpcRequest request) throws IOException {
         DataGroupSpec spec = DataGroupSpec.parseFrom(request.getBody());
         if (spec.getGraphId() <= 0 || spec.getPartId() < 0) throw new IllegalArgumentException("Data Group 身份无效");
         if (!dropCleanup.graphDropped(spec.getGraphId())) throw new ClusterException("GRAPH_STATE", "只能清理已经删除的图");
-        if (dropCleanup.leaseRetained(spec.getGraphId())) throw new ClusterException("BUSY", "Schema 租约未结束，稍后再清理数据目录");
-        // 只卸下 Group 并改名。清空文件由后台按带宽继续，避免这次 RPC 被大目录拖超时。
+        // 只卸下 Group 并改名。清空文件由后台立刻继续，避免这次 RPC 被大目录拖超时。
         node.detachDataGroup(GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId()));
     }
     private static RaftPeer raftPeer(Node member, boolean learner) {
@@ -830,6 +1003,7 @@ public final class StorageServer implements AutoCloseable {
         maintenance.shutdownNow();
         joining.shutdownNow();
         recovery.shutdownNow();
+        recoveryWorkers.shutdownNow();
         topologyRecovery.shutdownNow();
         coordinators.shutdownNow();
         writers.shutdownNow();
@@ -840,6 +1014,7 @@ public final class StorageServer implements AutoCloseable {
         try {
             maintenance.awaitTermination(10, TimeUnit.SECONDS);
             recovery.awaitTermination(10, TimeUnit.SECONDS);
+            recoveryWorkers.awaitTermination(10, TimeUnit.SECONDS);
             topologyRecovery.awaitTermination(10, TimeUnit.SECONDS);
             coordinators.awaitTermination(10, TimeUnit.SECONDS);
             writers.awaitTermination(10, TimeUnit.SECONDS);

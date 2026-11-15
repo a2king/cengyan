@@ -66,7 +66,11 @@ class StorageServerTest {
                 data_dir=node-data
                 """);
         var config = StorageConfig.load(file);
-        assertEquals(10, config.writeThreads());
+        assertEquals(8, config.writeThreads());
+        assertEquals(4, config.admissionThreads());
+        assertEquals(32, config.coordinatorThreads());
+        assertEquals(4, config.transactionRecoveryThreads());
+        assertEquals(60_000, config.transactionRecoveryIntervalMs());
         assertEquals(64 * 1024 * 1024, config.rpcMaxPayload());
         assertEquals(16 * 1024 * 1024, io.cengyan.distributed.TransactionEngine.planMaxBytes());
         assertFalse(config.rebuildData());

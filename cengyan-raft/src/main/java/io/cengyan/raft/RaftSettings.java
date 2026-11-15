@@ -19,7 +19,7 @@ public record RaftSettings(long segmentBytes, long snapshotEntries, long retaine
         }
     }
 
-    public static RaftSettings defaults() { return new RaftSettings(16L * 1024 * 1024, 2_000, 1_000, 2); }
+    public static RaftSettings defaults() { return new RaftSettings(16L * 1024 * 1024, 2_000, 1_000, 1); }
 
     public RaftProperties properties(Path directory, String host, int port) {
         RaftProperties properties = new RaftProperties();
@@ -42,6 +42,8 @@ public record RaftSettings(long segmentBytes, long snapshotEntries, long retaine
         RaftServerConfigKeys.Log.setQueueByteLimit(properties, SizeInBytes.valueOf(32L * 1024 * 1024));
         RaftServerConfigKeys.Log.Appender.setSnapshotChunkSizeMax(properties, SizeInBytes.valueOf(256 * 1024));
         RaftServerConfigKeys.setStagingCatchupGap(properties, 1);
+        // 两节点删掉其中一个、或删掉后用同一节点 ID 再加入，都会改变多数派，必须允许。
+        RaftServerConfigKeys.LeaderElection.setMemberMajorityAdd(properties, true);
         RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(properties, true);
         RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(properties, snapshotEntries);
         RaftServerConfigKeys.Snapshot.setRetentionFileNum(properties, retainedSnapshots);

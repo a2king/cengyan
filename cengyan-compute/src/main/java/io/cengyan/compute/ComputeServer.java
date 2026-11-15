@@ -22,6 +22,8 @@ import io.netty.handler.codec.LineBasedFrameDecoder;
 import io.netty.handler.codec.string.*;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import org.apache.ratis.protocol.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
@@ -36,6 +38,7 @@ import java.util.concurrent.atomic.*;
 /** 独立 Compute：外部 JSON 接入、内部代理、单查询单执行节点、本地临时文件。 */
 public final class ComputeServer implements AutoCloseable {
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final Logger log = LoggerFactory.getLogger(ComputeServer.class);
     private final ComputeConfig config;
     private final StorageGateway storage;
     private final DistributedCatalog catalog;
@@ -108,10 +111,10 @@ public final class ComputeServer implements AutoCloseable {
                                 @Override protected void channelRead0(ChannelHandlerContext ctx, String line) {
                                     clientRequests.incrementAndGet();
                                     clientBytesIn.addAndGet(line.getBytes(StandardCharsets.UTF_8).length);
-                                    try {
-                                        JsonNode parsed = JSON.readTree(line);
+                     try {
+                                         JsonNode parsed = JSON.readTree(line);
                                         if (!parsed.isObject()) throw new IllegalArgumentException("请求必须为 JSON 对象");
-                                        CompletableFuture<ObjectNode> response = external((ObjectNode) parsed);
+                                         CompletableFuture<ObjectNode> response = external((ObjectNode) parsed);
                                         outstanding.add(response);
                                         response.whenComplete((result, error) -> {
                                             outstanding.remove(response);
@@ -275,7 +278,11 @@ public final class ComputeServer implements AutoCloseable {
                     request.remove(List.of("token", "session"));
                     String id = request.path("requestId").asText(UUID.randomUUID().toString());
                     if (!id.matches("[A-Za-z0-9_-]{1,120}")) throw new ClusterException("INVALID_ARGUMENT", "requestId 格式无效");
-                    request.put("requestId", id);
+                     request.put("requestId", id);
+                     String queryText = request.path("query").asText("");
+                     log.info("请求开始 requestId={} op={} graph={} write={} timeoutMs={} query={}", id, op,
+                             request.path("graph").asText(""), write, Math.max(1, TimeUnit.NANOSECONDS.toMillis(ingressDeadline - System.nanoTime())),
+                             queryText.length() > 8192 ? queryText.substring(0, 8192) + "...(truncated)" : queryText);
                     if (request.path("query").asText().stripLeading().toUpperCase(Locale.ROOT).startsWith("USE ")) {
                         var statements = Gql.parseAll(request.path("query").asText());
                         if (statements.size() == 1 && statements.getFirst() instanceof Stmt.Use use) request.put("graph", use.name());
@@ -287,7 +294,7 @@ public final class ComputeServer implements AutoCloseable {
                     long remainingNanos = deadline - System.nanoTime();
                     if (remainingNanos <= 0) throw new ClusterException("QUERY_TIMEOUT", "请求在入口校验期间已超时");
                     if (request.hasNonNull("graph") && !request.path("graph").asText().isBlank()
-                            && !op.equals("createGraph") && !(op.equals("execute") && request.path("query").asText().stripLeading().toUpperCase(Locale.ROOT).startsWith("CREATE GRAPH"))) {
+                            && requiresCurrentGraph(op, request.path("query").asText(""))) {
                         String graphName = request.path("graph").asText();
                         // 建表会推进 schema 版本。只有不会改 schema 的批量写入才复用租约。
                         if (!op.equals("bulkInsert")) schemaLeases.remove(graphName);
@@ -307,11 +314,28 @@ public final class ComputeServer implements AutoCloseable {
                                     .put("message", unknownWrite ? "写请求等待超过截止时间，提交状态无法确认，Storage 将继续完成提交或回滚" : outcome.message()));
                         }
                     });
-                    response.whenComplete((done, failure) -> { if (response.isCancelled()) queue.cancel(ticket); });
-                } catch (Throwable ex) { response.complete(error(ex)); }
+                     response.whenComplete((done, failure) -> {
+                         if (response.isCancelled()) queue.cancel(ticket);
+                         String code = failure == null && done != null ? done.path("code").asText("") : "EXCEPTION";
+                         log.info("请求结束 requestId={} op={} code={} elapsedMs={}", id, op, code,
+                                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - receivedAt));
+                     });
+                 } catch (Throwable ex) {
+                     log.warn("请求入口失败 op={} requestId={} message={}", original.path("op").asText(""),
+                             original.path("requestId").asText(""), ex.toString());
+                     response.complete(error(ex));
+                 }
             });
         } catch (RejectedExecutionException ex) { response.complete(JSON.createObjectNode().put("code", "BUSY").put("message", "入口接纳队列已满")); }
         return response;
+    }
+
+    /** 目录语句不读取当前图。会话里残留的已删除图不能挡住建图和列表刷新。 */
+    static boolean requiresCurrentGraph(String op, String query) {
+        if ("createGraph".equals(op)) return false;
+        if (!"execute".equals(op)) return true;
+        String text = query == null ? "" : query.stripLeading().toUpperCase(Locale.ROOT);
+        return !(text.startsWith("CREATE GRAPH") || text.startsWith("SHOW GRAPHS") || text.startsWith("SHOW ALIASES"));
     }
 
     private final ConcurrentMap<String, SchemaLease> schemaLeases = new ConcurrentHashMap<>();
@@ -515,6 +539,9 @@ public final class ComputeServer implements AutoCloseable {
                     IdType.valueOf(request.path("vertexIdType").asText("INT64")), IdType.valueOf(request.path("edgeIdType").asText("INT64")));
             return ok().put("graphId", definition.getId()).put("rowsAffected", 1);
         }
+        if (op.equals("importPlan") || op.equals("importStage") || op.equals("importCommit") || op.equals("importHeartbeat") || op.equals("importFinish")) {
+            return new BulkImport(storage, catalog, graph).handle(request);
+        }
         if (op.equals("bulkTopology")) return bulkTopology(graphName);
         if (op.equals("bulkInsert")) {
             if (!Set.of("node", "edge").contains(request.path("kind").asText()) || !request.path("rows").isArray()
@@ -681,6 +708,7 @@ public final class ComputeServer implements AutoCloseable {
     private ObjectNode opsMetrics() {
         ObjectNode result = ok();
         result.put("nodeId", config.nodeId());
+        result.put("hostname", HostMetrics.hostname());
         result.put("role", "COMPUTE");
         result.set("slots", JSON.valueToTree(slots.load()));
         result.put("queuePending", queue.pending());

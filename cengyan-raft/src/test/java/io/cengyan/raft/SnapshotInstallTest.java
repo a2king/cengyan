@@ -51,4 +51,43 @@ class SnapshotInstallTest {
             }
         }
     }
+
+    @Test @Timeout(90)
+    void 重启直接打开原库而不是再复制一份快照() throws Exception {
+        int port;
+        try (var socket = new ServerSocket(0)) { port = socket.getLocalPort(); }
+        RaftPeer peer = RaftPeer.newBuilder().setId("s1").setAddress("127.0.0.1:" + port).build();
+        var id = GroupIds.data("reopen", 1, 0);
+        var group = RaftGroup.valueOf(id, peer);
+        var settings = new RaftSettings(1024 * 1024, 10, 0, 1);
+        Path root = home.resolve("reopen");
+        try (var node = new RaftNode("reopen", "s1", "127.0.0.1", port, root, group, settings);
+             var client = node.client(group)) {
+            var write = WriteBatch.newBuilder().setRequestId("once").setExpiresAtMs(2_000_000_000_000L)
+                    .addMutations(Mutation.newBuilder().setKey(ByteString.copyFromUtf8("key")).setValue(ByteString.copyFromUtf8("kept"))).build();
+            assertTrue(client.io().send(RocksStateMachine.message(write.toByteArray())).isSuccess());
+            assertTrue(node.server().getDivision(id).getStateMachine().takeSnapshot() > 0);
+        }
+        Path dbSst = null;
+        Path snapSst = null;
+        try (var files = java.nio.file.Files.walk(root)) {
+            for (Path path : files.toList()) {
+                String name = path.getFileName().toString();
+                assertFalse(name.startsWith("snapshot.") || name.startsWith("work-"), "不再保留整库 zip 或第二份工作目录");
+                if (!name.endsWith(".sst") || path.getParent() == null) continue;
+                String parent = path.getParent().getFileName().toString();
+                if (parent.equals("db")) dbSst = path;
+                if (parent.startsWith("snap-")) snapSst = path;
+            }
+        }
+        if (dbSst != null && snapSst != null) {
+            assertEquals(java.nio.file.Files.getAttribute(dbSst, "basic:fileKey"), java.nio.file.Files.getAttribute(snapSst, "basic:fileKey"),
+                    "快照应与工作库共享 SST，而不是再复制一份");
+        }
+        try (var node = new RaftNode("reopen", "s1", "127.0.0.1", port, root, group, settings)) {
+            var read = node.server().getDivision(id).getStateMachine().query(RocksStateMachine.message(
+                    ReadKey.newBuilder().setKey(ByteString.copyFromUtf8("key")).build().toByteArray())).join();
+            assertEquals("kept", StoredValue.parseFrom(read.getContent().toByteArray()).getValue().toStringUtf8());
+        }
+    }
 }

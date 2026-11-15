@@ -76,7 +76,31 @@ message WriteBatch {
   repeated string purge_request_ids = 5;
   uint64 purge_before_ms = 6;
   uint64 controller_epoch = 7;
+  // 行数据在副本本地的 SST 里。日志只记录校验和，重放时按校验和跳过已摄入的文件。
+  ImportDirective import_file = 8;
 }
+enum ImportConflict {
+  IMPORT_CONFLICT_UNSPECIFIED = 0;
+  IMPORT_IGNORE = 1;
+  IMPORT_REPLACE = 2;
+  IMPORT_ERROR = 3;
+}
+message ImportDirective {
+  bytes checksum = 1;
+  ImportConflict conflict = 2;
+  bool undo = 3;
+  uint64 generation = 4;
+}
+message ImportChunk {
+  bytes checksum = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool last = 4;
+  string session_id = 5;
+  uint64 graph_id = 6;
+  uint32 part_id = 7;
+}
+message ImportHeartbeat { string session_id = 1; }
 message ReadKey {
   bytes key = 1;
   bool scan = 2;
@@ -192,6 +216,9 @@ message GraphDefinition {
   uint64 write_epoch = 12;
   string comment = 13;
   string data_mode = 14;
+  // 建图时选定的主键长度。0 表示未指定，节点类型沿用 INT64=19、STRING=4096。
+  uint32 vertex_id_length = 15;
+  uint32 edge_id_length = 16;
 }
 message TypeDefinition {
   string name = 1;

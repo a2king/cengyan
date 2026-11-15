@@ -137,9 +137,21 @@ public final class RaftNode implements AutoCloseable {
                         TimeDuration.valueOf(100, TimeUnit.MILLISECONDS))).build();
     }
 
+    /** 先拒绝这个分片上新的导入和查询，再进入卸下。重复调用没有副作用。 */
+    public void prepareDrop(RaftGroupId groupId) throws IOException {
+        if (groupId == null) return;
+        RocksStateMachine machine = machines.get(groupId);
+        if (machine == null && hosts(groupId)) {
+            var stateMachine = server.getDivision(groupId).getStateMachine();
+            if (stateMachine instanceof RocksStateMachine rocks) machine = rocks;
+        }
+        if (machine != null) machine.beginDrop();
+    }
+
     /**
      * 卸下本机 Data Group，并把目录改名为 {@code raft/dropped-<uuid>}。
-     * 改名只动目录项，不等待清空文件。调用方必须已经把图标记为 DROPPED，并确认 Schema 租约结束。
+     * 先拒绝新的导入和查询，再关闭状态机，等文件句柄放开后才改名。改名不等待清空文件。
+     * 调用方必须已经把图标记为 DROPPED。整图删除不等 Schema 租约。
      * @return 等待后台删除的隔离目录；本机没有这份数据时为空
      */
     public synchronized Optional<Path> detachDataGroup(RaftGroupId groupId) throws IOException {
@@ -147,6 +159,11 @@ public final class RaftNode implements AutoCloseable {
             throw new IllegalArgumentException("拒绝删除 Metadata 或 Compute Group");
         }
         RocksStateMachine machine = machines.get(groupId);
+        prepareDrop(groupId);
+        if (machine == null && hosts(groupId)) {
+            var stateMachine = server.getDivision(groupId).getStateMachine();
+            if (stateMachine instanceof RocksStateMachine rocks) machine = rocks;
+        }
         if (hosts(groupId)) {
             var division = server.getDivision(groupId);
             var group = RaftGroup.valueOf(groupId, division.getRaftConf().getAllPeers());
@@ -207,9 +224,8 @@ public final class RaftNode implements AutoCloseable {
         return found;
     }
 
-    /** 按字节速率清空一个隔离目录。{@code stop} 为真时保留剩余文件，下次继续。 */
-    public void deleteQuarantined(Path directory, long bytesPerSecond, BooleanSupplier stop) throws IOException, InterruptedException {
-        if (bytesPerSecond < 1) throw new IllegalArgumentException("删除带宽必须为正数");
+    /** 立刻清空一个已关闭的隔离目录。{@code stop} 为真时保留剩余文件，下次继续。 */
+    public void deleteQuarantined(Path directory, BooleanSupplier stop) throws IOException, InterruptedException {
         Path raftRoot = raftRoot();
         Path target = directory.toAbsolutePath().normalize();
         if (target.getParent() == null || !target.getParent().equals(raftRoot)) throw new IOException("拒绝删除 Raft 根目录之外的路径");
@@ -220,11 +236,14 @@ public final class RaftNode implements AutoCloseable {
             forgetPending(name);
             return;
         }
-        deleteSlowly(target, bytesPerSecond, stop == null ? () -> false : stop, new DeletionPace());
+        deleteTree(target, stop == null ? () -> false : stop);
         if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) forgetPending(name);
     }
 
     public RaftServer server() { return server; }
+
+    /** 本进程已经打开的分片状态机。导入心跳和暂存清理会逐个访问。 */
+    public java.util.Collection<RocksStateMachine> importMachines() { return java.util.List.copyOf(machines.values()); }
 
     private Optional<Path> quarantine(RaftGroupId groupId) throws IOException {
         Path raftRoot = raftRoot();
@@ -319,7 +338,7 @@ public final class RaftNode implements AutoCloseable {
 
     private Path raftRoot() { return storageRoot.resolve("raft").toAbsolutePath().normalize(); }
 
-    private static void deleteSlowly(Path path, long bytesPerSecond, BooleanSupplier stop, DeletionPace pace) throws IOException, InterruptedException {
+    private static void deleteTree(Path path, BooleanSupplier stop) throws IOException, InterruptedException {
         if (stop.getAsBoolean() || Thread.currentThread().isInterrupted()) throw new InterruptedException();
         if (Files.isSymbolicLink(path)) {
             Files.deleteIfExists(path);
@@ -328,31 +347,12 @@ public final class RaftNode implements AutoCloseable {
         if (Files.isDirectory(path)) {
             List<Path> children;
             try (var listed = Files.list(path)) { children = listed.toList(); }
-            for (Path child : children) deleteSlowly(child, bytesPerSecond, stop, pace);
+            for (Path child : children) deleteTree(child, stop);
             if (stop.getAsBoolean()) throw new InterruptedException();
             Files.deleteIfExists(path);
             return;
         }
-        long size = 0;
-        try { size = Files.size(path); } catch (IOException ignored) { /* 文件在删除前消失时按 0 字节计。 */ }
         Files.deleteIfExists(path);
-        pace.account(size, bytesPerSecond);
-    }
-
-    /** 把一秒钟内的删除量限制在配置带宽内。单个大文件无法拆开，超限后下一秒再继续。 */
-    private static final class DeletionPace {
-        private long windowStart = System.nanoTime();
-        private long windowBytes;
-        void account(long size, long bytesPerSecond) throws InterruptedException {
-            if (size <= 0) return;
-            windowBytes += size;
-            long elapsed = System.nanoTime() - windowStart;
-            if (windowBytes < bytesPerSecond && elapsed < 1_000_000_000L) return;
-            long sleep = 1_000_000_000L - elapsed;
-            if (windowBytes >= bytesPerSecond && sleep > 0) TimeUnit.NANOSECONDS.sleep(sleep);
-            windowStart = System.nanoTime();
-            windowBytes = 0;
-        }
     }
 
     private static void deleteDataDirectory(Path root) throws IOException {

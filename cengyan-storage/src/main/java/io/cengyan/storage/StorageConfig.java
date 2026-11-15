@@ -15,7 +15,14 @@ import java.util.*;
 public record StorageConfig(String clusterId, String nodeId, InetSocketAddress rpcAddress,
                             InetSocketAddress raftAddress, Path directory, List<RaftPeer> metadataMembers,
                             RaftSettings raftSettings, int rpcMaxPayload, int rpcMaxInflight, int admissionThreads, int admissionQueue,
-                            int writeThreads) {
+                            int writeThreads, int coordinatorThreads, int transactionRecoveryThreads, long transactionRecoveryIntervalMs) {
+    public StorageConfig(String clusterId, String nodeId, InetSocketAddress rpcAddress,
+                         InetSocketAddress raftAddress, Path directory, List<RaftPeer> metadataMembers,
+                         RaftSettings raftSettings, int rpcMaxPayload, int rpcMaxInflight, int admissionThreads, int admissionQueue,
+                         int writeThreads) {
+        this(clusterId, nodeId, rpcAddress, raftAddress, directory, metadataMembers, raftSettings,
+                rpcMaxPayload, rpcMaxInflight, admissionThreads, admissionQueue, writeThreads, 32, 4, 60_000);
+    }
     public StorageConfig(String clusterId, String nodeId, InetSocketAddress rpcAddress,
                          InetSocketAddress raftAddress, Path directory, List<RaftPeer> metadataMembers,
                          RaftSettings raftSettings, int rpcMaxPayload, int rpcMaxInflight, int admissionThreads, int admissionQueue) {
@@ -26,7 +33,8 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
         if (clusterId == null || clusterId.isBlank() || nodeId == null || !nodeId.matches("[A-Za-z0-9_-]+")
                 || directory == null || raftSettings == null || rpcAddress == null || raftAddress == null
                 || rpcAddress.getPort() == raftAddress.getPort() || rpcAddress.getPort() < 1 || raftAddress.getPort() < 1
-                || rpcMaxPayload < 1024 || rpcMaxInflight < 1 || admissionThreads < 1 || admissionQueue < 1 || writeThreads < 1) {
+                || rpcMaxPayload < 1024 || rpcMaxInflight < 1 || admissionThreads < 1 || admissionQueue < 1 || writeThreads < 1
+                || coordinatorThreads < 1 || transactionRecoveryThreads < 1 || transactionRecoveryIntervalMs < 1000) {
             throw new IllegalArgumentException("Storage 节点配置无效");
         }
         metadataMembers = List.copyOf(metadataMembers);
@@ -57,7 +65,8 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
     public long recoveryTimeoutMs() { return operationalNumber("replica_recovery_timeout_ms", 1800000); }
     public long idempotencyWindowMs() { return operationalNumber("idempotency_window_ms", io.cengyan.distributed.StorageGateway.DEFAULT_IDEMPOTENCY_WINDOW_MS); }
     public long backgroundIntervalMs() { return operationalNumber("background_interval_ms", 10000); }
-    public long backgroundBytesPerSecond() { return operationalNumber("background_bytes_per_second", 64L * 1024 * 1024); }
+    /** 快照拷贝带宽。已删除图的数据目录不使用这个限速。 */
+    public long backgroundBytesPerSecond() { return operationalNumber("background_bytes_per_second", 32L * 1024 * 1024); }
     /** 已提交历史版本在分片库里的保留期；到期后压缩成基线以回收空间。 */
     public long versionRetentionMs() { return operationalNumber("version_retention_ms", io.cengyan.distributed.VersionMaintenance.DEFAULT_RETENTION_MS); }
     public String zone() { return operationalText("zone"); }
@@ -103,13 +112,16 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
         if (!directory.isAbsolute()) directory = file.toAbsolutePath().getParent().resolve(directory);
         StorageConfig config = new StorageConfig(required(p, "cluster_id"), required(p, "node_id"),
                 endpoint(required(p, "rpc_address")), endpoint(required(p, "raft_address")), directory, members,
-                new RaftSettings(number(p, "raft_log_segment_bytes", 16L * 1024 * 1024),
+                new RaftSettings(number(p, "raft_log_segment_bytes", 64L * 1024 * 1024),
                         number(p, "raft_snapshot_entries", 2_000), number(p, "raft_log_retained_entries", 1_000),
-                        Math.toIntExact(number(p, "raft_snapshot_retained", 2))),
+                        Math.toIntExact(number(p, "raft_snapshot_retained", 1))),
                 Math.toIntExact(number(p, "rpc_max_payload_bytes", 64L * 1024 * 1024)),
                 Math.toIntExact(number(p, "rpc_max_inflight", 128)),
-                Math.toIntExact(number(p, "admission_threads", 2)), Math.toIntExact(number(p, "admission_queue", 256)),
-                Math.toIntExact(number(p, "write_threads", 10)));
+                Math.toIntExact(number(p, "admission_threads", 4)), Math.toIntExact(number(p, "admission_queue", 512)),
+                Math.toIntExact(number(p, "write_threads", 8)),
+                Math.toIntExact(number(p, "coordinator_threads", 32)),
+                Math.toIntExact(number(p, "transaction_recovery_threads", 4)),
+                number(p, "transaction_recovery_interval_ms", 60_000));
         io.cengyan.distributed.TransactionEngine.setPlanMaxBytes(Math.toIntExact(number(p, "transaction_plan_max_bytes",
                 io.cengyan.distributed.TransactionEngine.DEFAULT_PLAN_MAX_BYTES)));
         Properties operations = new Properties();

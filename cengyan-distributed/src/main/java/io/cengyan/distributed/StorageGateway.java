@@ -283,7 +283,6 @@ public final class StorageGateway implements AutoCloseable {
             boolean submitted = false;
             RpcClient client = null;
             CompletableFuture<RpcResponse> pendingCall = null;
-            long sentAt = 0;
             try {
                 client = connection(address, deadline);
                 long remaining = timeLeft(deadline).toNanos();
@@ -293,7 +292,6 @@ public final class StorageGateway implements AutoCloseable {
                 if (request.getSerializedSize() > maxPayload) throw new ClusterException("BATCH_TOO_LARGE",
                         "Storage RPC 超过上限；method=" + method + " bytes=" + request.getSerializedSize() + " limit=" + maxPayload);
                 submitted = true;
-                sentAt = System.nanoTime();
                 pendingCall = client.call(request, Duration.ofNanos(remaining));
                 RpcResponse response = pendingCall.get(remaining, TimeUnit.NANOSECONDS);
                 if (Set.of("NOT_LEADER", "GROUP_UNAVAILABLE", "REPLICA_UNTRUSTED").contains(response.getCode())) {
@@ -336,12 +334,10 @@ public final class StorageGateway implements AutoCloseable {
                     catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new ClusterException("QUERY_CANCELED", "Storage 调用已取消", interrupted); }
                     continue;
                 }
-                // One request failing must not close the connection shared by every other in-flight request:
-                // that turned a single slow or rejected call into "connection broken" for all of them.
-                // Replace the connection only when it is really dead, or nothing arrived on it since this request was sent.
-                if (client != null && (!client.isActive() || client.lastReceivedNanos() - sentAt < 0)) {
-                    if (connections.remove(address, client)) client.close();
-                }
+                // One request timing out must not close the connection. Import commits share it and can sit
+                // quietly for minutes while a replica ingests; closing it fails every other write with
+                // "RPC 客户端已关闭" even though the socket is still up.
+                if (client != null && !client.isActive() && connections.remove(address, client)) client.close();
                 if (method.equals("kv.read") && !pinned && System.nanoTime() < deadline) {
                     leaders.remove(partition);
                     if (graph > 0) {
@@ -452,10 +448,14 @@ public final class StorageGateway implements AutoCloseable {
         finally { cursorOwners.remove(cursorId); }
     }
     public BatchResult write(long graph, int part, WriteBatch command) {
+        return write(graph, part, command, Duration.ofSeconds(15));
+    }
+
+    public BatchResult write(long graph, int part, WriteBatch command, Duration timeout) {
         long epoch = controllerEpoch();
         if (epoch > 0) command = command.toBuilder().setControllerEpoch(epoch).build();
         try {
-            return BatchResult.parseFrom(call(graph, part, "kv.write", command.getRequestId(), command.toByteString(), Duration.ofSeconds(15)).getBody());
+            return BatchResult.parseFrom(call(graph, part, "kv.write", command.getRequestId(), command.toByteString(), timeout).getBody());
         } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("PROTOCOL_ERROR", "Storage 写响应损坏", ex); }
     }
     public interface ScanConsumer { void accept(ScanPage page); }

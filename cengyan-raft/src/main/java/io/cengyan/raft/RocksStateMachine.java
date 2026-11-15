@@ -15,29 +15,31 @@ import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
-import org.apache.ratis.server.storage.FileInfo;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
-import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
-import org.apache.ratis.statemachine.impl.SingleFileSnapshotInfo;
-import org.apache.ratis.util.MD5FileUtil;
 import org.rocksdb.*;
 import java.io.*;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.Comparator;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
-import java.util.zip.ZipOutputStream;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.logging.Logger;
 
 /**
  * 分片状态机基础：数据、去重结果、应用位置在同一个 RocksDB 批次内提交。
@@ -47,9 +49,28 @@ public final class RocksStateMachine extends BaseStateMachine {
     static { RocksDB.loadLibrary(); }
     private static final byte[] APPLIED = {0};
     private static final byte[] CONTROLLER_EPOCH = {0, 1};
-    private static final String MANIFEST = "cengyan-snapshot.properties";
-    private final SimpleStateMachineStorage storage = new SimpleStateMachineStorage();
+    private static final Logger LOG = Logger.getLogger(RocksStateMachine.class.getName());
+    private static final int IMPORT_L0_SLOWDOWN = 1024;
+    private static final int IMPORT_L0_STOP = 4096;
+    private static final int NORMAL_L0_SLOWDOWN = 20;
+    private static final int NORMAL_L0_STOP = 36;
+    private static final ExecutorService IMPORT_COMPACTOR = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "storage-import-compact");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private static final CopyOnWriteArrayList<RocksStateMachine> LIVE = new CopyOnWriteArrayList<>();
+    private static final ScheduledExecutorService IMPORT_COMPACT_CLOCK = Executors.newSingleThreadScheduledExecutor(task -> {
+        Thread thread = new Thread(task, "storage-import-compact-clock");
+        thread.setDaemon(true);
+        return thread;
+    });
+    static {
+        IMPORT_COMPACT_CLOCK.scheduleWithFixedDelay(RocksStateMachine::compactDue, 60, 60, TimeUnit.SECONDS);
+    }
+    private final CheckpointStorage storage = new CheckpointStorage();
     private final Object snapshotLock = new Object();
+    private final Set<String> importSessions = new HashSet<>();
     /** 读不挡住写，写不挡住其他分片。同一分片的 apply 仍然互斥。 */
     private final ReentrantReadWriteLock dbLock = new ReentrantReadWriteLock();
     private static final Cache BLOCK_CACHE = new LRUCache(256L * 1024 * 1024);
@@ -58,10 +79,30 @@ public final class RocksStateMachine extends BaseStateMachine {
     private WriteOptions writes;
     private RocksDB db;
     private Path stateDirectory;
+    private Path liveDirectory;
+    private Path importStaging;
+    /** 导入期间关掉自动压实，并抬高 L0 停写阈值。进程重启后恢复为打开，不写入配置。 */
+    private boolean compactionPaused;
+    /** 本进程所有分片共用一把锁，保证压实和关闭数据库不会同时进行。 */
+    private final ReentrantLock compactExclusive = new ReentrantLock();
+    private final Object compactState = new Object();
+    private final java.util.Map<String, AppendDecision> appendSessions = new java.util.HashMap<>();
+    /** 测试可改小，用来触发一轮导入压实。 */
+    long importCompactWaveBytes = 1L << 30;
+    /** 未压实数据攒够这个时间后，即使不足 1GB 也压一次。测试可改成 0。 */
+    long importCompactIdleMs = 3_600_000L;
+    private long bytesSinceCompact;
+    private long uncompactedSinceMs;
+    private boolean compactQueued;
+    private volatile boolean closing;
+    private volatile int completedCompactions;
+    private record AppendDecision(long generation, boolean appendOnly) { }
     private boolean rebuildOnly;
     private record ScanCursor(Snapshot snapshot, ByteString query, long expiresAt, ByteString lastKey) { }
     private final java.util.Map<String, ScanCursor> scans = new java.util.HashMap<>();
     private final long snapshotBytesPerSecond;
+    /** 图空间已经删除。新的导入和查询直接拒绝；正在进行的调用结束于关闭数据库之前。 */
+    private volatile boolean dropping;
     public RocksStateMachine() { this(64L * 1024 * 1024); }
     public RocksStateMachine(long snapshotBytesPerSecond) {
         if (snapshotBytesPerSecond < 1) throw new IllegalArgumentException("快照带宽必须为正数");
@@ -74,29 +115,133 @@ public final class RocksStateMachine extends BaseStateMachine {
         machine.rebuildOnly = true;
         try {
             Files.createDirectories(directory);
+            machine.liveDirectory = directory;
+            machine.importStaging = directory.resolve("import-staging");
+            Files.createDirectories(machine.importStaging);
             machine.options = databaseOptions(true);
             machine.writes = new WriteOptions().setDisableWAL(true).setSync(false);
             machine.db = RocksDB.open(machine.options, directory.toString());
             EntityCountStore.initialize(machine.db, machine.writes);
+            machine.register();
             return machine;
         } catch (RocksDBException ex) { machine.closeDatabase(); throw new IOException(ex); }
     }
 
-    /**
-     * Reopen a replica sealed during cluster maintenance. The caller must verify the full
-     * content against the seal and Metadata before trusting it.
-     */
+    /** 重新打开已经存在的分片目录。调用方需要先确认目录属于本集群。 */
     public static RocksStateMachine reopenSealedReplica(Path directory) throws IOException {
         if (!Files.isDirectory(directory) || !Files.exists(directory.resolve("CURRENT"))) throw new IOException("封存的分片目录不存在：" + directory);
         var machine = new RocksStateMachine();
         machine.rebuildOnly = true;
+        machine.liveDirectory = directory;
+        machine.importStaging = directory.resolve("import-staging");
+        Files.createDirectories(machine.importStaging);
         try {
             machine.options = databaseOptions(false);
             machine.writes = new WriteOptions().setDisableWAL(true).setSync(false);
             machine.db = RocksDB.open(machine.options, directory.toString());
             EntityCountStore.initialize(machine.db, machine.writes);
+            machine.register();
             return machine;
         } catch (RocksDBException ex) { machine.closeDatabase(); throw new IOException(ex); }
+    }
+
+    /** 把 SST 分块写到本副本。文件不进入 Raft 日志；摄入由随后的导入指令触发。 */
+    public void stageImport(io.cengyan.protocol.proto.ClusterProtocol.ImportChunk chunk) throws IOException {
+        stageImport(chunk, System.currentTimeMillis());
+    }
+
+    void stageImport(io.cengyan.protocol.proto.ClusterProtocol.ImportChunk chunk, long now) throws IOException {
+        if (importStaging == null) throw new IOException("导入暂存目录尚未就绪");
+        dbLock.writeLock().lock();
+        try {
+            if (dropping || db == null) throw new IOException("图空间已删除");
+            boolean started = !importSessions.contains(chunk.getSessionId());
+            ImportApplier.stage(importStaging, chunk, now);
+            if (importSessions.add(chunk.getSessionId()) && started) pauseCompaction();
+        }
+        finally { dbLock.writeLock().unlock(); }
+    }
+
+    /** 刷新导入会话心跳。没有心跳满 30 分钟后，暂存文件会被删掉。 */
+    public void heartbeatImport(String sessionId) throws IOException {
+        heartbeatImport(sessionId, System.currentTimeMillis());
+    }
+
+    void heartbeatImport(String sessionId, long now) throws IOException {
+        if (dropping) return;
+        if (importStaging == null) throw new IOException("导入暂存目录尚未就绪");
+        dbLock.writeLock().lock();
+        try {
+            if (dropping || db == null) return;
+            ImportSessions.heartbeat(importStaging, sessionId, now);
+        }
+        finally { dbLock.writeLock().unlock(); }
+    }
+
+    /**
+     * 导入会话结束。只清理会话和暂存文件，不等待压实。
+     * L0 降到默认停写线以下、并且没有导入会话时，后台再恢复自动压实。
+     * @return 本分片是否持有这个会话
+     */
+    public boolean finishImport(String sessionId) throws IOException {
+        dbLock.writeLock().lock();
+        try {
+            if (importStaging == null || !importSessions.contains(sessionId)) return false;
+            importSessions.remove(sessionId);
+            appendSessions.remove(sessionId);
+            ImportSessions.close(importStaging, sessionId);
+            if (importSessions.isEmpty()) resumeCompactionIfSettled();
+            return true;
+        } finally { dbLock.writeLock().unlock(); }
+    }
+
+    /** 计划内重启前把内存表刷进 SST，使已应用位置和工作库一起落盘。 */
+    public void flushForRestart() throws IOException {
+        dbLock.writeLock().lock();
+        try { flushHeld(); }
+        finally { dbLock.writeLock().unlock(); }
+    }
+
+    /** @return 本次删掉的暂存文件数 */
+    public int expireImports(long now) throws IOException {
+        if (importStaging == null) return 0;
+        dbLock.writeLock().lock();
+        try { return ImportSessions.expire(importStaging, now); }
+        finally { dbLock.writeLock().unlock(); }
+    }
+
+    /** 拒绝这张图上新的导入和查询。已进入的调用在关闭数据库时排空，避免文件句柄把空间留住。 */
+    void beginDrop() { dropping = true; }
+
+    /** 在已经持有本地 SST 的分片上直接摄入。Raft 路径走 apply，不重复进入这里。 */
+    public io.cengyan.protocol.proto.ClusterProtocol.BatchResult applyImport(
+            io.cengyan.protocol.proto.ClusterProtocol.ImportDirective directive) throws IOException {
+        dbLock.writeLock().lock();
+        try (org.rocksdb.WriteBatch batch = new org.rocksdb.WriteBatch()) {
+            if (dropping || db == null) return failure("GRAPH_STATE", "图空间已删除");
+            var result = ingestHeld(batch, directive);
+            db.write(writes, batch);
+            ImportApplier.release(importStaging, directive.getChecksum().toByteArray());
+            return result;
+        } catch (RocksDBException ex) {
+            throw new IOException(ex);
+        } finally {
+            dbLock.writeLock().unlock();
+            compactIfDue(System.currentTimeMillis());
+        }
+    }
+
+    byte[] readPhysical(byte[] key) throws org.rocksdb.RocksDBException {
+        dbLock.readLock().lock();
+        try { return db.get(key); }
+        finally { dbLock.readLock().unlock(); }
+    }
+
+    io.cengyan.protocol.proto.ClusterProtocol.EntityCounts readCounts(long generation) throws IOException {
+        dbLock.readLock().lock();
+        try { return EntityCountStore.read(db, generation); }
+        catch (org.rocksdb.RocksDBException ex) { throw new IOException(ex); }
+        finally { dbLock.readLock().unlock(); }
     }
 
     /** Data replicas run without WAL; flush memtables before the files are trusted across a restart. */
@@ -167,6 +312,8 @@ public final class RocksStateMachine extends BaseStateMachine {
         storage.init(raftStorage);
         stateDirectory = raftStorage.getStorageDir().getStateMachineDir().toPath();
         Files.createDirectories(stateDirectory);
+        importStaging = stateDirectory.resolve("import-staging");
+        Files.createDirectories(importStaging);
         restore();
         getLifeCycle().transition(org.apache.ratis.util.LifeCycle.State.STARTING);
         getLifeCycle().transition(org.apache.ratis.util.LifeCycle.State.RUNNING);
@@ -174,7 +321,17 @@ public final class RocksStateMachine extends BaseStateMachine {
 
     @Override public synchronized void pause() {
         getLifeCycle().transition(org.apache.ratis.util.LifeCycle.State.PAUSING);
-        closeDatabase();
+        closing = true;
+        compactExclusive.lock();
+        try {
+            try { flushHeld(); }
+            catch (IOException ex) { LOG.warning("暂停前刷盘失败：" + ex.getMessage()); }
+            synchronized (compactState) {
+                bytesSinceCompact = 0;
+                uncompactedSinceMs = 0;
+            }
+            closeDatabase();
+        } finally { compactExclusive.unlock(); }
         getLifeCycle().transition(org.apache.ratis.util.LifeCycle.State.PAUSED);
     }
     @Override public synchronized void reinitialize() throws IOException {
@@ -185,57 +342,61 @@ public final class RocksStateMachine extends BaseStateMachine {
     @Override public StateMachineStorage getStateMachineStorage() { return storage; }
 
     private void restore() throws IOException {
-        closeDatabase();
-        // 工作库可重建：已发布 Checkpoint + 后续 Raft 日志是恢复来源。
-        Path next = stateDirectory.resolve("work-" + UUID.randomUUID());
-        Files.createDirectory(next);
-        var snapshot = storage.loadLatestSnapshot();
-        if (snapshot == null) {
-            try (var files = Files.list(stateDirectory)) {
-                if (files.anyMatch(file -> SimpleStateMachineStorage.SNAPSHOT_REGEX.matcher(file.getFileName().toString()).matches())) {
-                    throw new IOException("存在已发布快照但无法加载，拒绝从空数据库恢复");
-                }
+        closing = true;
+        compactExclusive.lock();
+        try { closeDatabase(); }
+        finally { compactExclusive.unlock(); }
+        importSessions.clear();
+        appendSessions.clear();
+        compactionPaused = false;
+        synchronized (compactState) {
+            bytesSinceCompact = 0;
+            uncompactedSinceMs = 0;
+        }
+        Files.createDirectories(stateDirectory);
+        importStaging = stateDirectory.resolve("import-staging");
+        Files.createDirectories(importStaging);
+        Path dbDir = CheckpointStorage.dbDirectory(stateDirectory);
+        TermIndex adopted = null;
+        if (!Files.exists(dbDir.resolve("CURRENT"))) {
+            Path installed = CheckpointStorage.installedSnapshot(stateDirectory);
+            if (installed != null) {
+                adopted = CheckpointStorage.termIndex(installed);
+                stripDigestFiles(installed);
+                CheckpointStorage.deleteTree(dbDir);
+                Files.move(installed, dbDir);
             }
         }
         try {
-            if (snapshot != null) {
-                Path file = snapshot.getFile().getPath();
-                var expected = snapshot.getFile().getFileDigest();
-                if (expected != null && !expected.equals(MD5FileUtil.computeMd5ForFile(file.toFile()))) {
-                    throw new IOException("Raft 快照校验失败");
-                }
-                unpack(file, next);
-                java.util.Properties manifest = new java.util.Properties();
-                try (var input = Files.newInputStream(next.resolve(MANIFEST))) { manifest.load(input); }
-                if (!"1".equals(manifest.getProperty("format"))
-                        || !getGroupId().getUuid().toString().equals(manifest.getProperty("group_id"))
-                        || !Long.toString(snapshot.getIndex()).equals(manifest.getProperty("index"))
-                        || !Long.toString(snapshot.getTerm()).equals(manifest.getProperty("term"))) {
-                    throw new IOException("快照身份、格式或应用位置不匹配");
-                }
-                Files.delete(next.resolve(MANIFEST));
-            }
-            options = databaseOptions(true);
-            // Raft 日志已经 fsync。状态机从快照加日志重放，不再为 memtable 写 WAL，也不在 apply 时再 fsync 一次。
+            boolean create = !Files.exists(dbDir.resolve("CURRENT"));
+            if (create) Files.createDirectories(dbDir);
+            options = databaseOptions(create);
+            // Raft 日志已经 fsync。内存表没刷盘的部分由日志重放补上，不再为每次写入打开 RocksDB WAL。
             writes = new WriteOptions().setDisableWAL(true).setSync(false);
-            db = RocksDB.open(options, next.toString());
+            db = RocksDB.open(options, dbDir.toString());
+            liveDirectory = dbDir;
+            closing = false;
+            register();
+            storage.retain(dbDir);
             byte[] applied = db.get(APPLIED);
-            TermIndex position = applied == null ? TermIndex.INITIAL_VALUE
-                    : decodePosition(applied);
-            if (snapshot != null && !snapshot.getTermIndex().equals(position)) {
-                throw new IOException("快照数据与 Raft 应用位置不一致");
-            }
+            TermIndex position = applied == null ? TermIndex.INITIAL_VALUE : decodePosition(applied);
+            if (adopted != null && !adopted.equals(position)) throw new IOException("安装的快照与库内应用位置不一致");
             EntityCountStore.initialize(db, writes);
             setLastAppliedTermIndex(position);
-            // 只删除本状态机工作目录，不触及用户数据目录或 Raft 日志。
-            try (var files = Files.list(stateDirectory)) {
-                for (Path old : files.filter(p -> p.getFileName().toString().startsWith("work-")).toList()) {
-                    if (!old.equals(next)) deleteOwnedTree(old);
-                }
-            }
+            if (adopted != null) storage.capture(db, adopted.getTerm(), adopted.getIndex(), snapshotBytesPerSecond);
+            else storage.reload();
         } catch (RocksDBException | IOException | RuntimeException ex) {
             closeDatabase();
             throw new IOException("无法恢复分片状态机", ex);
+        }
+    }
+
+    /** 安装快照时 Ratis 会在文件旁写下校验和。RocksDB 不使用这些旁路文件。 */
+    private static void stripDigestFiles(Path directory) throws IOException {
+        try (var files = Files.list(directory)) {
+            for (Path file : files.toList()) {
+                if (file.getFileName().toString().endsWith(".md5")) Files.deleteIfExists(file);
+            }
         }
     }
 
@@ -246,22 +407,27 @@ public final class RocksStateMachine extends BaseStateMachine {
             try { return applyCommand(io.cengyan.protocol.proto.ClusterProtocol.WriteBatch.parseFrom(
                     entry.getStateMachineLogEntry().getLogData().toByteArray()), entry.getIndex(), entry.getTerm()); }
             catch (Exception ex) { return CompletableFuture.failedFuture(ex); }
-        } finally { dbLock.writeLock().unlock(); }
+        } finally {
+            dbLock.writeLock().unlock();
+            compactIfDue(System.currentTimeMillis());
+        }
     }
 
     private CompletableFuture<Message> applyCommand(io.cengyan.protocol.proto.ClusterProtocol.WriteBatch command, long index, long term) {
         try {
             if (index <= getLastAppliedTermIndex().getIndex()) throw new IOException("Raft 日志重复或倒序应用");
             BatchResult result;
+            boolean releaseImport = false;
             byte[] key = namespace((byte) 1, command.getRequestId().getBytes(StandardCharsets.UTF_8));
             byte[] digest = digest(command.toBuilder().clearExpiresAtMs().clearControllerEpoch().build().toByteArray());
             try (org.rocksdb.WriteBatch batch = new org.rocksdb.WriteBatch()) {
                 byte[] currentEpochBytes = db.get(CONTROLLER_EPOCH);
                 long currentEpoch = currentEpochBytes == null ? 0 : ByteBuffer.wrap(currentEpochBytes).getLong();
+                boolean importing = command.hasImportFile();
                 if (command.getControllerEpoch() != 0 && command.getControllerEpoch() < currentEpoch) {
                     result = failure("STALE_CONTROLLER", "控制命令来自旧 Metadata Leader 任期");
                 } else if (command.getRequestId().isBlank() || command.getRequestId().length() > 256
-                        || (command.getMutationsCount() == 0 && command.getPurgeRequestIdsCount() == 0)
+                        || (command.getMutationsCount() == 0 && command.getPurgeRequestIdsCount() == 0 && !importing)
                         || command.getExpiresAtMs() <= 0
                         || (command.getPurgeRequestIdsCount() > 0 && command.getPurgeBeforeMs() <= 0)) {
                     result = failure("INVALID_ARGUMENT", "写入批次标识、内容或有效期无效");
@@ -271,6 +437,17 @@ public final class RocksStateMachine extends BaseStateMachine {
                         var record = IdempotencyRecord.parseFrom(previous);
                         result = MessageDigest.isEqual(digest, record.getDigest().toByteArray()) ? record.getResult()
                                 : failure("REQUEST_CONFLICT", "相同 requestId 对应不同写入内容；requestId=" + command.getRequestId());
+                    } else if (importing) {
+                        if (command.getMutationsCount() > 0 || command.getConditionsCount() > 0 || command.getPurgeRequestIdsCount() > 0) {
+                            result = failure("INVALID_ARGUMENT", "导入指令不能混入普通写入");
+                        } else if (dropping) {
+                            result = failure("GRAPH_STATE", "图空间已删除");
+                        } else {
+                            result = ingestHeld(batch, command.getImportFile());
+                            releaseImport = true;
+                        }
+                        batch.put(key, IdempotencyRecord.newBuilder().setDigest(ByteString.copyFrom(digest))
+                                .setResult(result).setExpiresAtMs(command.getExpiresAtMs()).build().toByteArray());
                     } else {
                         boolean matches = true;
                         for (var condition : command.getConditionsList()) {
@@ -314,6 +491,7 @@ public final class RocksStateMachine extends BaseStateMachine {
                 batch.put(APPLIED, position(term, index));
                 db.write(writes, batch);
             }
+            if (releaseImport) ImportApplier.release(importStaging, command.getImportFile().getChecksum().toByteArray());
             updateLastAppliedTermIndex(term, index);
             return CompletableFuture.completedFuture(message(result.toByteArray()));
         } catch (Exception ex) {
@@ -339,6 +517,7 @@ public final class RocksStateMachine extends BaseStateMachine {
     }
     private CompletableFuture<Message> queryLocked(Message request) {
         try {
+            if (dropping || db == null) throw new IOException("图空间已删除");
             var key = ReadKey.parseFrom(request.getContent().toByteArray());
             if (key.getEntityCounts()) {
                 return CompletableFuture.completedFuture(message(EntityCountStore.read(db, key.getCountsGeneration()).toByteArray()));
@@ -444,101 +623,226 @@ public final class RocksStateMachine extends BaseStateMachine {
 
     @Override public long takeSnapshot() throws IOException {
         if (rebuildOnly) throw new IOException("重建分片不生成快照");
-        synchronized (snapshotLock) { return snapshotLocked(); }
-    }
-
-    private long snapshotLocked() throws IOException {
-        Path checkpoint = stateDirectory.resolve("checkpoint-" + UUID.randomUUID());
-        final TermIndex position;
-        dbLock.writeLock().lock();
-        try {
-            position = getLastAppliedTermIndex();
-            if (position.getIndex() < 0) return -1;
-            var current = storage.getLatestSnapshot();
-            if (current != null && current.getIndex() == position.getIndex()) return position.getIndex();
-            RocksDBException failure = null;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                try (Checkpoint cp = Checkpoint.create(db)) {
-                    cp.createCheckpoint(checkpoint.toString());
-                    failure = null;
-                    break;
-                } catch (RocksDBException ex) {
-                    failure = ex;
-                    deleteOwnedTree(checkpoint);
-                    deleteOwnedTree(checkpoint.resolveSibling(checkpoint.getFileName() + ".tmp"));
-                    if (attempt < 2) {
-                        java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(50L * (attempt + 1)));
-                        if (Thread.currentThread().isInterrupted()) throw new java.io.InterruptedIOException("Checkpoint 创建被取消");
-                    }
-                }
-            }
-            if (failure != null) throw new IOException("无法创建 RocksDB Checkpoint", failure);
-        } finally { dbLock.writeLock().unlock(); }
-        Path target = storage.getSnapshotFile(position.getTerm(), position.getIndex()).toPath();
-        Path temporary = target.resolveSibling(target.getFileName() + ".tmp-" + UUID.randomUUID());
-        // SST 打包和校验不持有状态机锁，源 Leader 可以继续应用新写入。
-        try {
-            java.util.Properties manifest = new java.util.Properties();
-            manifest.setProperty("format", "1");
-            manifest.setProperty("group_id", getGroupId().getUuid().toString());
-            manifest.setProperty("term", Long.toString(position.getTerm()));
-            manifest.setProperty("index", Long.toString(position.getIndex()));
-            try (var output = Files.newOutputStream(checkpoint.resolve(MANIFEST))) { manifest.store(output, "Cengyan Checkpoint"); }
-            try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(temporary)); var files = Files.list(checkpoint)) {
-                zip.setLevel(0);
-                long started = System.nanoTime(), copied = 0;
-                byte[] buffer = new byte[256 * 1024];
-                for (Path file : files.sorted().toList()) {
-                    if (!Files.isRegularFile(file)) throw new IOException("Checkpoint 存在不支持的文件");
-                    zip.putNextEntry(new ZipEntry(file.getFileName().toString()));
-                    try (InputStream input = Files.newInputStream(file)) {
-                        int count;
-                        while ((count = input.read(buffer)) >= 0) {
-                            zip.write(buffer, 0, count); copied += count;
-                            long targetElapsed = (long) ((double) copied * 1_000_000_000L / snapshotBytesPerSecond);
-                            long wait = targetElapsed - (System.nanoTime() - started);
-                            if (wait > 0) java.util.concurrent.locks.LockSupport.parkNanos(wait);
-                            if (Thread.currentThread().isInterrupted()) throw new java.io.InterruptedIOException("快照生成被取消");
-                        }
-                    }
-                    zip.closeEntry();
-                }
-            }
-            try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE)) { channel.force(true); }
-            Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE);
-            var md5 = MD5FileUtil.computeMd5ForFile(target.toFile());
-            MD5FileUtil.saveMD5File(target.toFile(), md5);
-            storage.updateLatestSnapshot(new SingleFileSnapshotInfo(new FileInfo(target, md5), position));
+        synchronized (snapshotLock) {
+            final TermIndex position;
+            dbLock.writeLock().lock();
+            try {
+                flushHeld();
+                position = getLastAppliedTermIndex();
+                if (position.getIndex() < 0) return -1;
+                var current = storage.getLatestSnapshot();
+                if (current != null && current.getIndex() == position.getIndex()) return position.getIndex();
+                storage.link(db, position.getTerm(), position.getIndex());
+            } catch (RocksDBException ex) {
+                throw new IOException("无法创建 RocksDB Checkpoint", ex);
+            } finally { dbLock.writeLock().unlock(); }
+            storage.seal(position.getTerm(), position.getIndex(), snapshotBytesPerSecond);
             return position.getIndex();
-        } finally {
-            Files.deleteIfExists(temporary);
-            deleteOwnedTree(checkpoint);
         }
     }
 
-    private static void unpack(Path snapshot, Path directory) throws IOException {
-        try (ZipInputStream zip = new ZipInputStream(Files.newInputStream(snapshot))) {
-            ZipEntry entry;
-            while ((entry = zip.getNextEntry()) != null) {
-                String name = entry.getName();
-                // Checkpoint 仅包含一层文件；禁止路径穿越和任意目录写入。
-                if (name.isBlank() || name.contains("/") || name.contains("\\") || name.equals("..") || name.contains(":")) {
-                    throw new IOException("快照文件路径无效");
-                }
-                try (OutputStream out = Files.newOutputStream(directory.resolve(name), StandardOpenOption.CREATE_NEW)) {
-                    zip.transferTo(out);
-                }
-                zip.closeEntry();
+    private void flushHeld() throws IOException {
+        if (db == null || dropping) return;
+        try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) { db.flush(flush); }
+        catch (RocksDBException ex) { throw new IOException("无法把内存表刷入本地数据库", ex); }
+    }
+
+    private void pauseCompaction() throws IOException {
+        if (compactionPaused || db == null) return;
+        applyCompactionOptions(true);
+        compactionPaused = true;
+    }
+
+    private void resumeCompaction() throws IOException {
+        if (!compactionPaused || db == null) return;
+        applyCompactionOptions(false);
+        compactionPaused = false;
+    }
+
+    private void applyCompactionOptions(boolean importing) throws IOException {
+        MutableColumnFamilyOptions changed = MutableColumnFamilyOptions.builder()
+                .setDisableAutoCompactions(importing)
+                .setLevel0SlowdownWritesTrigger(importing ? IMPORT_L0_SLOWDOWN : NORMAL_L0_SLOWDOWN)
+                .setLevel0StopWritesTrigger(importing ? IMPORT_L0_STOP : NORMAL_L0_STOP)
+                .build();
+        try { db.setOptions(db.getDefaultColumnFamily(), changed); }
+        catch (RocksDBException ex) { throw new IOException(importing ? "无法暂停自动压实" : "无法恢复自动压实", ex); }
+    }
+
+    /** 必须已持有分片写锁。压实在后台进行，这里只记账。 */
+    private BatchResult ingestHeld(org.rocksdb.WriteBatch batch, io.cengyan.protocol.proto.ClusterProtocol.ImportDirective directive) throws IOException, RocksDBException {
+        byte[] checksum = directive.getChecksum().toByteArray();
+        long size = ImportApplier.stagedBytes(importStaging, checksum);
+        boolean[] created = {false};
+        BatchResult result = ImportApplier.ingest(db, batch, importStaging, directive, appendOnly(directive), created);
+        if (created[0]) noteIngested(size);
+        return result;
+    }
+
+    private boolean appendOnly(io.cengyan.protocol.proto.ClusterProtocol.ImportDirective directive) throws IOException, RocksDBException {
+        if (directive.getUndo() || directive.getConflict() == io.cengyan.protocol.proto.ClusterProtocol.ImportConflict.IMPORT_REPLACE) return false;
+        String session = ImportApplier.sessionOwner(importStaging, directive.getChecksum().toByteArray());
+        if (session == null || !importSessions.contains(session)) return false;
+        AppendDecision decision = appendSessions.get(session);
+        if (decision != null) return decision.generation == directive.getGeneration() && decision.appendOnly;
+        boolean empty = !generationHasData(directive.getGeneration());
+        appendSessions.put(session, new AppendDecision(directive.getGeneration(), empty));
+        return empty;
+    }
+
+    private boolean generationHasData(long generation) throws RocksDBException {
+        for (byte kind : new byte[] {16, 17}) {
+            byte[] prefix = ByteBuffer.allocate(10).put((byte) 2).put(kind).putLong(generation).array();
+            try (RocksIterator iterator = db.newIterator()) {
+                iterator.seek(prefix);
+                if (iterator.isValid() && startsWith(iterator.key(), prefix)) return true;
+            }
+        }
+        return false;
+    }
+
+    private void noteIngested(long bytes) {
+        if (bytes <= 0) return;
+        synchronized (compactState) {
+            if (bytesSinceCompact == 0) uncompactedSinceMs = System.currentTimeMillis();
+            bytesSinceCompact += bytes;
+        }
+    }
+
+    /** 未压实字节达到一轮，或已经积满设定时间。调用方持有 {@link #compactState}。 */
+    private boolean due(long now) {
+        if (bytesSinceCompact <= 0) return false;
+        if (bytesSinceCompact >= importCompactWaveBytes) return true;
+        return uncompactedSinceMs > 0 && now - uncompactedSinceMs >= importCompactIdleMs;
+    }
+
+    void compactIfDue(long now) {
+        synchronized (compactState) {
+            if (due(now)) enqueue();
+        }
+    }
+
+    /** 调用方持有 {@link #compactState}。 */
+    private void enqueue() {
+        if (closing || dropping || db == null || compactQueued) return;
+        compactQueued = true;
+        IMPORT_COMPACTOR.execute(this::runRound);
+    }
+
+    private void runRound() {
+        boolean again = false;
+        try { again = compactTop(); }
+        finally {
+            synchronized (compactState) {
+                compactQueued = false;
+                if (again && !closing && !dropping && db != null && due(System.currentTimeMillis())) enqueue();
             }
         }
     }
 
-    private static void deleteOwnedTree(Path directory) throws IOException {
-        if (!Files.exists(directory)) return;
-        if (Files.isSymbolicLink(directory)) throw new IOException("状态机临时目录不能是符号链接");
-        try (var files = Files.walk(directory)) {
-            for (Path file : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(file);
+    /** @return 本轮有进展，调用方可以接着看是否还要再压 */
+    private boolean compactTop() {
+        compactExclusive.lock();
+        try {
+            if (closing || dropping || db == null || liveDirectory == null) return false;
+            List<String> level0 = new ArrayList<>();
+            long level0Bytes = 0;
+            ColumnFamilyMetaData metadata = db.getColumnFamilyMetaData();
+            for (LevelMetaData level : metadata.levels()) {
+                if (level.level() != 0) continue;
+                for (SstFileMetaData file : level.files()) {
+                    if (file.beingCompacted()) continue;
+                    level0.add(file.fileName());
+                    level0Bytes += file.size();
+                }
+            }
+            if (level0.isEmpty()) {
+                synchronized (compactState) {
+                    bytesSinceCompact = 0;
+                    uncompactedSinceMs = 0;
+                }
+                LOG.info("新摄入的数据已经不在 L0，清零未压实计数");
+                resumeWhenIdle();
+                return false;
+            }
+            long free = Files.getFileStore(liveDirectory).getUsableSpace();
+            if (free <= level0Bytes) {
+                LOG.warning("空闲空间不足本轮 L0 压实。L0 " + level0Bytes + " 字节，空闲 " + free + " 字节");
+                return false;
+            }
+            long accounted;
+            synchronized (compactState) { accounted = bytesSinceCompact; }
+            try (CompactionOptions options = new CompactionOptions(); CompactionJobInfo info = new CompactionJobInfo()) {
+                db.compactFiles(options, level0, 1, -1, info);
+            }
+            synchronized (compactState) {
+                bytesSinceCompact -= accounted;
+                if (bytesSinceCompact < 0) bytesSinceCompact = 0;
+                if (bytesSinceCompact == 0) uncompactedSinceMs = 0;
+            }
+            completedCompactions++;
+            resumeWhenIdle();
+            return true;
+        } catch (Exception ex) {
+            LOG.warning("导入压实没有完成：" + ex.getMessage());
+            return false;
+        } finally { compactExclusive.unlock(); }
+    }
+
+    private void resumeWhenIdle() {
+        dbLock.readLock().lock();
+        try { resumeCompactionIfSettled(); }
+        finally { dbLock.readLock().unlock(); }
+    }
+
+    /** 调用方持有分片锁。没有导入会话且 L0 已经低于默认减速线时，恢复自动压实。 */
+    private void resumeCompactionIfSettled() {
+        try {
+            if (!compactionPaused || db == null || !importSessions.isEmpty()) return;
+            if (level0Count() > NORMAL_L0_SLOWDOWN) return;
+            resumeCompaction();
+        } catch (Exception ex) {
+            LOG.warning("恢复自动压实没有完成：" + ex.getMessage());
         }
+    }
+
+    private int level0Count() throws RocksDBException {
+        ColumnFamilyMetaData metadata = db.getColumnFamilyMetaData();
+        for (LevelMetaData level : metadata.levels()) {
+            if (level.level() == 0) return level.files().size();
+        }
+        return 0;
+    }
+
+    private void register() {
+        LIVE.addIfAbsent(this);
+        if (db == null) return;
+        long level0Bytes = 0;
+        ColumnFamilyMetaData metadata = db.getColumnFamilyMetaData();
+        for (LevelMetaData level : metadata.levels()) {
+            if (level.level() != 0) continue;
+            level0Bytes = level.size();
+        }
+        if (level0Bytes <= 0) return;
+        synchronized (compactState) {
+            if (bytesSinceCompact < level0Bytes) bytesSinceCompact = level0Bytes;
+            if (uncompactedSinceMs == 0) uncompactedSinceMs = System.currentTimeMillis();
+        }
+        compactIfDue(System.currentTimeMillis());
+    }
+
+    private static void compactDue() {
+        long now = System.currentTimeMillis();
+        for (RocksStateMachine machine : LIVE) {
+            try { machine.compactIfDue(now); }
+            catch (RuntimeException ex) { LOG.warning("导入压实检查失败：" + ex.getMessage()); }
+        }
+    }
+
+    int completedCompactions() { return completedCompactions; }
+
+    long uncompactedBytes() {
+        synchronized (compactState) { return bytesSinceCompact; }
     }
 
     private static Options databaseOptions(boolean create) {
@@ -568,6 +872,7 @@ public final class RocksStateMachine extends BaseStateMachine {
         return Message.valueOf(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(bytes));
     }
     private void closeDatabase() {
+        LIVE.remove(this);
         if (db != null) for (String id : java.util.List.copyOf(scans.keySet())) releaseScan(id);
         if (db != null) { db.close(); db = null; }
         if (writes != null) { writes.close(); writes = null; }
@@ -583,8 +888,20 @@ public final class RocksStateMachine extends BaseStateMachine {
         finally { dbLock.writeLock().unlock(); }
     }
     private void closeHeld() {
-        if (rebuildOnly) { closeDatabase(); return; }
-        closeDatabase();
+        closing = true;
+        compactExclusive.lock();
+        try {
+            if (!rebuildOnly) {
+                try { flushHeld(); }
+                catch (IOException ex) { LOG.warning("关闭前刷盘失败：" + ex.getMessage()); }
+            }
+            synchronized (compactState) {
+                bytesSinceCompact = 0;
+                uncompactedSinceMs = 0;
+            }
+            closeDatabase();
+        } finally { compactExclusive.unlock(); }
+        if (rebuildOnly) return;
         if (getLifeCycle().getCurrentState() != org.apache.ratis.util.LifeCycle.State.CLOSED) {
             getLifeCycle().transition(org.apache.ratis.util.LifeCycle.State.CLOSING);
             getLifeCycle().transition(org.apache.ratis.util.LifeCycle.State.CLOSED);
