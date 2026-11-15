@@ -58,10 +58,19 @@ public final class DistributedCatalog {
 
     public GraphDefinition create(String requestId, String name, int partitions, int replicas,
                                    IdType vertexType, IdType edgeType, String comment) {
+        return create(requestId, name, partitions, replicas, vertexType, edgeType, comment, 0, 0);
+    }
+
+    public GraphDefinition create(String requestId, String name, int partitions, int replicas,
+                                   IdType vertexType, IdType edgeType, String comment, int vertexIdLength, int edgeIdLength) {
         if (name == null || !name.matches("[\\p{L}][\\p{L}\\p{N}_]{0,127}") || partitions < 1 || partitions > 65535
                 || replicas < 1 || vertexType == IdType.ID_UNSPECIFIED || edgeType == IdType.ID_UNSPECIFIED) {
             throw new ClusterException("INVALID_ARGUMENT", "图名、分片、副本或 ID 类型无效");
         }
+        int vertexLength = vertexIdLength > 0 ? vertexIdLength : 0;
+        int edgeLength = edgeIdLength > 0 ? edgeIdLength : 0;
+        if (vertexLength > 0) validateIdLength(vertexType, vertexLength);
+        if (edgeLength > 0) validateIdLength(edgeType, edgeLength);
         List<Node> nodes = placementNodes();
         if (replicas > nodes.size()) throw new ClusterException("INSUFFICIENT_NODES", "可用存储节点不足以满足副本数");
         ByteString key = graphKey(name);
@@ -72,8 +81,8 @@ public final class DistributedCatalog {
             GraphDefinition stored = parseGraph(existing);
             if (stored.getState().equals("DROPPED")) {
                 // 同名重建必须分配新 graphId，绝不能复用旧分片的 Raft 身份。
-                // 旧目录由 Storage 后台在租约结束后隔离并清空。
-                    definition = allocate(name, requestId, partitions, replicas, vertexType, edgeType, comment, existing);
+                // 旧目录由 Storage 后台立刻卸下并清空，不等 Schema 租约。
+                    definition = allocate(name, requestId, partitions, replicas, vertexType, edgeType, comment, vertexLength, edgeLength, existing);
             } else {
                 definition = graph(name);
                 ByteString owner = storage.get(0, 0, TransactionEngine.text("catalog/createOwner/" + name));
@@ -84,12 +93,14 @@ public final class DistributedCatalog {
                 // 建图是一个可恢复的控制任务。请求在逐分片 addGroup 期间失败后，
                 // 后续请求可以继续同一个 CREATING 定义，但不能以不同参数覆盖原计划。
                 if (definition.getPartitions() != partitions || definition.getReplicas() != replicas
-                        || definition.getVertexIdType() != vertexType || definition.getEdgeIdType() != edgeType) {
+                        || definition.getVertexIdType() != vertexType || definition.getEdgeIdType() != edgeType
+                        || (vertexLength > 0 && definition.getVertexIdLength() > 0 && definition.getVertexIdLength() != vertexLength)
+                        || (edgeLength > 0 && definition.getEdgeIdLength() > 0 && definition.getEdgeIdLength() != edgeLength)) {
                     throw new ClusterException("REQUEST_CONFLICT", "同名图正在以不同参数创建");
                 }
             }
         } else {
-            definition = allocate(name, requestId, partitions, replicas, vertexType, edgeType, comment, null);
+            definition = allocate(name, requestId, partitions, replicas, vertexType, edgeType, comment, vertexLength, edgeLength, null);
         }
         for (int part = 0; part < definition.getPartitions(); part++) {
             DataGroupSpec.Builder spec = DataGroupSpec.newBuilder().setGraphId(definition.getId()).setPartId(part).setDataMode(dataMode(nodes));
@@ -127,7 +138,7 @@ public final class DistributedCatalog {
     }
 
     private GraphDefinition allocate(String name, String requestId, int partitions, int replicas,
-                                     IdType vertexType, IdType edgeType, String comment, ByteString expectedGraph) {
+                                     IdType vertexType, IdType edgeType, String comment, int vertexIdLength, int edgeIdLength, ByteString expectedGraph) {
         ByteString graph = graphKey(name);
         ByteString allocation = TransactionEngine.text("catalog/nextGraphId");
         ByteString expected = expectedGraph;
@@ -138,6 +149,7 @@ public final class DistributedCatalog {
             long next = counter == null ? 1 : Long.parseLong(counter.toStringUtf8());
             GraphDefinition definition = GraphDefinition.newBuilder().setId(next).setName(name)
                     .setPartitions(partitions).setReplicas(replicas).setVertexIdType(vertexType).setEdgeIdType(edgeType)
+                    .setVertexIdLength(vertexIdLength).setEdgeIdLength(edgeIdLength)
                     .setSchemaVersion(1).setState("CREATING").setDataMode(mode).setComment(comment == null ? "" : comment).build();
             try {
                 storage.write(0, 0, StorageGateway.batch("graph.allocate/" + requestId + "/" + next)
@@ -174,19 +186,19 @@ public final class DistributedCatalog {
         GraphDefinition graph = before;
         TypeDefinition.Builder normalized = type.toBuilder();
         if (type.getNode()) {
-            IdType requested = type.getIdType() == IdType.ID_UNSPECIFIED ? graph.getVertexIdType() : type.getIdType();
-            if (requested == IdType.ID_UNSPECIFIED) requested = IdType.INT64;
-            boolean hasNodeType = graph.getTypesList().stream().anyMatch(TypeDefinition::getNode);
-            if (hasNodeType && requested != graph.getVertexIdType()) {
-                throw new ClusterException("REQUEST_CONFLICT", "同一张图的节点类型必须使用相同的 ID 类型");
+            IdType graphType = graph.getVertexIdType() == IdType.ID_UNSPECIFIED ? IdType.INT64 : graph.getVertexIdType();
+            int graphLength = canonicalIdLength(graphType, graph.getVertexIdLength());
+            if (type.getIdType() != IdType.ID_UNSPECIFIED && type.getIdType() != graphType) {
+                throw new ClusterException("REQUEST_CONFLICT", "点类型必须使用图空间主键类型 " + graphType.name());
             }
-            if (!hasNodeType && requested != graph.getVertexIdType()) {
-                // 空图的第一个节点类型可以确定图级 vertex ID 编码；已有数据不能这样改编码。
-                graph = graph.toBuilder().setVertexIdType(requested).build();
+            int declared = graphType == IdType.STRING ? type.getIdLength() : (type.getIdLength() == 0 ? 64 : type.getIdLength());
+            if (declared != 0 && declared != graphLength) {
+                throw new ClusterException("REQUEST_CONFLICT", graphType == IdType.STRING
+                        ? "点类型必须使用图空间主键长度 " + graphLength
+                        : "整数主键固定为 INT64（64 位）");
             }
-            int length = type.getIdLength() == 0 ? (requested == IdType.STRING ? 4096 : 19) : type.getIdLength();
-            validateIdLength(requested, length);
-            normalized.setIdType(requested).setIdLength(length);
+            validateIdLength(graphType, graphLength);
+            normalized.setIdType(graphType).setIdLength(graphLength);
         }
         if (normalized.getId() == 0) {
             int nextId = graph.getTypesList().stream().mapToInt(TypeDefinition::getId).max().orElse(0) + 1;
@@ -202,9 +214,17 @@ public final class DistributedCatalog {
         return next;
     }
 
+    public static int canonicalIdLength(IdType type, int length) {
+        if (type != IdType.STRING) return 64;
+        return length > 0 ? length : 64;
+    }
+
     private static void validateIdLength(IdType type, int length) {
-        int max = type == IdType.INT64 ? 19 : 4096;
-        if (length < 1 || length > max) throw new ClusterException("INVALID_ARGUMENT", "ID 长度必须在 1 到 " + max + " 之间");
+        if (type != IdType.STRING) {
+            if (length != 64) throw new ClusterException("INVALID_ARGUMENT", "整数主键固定为 INT64（64 位）");
+            return;
+        }
+        if (length < 1 || length > 64) throw new ClusterException("INVALID_ARGUMENT", "字符串主键长度必须在 1 到 64 之间");
     }
     public void createAlias(String requestId, String alias, String target) {
         if (alias == null || !alias.matches("[\\p{L}][\\p{L}\\p{N}_]{0,127}")) throw new ClusterException("INVALID_ARGUMENT", "别名格式无效");
@@ -235,7 +255,7 @@ public final class DistributedCatalog {
         requireWritable(graph);
         update(requestId, graph, graph.toBuilder().setState("DROPPED").build());
         // 状态提交后立即返回。清空 RocksDB 和 Raft 文件可能很慢，同步等完会超时，目录却留下。
-        // 各 Storage 看到 DROPPED 后，在后台等 Schema 租约结束，卸下 Group，再按带宽删除文件。
+        // 各 Storage 看到 DROPPED 后，在后台卸下 Group 并立刻删除文件，不等 Schema 租约，也不限速。
         // 删除只针对这个 graphId；同名重建会得到新 graphId。历史 Metadata 记录仍保留。
     }
 

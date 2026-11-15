@@ -24,6 +24,7 @@ final class GqlReader {
             Map.entry("create", Kind.CREATE),
              Map.entry("graph", Kind.GRAPH),
              Map.entry("parts", Kind.PARTS),
+            Map.entry("replicas", Kind.REPLICAS),
             Map.entry("graphs", Kind.GRAPHS),
             Map.entry("use", Kind.USE),
             Map.entry("alias", Kind.ALIAS),
@@ -169,7 +170,22 @@ final class GqlReader {
             String name = ident();
             boolean ifNotExists = ifNotExists();
             int parts = take(Kind.PARTS) ? positiveInt("分片数量") : 1;
-            return new Stmt.CreateGraph(name, parts, comment(), ifNotExists);
+            int replicas = take(Kind.REPLICAS) ? positiveInt("副本数量") : 1;
+            String idType = "INT";
+            int idLength = 0;
+            if (take(Kind.ID)) {
+                if (take(Kind.STRING)) {
+                    idType = "STRING";
+                    idLength = stringIdLength();
+                } else if (take(Kind.INT) || take(Kind.INT64) || take(Kind.INTEGER_WORD)) {
+                    idType = "INT";
+                    if (take(Kind.LP)) return fail("INT64 主键固定为 64 位，不要写长度");
+                    idLength = 64;
+                } else {
+                    return fail("ID 后面要写 INT64 或 STRING");
+                }
+            }
+            return new Stmt.CreateGraph(name, parts, comment(), ifNotExists, replicas, idType, idLength);
         }
         if (take(Kind.ALIAS)) {
             String alias = ident();
@@ -186,22 +202,17 @@ final class GqlReader {
         boolean ifNotExists = ifNotExists();
         String comment = comment();
         String idType = "INT";
-        int idLength = 19;
+        int idLength = 64;
         boolean idSpecified = false;
         if (node && take(Kind.ID)) {
             idSpecified = true;
             if (take(Kind.STRING)) {
                 idType = "STRING";
-                idLength = idLength();
+                idLength = stringIdLength();
             } else if (take(Kind.INT) || take(Kind.INT64) || take(Kind.INTEGER_WORD)) {
                 idType = "INT";
-                if (take(Kind.LP)) {
-                    idLength = positiveInt("ID 长度");
-                    expect(Kind.RP, "ID 长度缺少右括号");
-                }
-                if (idLength > 19) {
-                    return fail("INT ID 长度不能超过 19 位");
-                }
+                if (take(Kind.LP)) return fail("INT64 主键固定为 64 位，不要写长度");
+                idLength = 64;
             } else {
                 return fail("ID 后面要写 INT 或 STRING");
             }
@@ -210,6 +221,12 @@ final class GqlReader {
         List<Stmt.Field> fields = fields();
         expect(Kind.RP, "类型定义缺少右括号");
         return new Stmt.CreateType(node, name, comment, idType, idLength, idSpecified, fields, ifNotExists);
+    }
+
+    private int stringIdLength() {
+        int value = idLength();
+        if (value > 64) return fail("STRING ID 长度不能超过 64");
+        return value;
     }
 
     private int idLength() {
@@ -1686,7 +1703,7 @@ final class GqlReader {
     private enum Kind {
         IDENT, INTEGER, REAL, STRING,
         BOOL, BOOLEAN, INT, INT64, INTEGER_WORD, DOUBLE, DATETIME, ID,
-        CREATE, GRAPH, GRAPHS, PARTS, USE, ALIAS, ALIASES, FOR, DROP, SHOW, NODE, REL, TYPES, TYPE,
+        CREATE, GRAPH, GRAPHS, PARTS, REPLICAS, USE, ALIAS, ALIASES, FOR, DROP, SHOW, NODE, REL, TYPES, TYPE,
         DESCRIBE, ALTER, ADD, NULL, INSERT, MATCH, WHERE, RETURN, ORDER, BY, LIMIT, SKIP,
         SET, DELETE, DISTINCT, CALL, YIELD, INDEX, INDEXES, UNIQUE, ON, COMMENT, EXPLAIN,
         AND, OR, XOR, NOT, IS, IN, AS, ASC, DESC, TRUE, FALSE,

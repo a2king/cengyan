@@ -52,13 +52,13 @@ class ComputeIntegrationTest {
             assertEquals("NODE_NOT_FOUND", badNode.path("code").asText());
             ObjectNode create = request(token, "createGraph").put("name", "Company").put("partitions", 3).put("vertexIdType", "STRING").put("edgeIdType", "STRING");
             ok(call(writer, reader, create));
-            ok(call(writer, reader, query(token, "CREATE NODE TYPE Company COMMENT '企业节点' ID STRING(36) (name STRING NULL COMMENT '名称')")));
+            ok(call(writer, reader, query(token, "CREATE NODE TYPE Company COMMENT '企业节点' ID STRING(64) (name STRING NULL COMMENT '名称')")));
             ok(call(writer, reader, query(token, "CREATE REL TYPE holder ()")));
             JsonNode nodeTypes = call(writer, reader, query(token, "SHOW NODE TYPES"));
             ok(nodeTypes);
             assertEquals(List.of("name", "id", "schemaVersion", "idType", "idLength", "comment"), JSON.convertValue(nodeTypes.path("columns"), List.class));
             assertEquals("STRING", nodeTypes.path("rows").get(0).get(3).asText());
-            assertEquals(36, nodeTypes.path("rows").get(0).get(4).asInt());
+            assertEquals(64, nodeTypes.path("rows").get(0).get(4).asInt());
             assertEquals("企业节点", nodeTypes.path("rows").get(0).get(5).asText());
             JsonNode description = call(writer, reader, query(token, "DESCRIBE NODE TYPE Company"));
             ok(description);

@@ -66,11 +66,18 @@ public final class RemoteQueryEngine {
             return project(List.of(Map.of()), select.tail().items(), select.tail().orderBy(), select.tail().distinct(), select.tail().skip(), select.tail().limit(), eval, canceled);
         }
         if (statement instanceof Stmt.CreateGraph create) {
-            catalog.create(requestId, create.name(), create.parts(), 1, IdType.INT64, IdType.INT64, create.comment());
+            IdType idType = create.idType() != null && create.idType().equalsIgnoreCase("STRING") ? IdType.STRING : IdType.INT64;
+            catalog.create(requestId, create.name(), create.parts(), Math.max(1, create.replicas()), idType, idType, create.comment(), create.idLength(), create.idLength());
             return QueryResult.changed(1);
         }
         if (statement instanceof Stmt.Show show && show.kind() == Stmt.Show.Kind.GRAPHS) {
-            return new QueryResult(List.of("name", "comment"), catalog.graphs().stream().map(g -> List.<Object>of(g.getName(), g.getComment())).toList(), 0);
+            return new QueryResult(List.of("name", "comment", "vertexIdType", "vertexIdLength", "edgeIdType", "edgeIdLength"), catalog.graphs().stream().map(g -> {
+                IdType vertex = g.getVertexIdType() == IdType.ID_UNSPECIFIED ? IdType.INT64 : g.getVertexIdType();
+                IdType edge = g.getEdgeIdType() == IdType.ID_UNSPECIFIED ? vertex : g.getEdgeIdType();
+                int vertexLength = DistributedCatalog.canonicalIdLength(vertex, g.getVertexIdLength());
+                int edgeLength = DistributedCatalog.canonicalIdLength(edge, g.getEdgeIdLength());
+                return List.<Object>of(g.getName(), g.getComment(), vertex.name(), vertexLength, edge.name(), edgeLength);
+            }).toList(), 0);
         }
         if (statement instanceof Stmt.Show show && show.kind() == Stmt.Show.Kind.ALIASES) return new QueryResult(List.of("alias", "graph"), catalog.aliases(), 0);
         if (statement instanceof Stmt.CreateAlias alias) { catalog.createAlias(requestId, alias.alias(), alias.graph()); return QueryResult.changed(1); }
@@ -185,7 +192,8 @@ public final class RemoteQueryEngine {
                 List<List<Object>> rows = graph.getTypesList().stream().filter(t -> t.getNode() == node).map(t -> {
                     if (node) {
                         IdType idType = t.getIdType() == IdType.ID_UNSPECIFIED ? graph.getVertexIdType() : t.getIdType();
-                        int idLength = t.getIdLength() == 0 ? (idType == IdType.STRING ? 4096 : 19) : t.getIdLength();
+                        int fallback = DistributedCatalog.canonicalIdLength(idType, graph.getVertexIdLength());
+                        int idLength = t.getIdLength() == 0 ? fallback : t.getIdLength();
                         return List.<Object>of(t.getName(), t.getId(), graph.getSchemaVersion(), idType.name(), idLength, t.getComment());
                     }
                     return List.<Object>of(t.getName(), t.getId(), graph.getSchemaVersion(), t.getComment());
