@@ -6,7 +6,6 @@ import io.cengyan.distributed.ClusterException;
 import io.cengyan.distributed.StorageGateway;
 import io.cengyan.distributed.TransactionEngine;
 import io.cengyan.protocol.proto.ClusterProtocol.GraphDefinition;
-import io.cengyan.protocol.proto.ClusterProtocol.LeaseHorizon;
 import io.cengyan.protocol.proto.ClusterProtocol.ScanPage;
 import io.cengyan.raft.GroupIds;
 import io.cengyan.raft.RaftNode;
@@ -29,8 +28,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 图标记为 DROPPED 之后，在本机后台卸下 Data Group 并清空文件。
- * 卸下时只把目录改名为 {@code raft/dropped-<uuid>}，Ratis 重启不会把它当成活 Group。
- * 文件按 {@code background_bytes_per_second} 慢慢删除，避免一次清空把删除请求拖到超时。
+ * 卸下时先拒绝新的导入和查询，关掉库并放开句柄，再把目录改名为 {@code raft/dropped-<uuid>}。
+ * 清空在后台线程里立刻进行，不等 Schema 租约，也不按带宽限速。删除请求本身不等待清空，避免超时。
+ * Schema 迁移的租约保留窗只约束活图上的旧版本回收。
  */
 final class DroppedGraphCleanup {
     private static final Logger log = LoggerFactory.getLogger(DroppedGraphCleanup.class);
@@ -83,27 +83,6 @@ final class DroppedGraphCleanup {
         return false;
     }
 
-    boolean leaseRetained(long graphId) {
-        long now = System.currentTimeMillis();
-        ByteString after = ByteString.EMPTY;
-        String cursor = "";
-        ByteString prefix = TransactionEngine.text("schema/lease/" + graphId + "/");
-        do {
-            ScanPage page = gateway.scan(0, 0, prefix, after, 100, cursor);
-            for (var item : page.getEntriesList()) {
-                try {
-                    if (LeaseHorizon.parseFrom(item.getValue()).getRetainUntilMs() > now) return true;
-                } catch (InvalidProtocolBufferException ex) {
-                    throw new ClusterException("CORRUPT_DATA", "租约授权窗口损坏", ex);
-                }
-            }
-            if (!page.getMore()) return false;
-            after = page.getLastKey();
-            cursor = page.getCursorId();
-        } while (!closed.get());
-        return true;
-    }
-
     private void run(boolean force) {
         if (closed.get()) return;
         if (paused && !force) return;
@@ -118,12 +97,6 @@ final class DroppedGraphCleanup {
         for (GraphDefinition graph : droppedGraphs()) {
             if (closed.get()) return;
             if (graph.getId() <= 0) continue;
-            boolean leased;
-            try { leased = leaseRetained(graph.getId()); }
-            catch (RuntimeException ex) {
-                log.warn("读取图 {} 的 Schema 租约失败，本轮不删除它的数据目录：{}", graph.getId(), ex.toString());
-                continue;
-            }
             int parts = graph.getPartitions();
             if (parts < 1 || parts > 65535) {
                 log.warn("已删除图 {} 的分片数无效：{}", graph.getId(), parts);
@@ -135,8 +108,10 @@ final class DroppedGraphCleanup {
                 try {
                     RaftGroupId id = GroupIds.data(config.clusterId(), graph.getId(), partId);
                     if (!node.hosts(id) && !node.dataDirectoryPresent(id)) continue;
-                    if (node.hosts(id)) armWriteGate(graph.getId(), partId);
-                    if (leased) continue;
+                    if (node.hosts(id)) {
+                        node.prepareDrop(id);
+                        armWriteGate(graph.getId(), partId);
+                    }
                     Optional<Path> quarantined = node.detachDataGroup(id);
                     quarantined.ifPresent(path -> log.info("已隔离已删除图的数据目录：graphId={} partId={} groupId={} directory={}",
                             graph.getId(), partId, id.getUuid(), path.getFileName()));
@@ -186,14 +161,13 @@ final class DroppedGraphCleanup {
 
     private void drain() {
         try {
-            long rate = Math.max(1, config.backgroundBytesPerSecond());
             while (!closed.get()) {
                 List<Path> dirs = node.quarantinedDirectories();
                 if (dirs.isEmpty()) return;
                 for (Path dir : dirs) {
                     if (closed.get()) return;
                     long started = System.nanoTime();
-                    node.deleteQuarantined(dir, rate, closed::get);
+                    node.deleteQuarantined(dir, closed::get);
                     if (!Files.exists(dir)) {
                         log.info("已清空隔离目录 {}，耗时 {} ms", dir.getFileName(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
                     }

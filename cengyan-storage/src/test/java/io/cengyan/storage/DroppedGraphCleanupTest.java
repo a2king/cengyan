@@ -2,8 +2,10 @@ package io.cengyan.storage;
 
 import io.cengyan.distributed.ClusterException;
 import io.cengyan.distributed.DistributedCatalog;
+import io.cengyan.distributed.SchemaLeases;
 import io.cengyan.distributed.StorageGateway;
 import io.cengyan.protocol.proto.ClusterProtocol.IdType;
+import io.cengyan.protocol.proto.ClusterProtocol.LeaseHorizon;
 import io.cengyan.raft.GroupIds;
 import io.cengyan.raft.RaftSettings;
 import org.apache.ratis.protocol.RaftPeer;
@@ -61,6 +63,33 @@ class DroppedGraphCleanupTest {
             assertNotEquals(goneId, again.getId());
             assertTrue(Files.isDirectory(raftRoot.resolve(GroupIds.data("drop-cleanup", again.getId(), 0).getUuid().toString())));
             assertFalse(residue(raftRoot, goneUuid));
+        }
+    }
+
+    @Test @Timeout(90)
+    void 租约未结束也立即删除数据目录并且保留其他图() throws Exception {
+        int raft, rpc;
+        try (var a = new ServerSocket(0); var b = new ServerSocket(0)) { raft = a.getLocalPort(); rpc = b.getLocalPort(); }
+        var peer = RaftPeer.newBuilder().setId("s1").setAddress("127.0.0.1:" + raft).setClientAddress("127.0.0.1:" + rpc).build();
+        var config = new StorageConfig("drop-lease", "s1", new InetSocketAddress("127.0.0.1", rpc), new InetSocketAddress("127.0.0.1", raft),
+                home, List.of(peer), RaftSettings.defaults(), 8 * 1024 * 1024, 128, 4, 64);
+        Path raftRoot = home.resolve("raft");
+        try (var server = new StorageServer(config); var gateway = new StorageGateway("drop-lease", List.of(config.rpcAddress()))) {
+            server.pauseDroppedGraphCleanup();
+            var catalog = new DistributedCatalog(gateway);
+            var gone = catalog.create("create-gone", "Gone", 1, 1, IdType.STRING, IdType.STRING);
+            var stay = catalog.create("create-stay", "Stay", 1, 1, IdType.STRING, IdType.STRING);
+            new SchemaLeases(gateway).acquire("Gone", "query-1", System.currentTimeMillis() + 60_000, 1, false);
+            LeaseHorizon horizon = LeaseHorizon.parseFrom(gateway.get(0, 0, SchemaLeases.key(gone.getId(), gone.getSchemaVersion())));
+            assertTrue(horizon.getRetainUntilMs() > System.currentTimeMillis());
+            String goneUuid = GroupIds.data("drop-lease", gone.getId(), 0).getUuid().toString();
+            String stayUuid = GroupIds.data("drop-lease", stay.getId(), 0).getUuid().toString();
+            catalog.dropGraph("drop-gone", "Gone");
+            awaitCleared(server, raftRoot, goneUuid);
+            assertTrue(horizon.getRetainUntilMs() > System.currentTimeMillis(), "删除不能等租约保留窗结束");
+            assertTrue(Files.isDirectory(raftRoot.resolve(stayUuid)), "其他图的目录必须保留");
+            assertTrue(Files.isDirectory(raftRoot.resolve(GroupIds.metadata("drop-lease").getUuid().toString())), "Metadata 目录必须保留");
+            assertEquals("ACTIVE", catalog.graph("Stay").getState());
         }
     }
 
