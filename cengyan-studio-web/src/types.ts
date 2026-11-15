@@ -29,6 +29,8 @@ export interface GraphSpace {
   name: string;
   aliases: string[];
   comment?: string;
+  idType?: string;
+  idLength?: number;
 }
 
 export interface TypeRow {
@@ -93,4 +95,7 @@ export interface OpsOverview {
   computeNodes?: Array<Record<string, unknown>>;
   storageNodes?: Array<Record<string, unknown>>;
   shards?: Array<Record<string, unknown>>;
+  clusterHealth?: string;
+  collectedAt?: number;
+  events?: Array<{ ts: number; nodeId: string; level: string; event: string; message: string }>;
 }

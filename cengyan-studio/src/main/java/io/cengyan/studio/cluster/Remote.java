@@ -1,6 +1,8 @@
 package io.cengyan.studio.cluster;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.*;
 
@@ -52,8 +54,11 @@ final class Remote {
                 libc, "yes".equals(values.get("systemd")), free, "0".equals(values.get("uid")), "yes".equals(values.get("tar")));
     }
 
-    /** 不满足条件时抛出带原因的异常。 */
-    static void require(Probe probe, String host) {
+    /**
+     * 不满足条件时抛出带原因的异常。
+     * @return 写入 Raft 和 RPC 的地址。主机名会解析成这台机器网卡上的 IP，避免其他节点用短主机名互相连接。
+     */
+    static String require(Probe probe, String host) {
         if (!probe.root()) throw new ClusterError("UNSUPPORTED_SERVER", "登录用户不是 root");
         if (!Set.of("x86_64", "aarch64").contains(probe.arch())) throw new ClusterError("UNSUPPORTED_SERVER", "不支持的 CPU 架构：" + probe.arch() + "（只支持 x86_64、aarch64）");
         if ("musl".equals(probe.libc())) throw new ClusterError("UNSUPPORTED_SERVER", "不支持 musl 系统（如 Alpine），离线 JDK 需要 glibc");
@@ -62,9 +67,42 @@ final class Remote {
         if (!probe.systemd()) throw new ClusterError("UNSUPPORTED_SERVER", "服务器没有运行 systemd");
         if (!probe.tar()) throw new ClusterError("UNSUPPORTED_SERVER", "服务器缺少 tar 命令");
         if (probe.freeMb() < 1024) throw new ClusterError("UNSUPPORTED_SERVER", BASE + " 所在磁盘可用空间不足 1GB（当前 " + probe.freeMb() + "MB）");
-        if (host.matches("\\d+\\.\\d+\\.\\d+\\.\\d+") && !probe.ips().contains(host))
-            throw new ClusterError("UNSUPPORTED_SERVER", "服务器网卡上没有地址 " + host + "（当前：" + String.join(", ", probe.ips())
+        return clusterAddress(host, probe.ips(), null);
+    }
+
+    /** {@code resolved} 为空时现场解析主机名。测试传入解析结果，避免依赖 DNS。 */
+    static String clusterAddress(String entered, List<String> nicIps, List<String> resolved) {
+        List<String> nic = nicIps.stream().filter(Remote::usableIpv4).distinct().toList();
+        if (usableIpv4(entered)) {
+            if (!nic.contains(entered)) throw new ClusterError("UNSUPPORTED_SERVER", "服务器网卡上没有地址 " + entered + "（当前：" + String.join(", ", nic)
                     + "）。节点会监听这个地址，请填写服务器的内网 IP");
+            return entered;
+        }
+        List<String> addresses = resolved != null ? resolved : lookup(entered);
+        List<String> matched = addresses.stream().filter(nic::contains).distinct().toList();
+        if (matched.isEmpty()) throw new ClusterError("UNSUPPORTED_SERVER", "主机名 " + entered + " 不能作为节点地址。解析结果："
+                + (addresses.isEmpty() ? "无法解析" : String.join(", ", addresses)) + "。服务器网卡：" + String.join(", ", nic) + "。请填写内网 IP");
+        return matched.getFirst();
+    }
+
+    private static List<String> lookup(String host) {
+        try {
+            return Arrays.stream(InetAddress.getAllByName(host)).map(InetAddress::getHostAddress).filter(Remote::usableIpv4).distinct().toList();
+        } catch (UnknownHostException ex) {
+            return List.of();
+        }
+    }
+
+    private static boolean usableIpv4(String address) {
+        String[] parts = address.split("\\.", -1);
+        if (parts.length != 4) return false;
+        int[] numbers = new int[4];
+        for (int i = 0; i < 4; i++) {
+            if (!parts[i].matches("\\d{1,3}")) return false;
+            numbers[i] = Integer.parseInt(parts[i]);
+            if (numbers[i] > 255) return false;
+        }
+        return numbers[0] != 0 && numbers[0] != 127 && !(numbers[0] == 169 && numbers[1] == 254);
     }
 
     private static int compare(String a, String b) {
@@ -199,10 +237,11 @@ final class Remote {
         return shell.exec("journalctl -u " + unit(nodeId) + " -n " + Math.max(1, Math.min(lines, 2000)) + " --no-pager 2>&1", SHORT).output();
     }
 
-    /** 停止并删除服务和节点目录；deleteData 为真时同时删除数据目录。 */
+    /** 停止进程并删除服务和节点目录；deleteData 为真时同时删除数据目录。 */
     static void removeNode(RemoteShell shell, ClusterState.NodeSpec node, boolean deleteData) throws IOException {
         String unit = unit(node.id());
-        StringBuilder script = new StringBuilder("systemctl disable --now " + unit + " 2>/dev/null || true; rm -f " + unitFile(node.id())
+        StringBuilder script = new StringBuilder("systemctl stop " + unit + " 2>/dev/null || true; systemctl kill --kill-who=all " + unit
+                + " 2>/dev/null || true; systemctl disable " + unit + " 2>/dev/null || true; rm -f " + unitFile(node.id())
                 + "; systemctl daemon-reload; rm -rf -- " + quote(nodeDir(node.id())));
         if (deleteData) {
             if (!safeDataDir(node.dataDir())) throw new ClusterError("INVALID_ARGUMENT", "拒绝删除数据目录：" + node.dataDir());

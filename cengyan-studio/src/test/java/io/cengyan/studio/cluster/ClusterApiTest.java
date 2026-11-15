@@ -71,8 +71,9 @@ class ClusterApiTest {
 
     @Test void probeRules() {
         var ok = new Remote.Probe("x86_64", "Rocky 9", "h", java.util.List.of("10.0.0.5"), "2.34", true, 5000, true, true);
-        Remote.require(ok, "10.0.0.5");
-        Remote.require(ok, "db-1.internal");
+        assertEquals("10.0.0.5", Remote.require(ok, "10.0.0.5"));
+        assertEquals("10.0.0.5", Remote.clusterAddress("db-1.internal", java.util.List.of("10.0.0.5"), java.util.List.of("10.0.0.5")));
+        assertThrows(ClusterError.class, () -> Remote.clusterAddress("craw-plat1", java.util.List.of("10.0.0.5"), java.util.List.of()), "解析不了的主机名不能写入 Raft 地址");
         assertThrows(ClusterError.class, () -> Remote.require(ok, "10.0.0.9"), "填写的 IP 必须在服务器网卡上");
         assertThrows(ClusterError.class, () -> Remote.require(new Remote.Probe("x86_64", "Alpine", "h", java.util.List.of(), "musl", true, 5000, true, true), "h"));
         assertThrows(ClusterError.class, () -> Remote.require(new Remote.Probe("ppc64le", "x", "h", java.util.List.of(), "2.34", true, 5000, true, true), "h"));
@@ -85,6 +86,21 @@ class ClusterApiTest {
         assertFalse(Remote.safeDataDir("/data/a b"));
         assertTrue(Remote.safeDataDir("/data1/cengyan/storage-1"));
         assertEquals("'it'\"'\"'s'", RemoteShell.quote("it's"));
+    }
+
+    @Test void opsOverviewReadsLocalSnapshot() throws Exception {
+        Path home = Fakes.home(tmp.resolve("ops-home"));
+        try (StudioServer studio = StudioServer.start(config(home))) {
+            HttpResponse<String> response = http.send(HttpRequest.newBuilder(
+                    URI.create("http://127.0.0.1:" + studio.port() + "/api/ops/overview")).build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, response.statusCode());
+            JsonNode body = ClusterStore.JSON.readTree(response.body());
+            assertEquals("OK", body.path("code").asText());
+            assertEquals("UNKNOWN", body.path("clusterHealth").asText());
+            assertTrue(body.path("storageNodes").isArray());
+            assertTrue(body.path("events").isArray());
+            assertTrue(Files.exists(home.resolve("data/ops.db")));
+        }
     }
 
     @Test void sshKeyIsGeneratedOnceInOpenSshFormat() throws Exception {

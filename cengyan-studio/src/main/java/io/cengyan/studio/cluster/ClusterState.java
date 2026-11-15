@@ -35,6 +35,9 @@ public record ClusterState(String clusterId, String rootPassword, List<Server> s
         public Server withProbe(String nextHostKey, String nextArch, String nextOs, String nextHostname) {
             return new Server(id, host, sshPort, note, status, message, nextHostKey, nextArch, nextOs, nextHostname, jdkSha, releaseId);
         }
+        public Server withHost(String nextHost) {
+            return new Server(id, nextHost, sshPort, note, status, message, hostKey, arch, os, hostname, jdkSha, releaseId);
+        }
         public Server withJdk(String sha) {
             return new Server(id, host, sshPort, note, status, message, hostKey, arch, os, hostname, sha, releaseId);
         }

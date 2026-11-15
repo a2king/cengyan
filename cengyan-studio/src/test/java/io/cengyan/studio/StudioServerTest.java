@@ -339,6 +339,9 @@ class StudioServerTest {
             assertEquals(200, response.statusCode());
             assertTrue(response.body().contains("层岩控制台"));
             assertTrue(response.headers().firstValue("Content-Type").orElse("").startsWith("text/html"));
+            HttpResponse<String> ops = HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + studio.port() + "/ops")).GET().build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            assertEquals(200, ops.statusCode());
+            assertTrue(ops.body().contains("层岩控制台"));
         }
     }
 

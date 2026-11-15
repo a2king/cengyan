@@ -55,6 +55,17 @@ class ClusterOps {
         return storageCall(state, "metadata.maintenance.status", ClusterStore.JSON.createObjectNode());
     }
 
+    /** 重启前把该节点各分片的内存表刷进本地库，避免启动时再复制一份数据。 */
+    void flushStorage(ClusterState state, NodeSpec node) {
+        try (StorageGateway gateway = gateway(state)) {
+            var response = gateway.direct(new InetSocketAddress(ConfigRenderer.host(state, node), node.rpcPort()),
+                    "maintenance.flush", ByteString.EMPTY, Duration.ofMinutes(10));
+            if (!response.getCode().equals("OK")) throw new ClusterError(response.getCode(), response.getMessage());
+        } catch (ClusterException ex) {
+            throw new ClusterError(ex.code(), ex.getMessage(), ex);
+        }
+    }
+
     boolean transferLeader(ClusterState state, String nodeId) {
         return storageCall(state, "metadata.transferLeader", ClusterStore.JSON.createObjectNode().put("nodeId", nodeId)).path("transferred").asBoolean();
     }

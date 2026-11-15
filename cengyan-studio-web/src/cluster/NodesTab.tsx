@@ -113,29 +113,32 @@ function AddNodeModal({ ctx, role, onClose }: { ctx: ConsoleContext; role: Role;
 }
 
 function RemoveNodeModal({ ctx, node, onClose }: { ctx: ConsoleContext; node: NodeRow; onClose: () => void }) {
-  const [deleteData, setDeleteData] = useState(false);
+  const storage = node.role === 'STORAGE';
+  const [deleteData, setDeleteData] = useState(storage);
   const [confirm, setConfirm] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const submit = async () => {
     setLoading(true); setError('');
-    try { const task = await ctx.api.removeNode(node.id, deleteData, confirm); onClose(); ctx.started(task); }
+    try { const task = await ctx.api.removeNode(node.id, storage || deleteData, confirm); onClose(); ctx.started(task); }
     catch (reason) { setError(errorText(reason)); }
     finally { setLoading(false); }
   };
   return <Modal title={`移除节点 ${node.id}`} open onCancel={onClose} onOk={() => void submit()} okText="移除" confirmLoading={loading}
-    okButtonProps={{ danger: true, disabled: deleteData && confirm !== node.id }} destroyOnHidden>
+    okButtonProps={{ danger: true, disabled: (storage || deleteData) && confirm !== node.id }} destroyOnHidden>
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
-      <Text>{!node.joined ? '节点尚未加入集群，将直接停止并删除服务。'
-        : node.role === 'STORAGE' ? '先检查剩余存储节点能否满足图空间副本数，然后把该节点上的分片迁移到其他节点，迁移完成后移除。数据量大时可能需要较长时间。'
-        : '先停止接收新查询，等待进行中的查询结束（最多 5 分钟），然后从计算成员中移除。'}</Text>
-      <Radio.Group value={deleteData} onChange={(e) => setDeleteData(e.target.value)}>
-        <Space direction="vertical">
-          <Radio value={false}>保留数据目录 <Text type="secondary">{node.dataDir}</Text></Radio>
-          <Radio value={true}><Text type="danger">同时删除数据目录</Text></Radio>
-        </Space>
-      </Radio.Group>
-      {deleteData && <Input placeholder={`输入 ${node.id} 确认删除数据`} value={confirm} onChange={(e) => setConfirm(e.target.value)} status={confirm && confirm !== node.id ? 'error' : undefined} />}
+      <Text>{!node.joined ? '将停止进程，并删除该节点的配置和数据目录。'
+        : storage ? '先把该节点上的分片迁走，然后停止进程，删除配置、服务和数据目录。之后可以用相同节点 ID 重新添加。数据量大时迁移可能较久。'
+        : '先停止接收新查询，等待进行中的查询结束（最多 5 分钟），然后停止进程并从计算成员中移除。'}</Text>
+      {storage
+        ? <Alert type="warning" showIcon message="将删除全部配置和数据" description={<Text type="secondary">{node.dataDir}</Text>} />
+        : <Radio.Group value={deleteData} onChange={(e) => setDeleteData(e.target.value)}>
+            <Space direction="vertical">
+              <Radio value={false}>保留数据目录 <Text type="secondary">{node.dataDir}</Text></Radio>
+              <Radio value={true}><Text type="danger">同时删除数据目录</Text></Radio>
+            </Space>
+          </Radio.Group>}
+      {(storage || deleteData) && <Input placeholder={`输入 ${node.id} 确认删除`} value={confirm} onChange={(e) => setConfirm(e.target.value)} status={confirm && confirm !== node.id ? 'error' : undefined} />}
       {error && <Alert type="error" showIcon message={error} />}
     </Space>
   </Modal>;

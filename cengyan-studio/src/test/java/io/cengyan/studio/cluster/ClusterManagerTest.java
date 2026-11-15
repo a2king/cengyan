@@ -137,9 +137,9 @@ class ClusterManagerTest {
         assertFalse(manager.pendingRestart(manager.state(), manager.state().node("storage-1").orElseThrow()), "成员列表变化不需要重启");
 
         assertEquals("NOT_FOUND", assertThrows(ClusterError.class, () -> manager.addNode(Role.STORAGE, "missing", "x", 1, 2, 0, "/opt/x/y")).code());
-        assertEquals("PORT_IN_USE", assertThrows(ClusterError.class,
-                () -> manager.addNode(Role.STORAGE, serverId("10.0.1.1"), "storage-9", 19700, 19777, 0, "/opt/cengyan/data/s9")).code());
-        assertEquals(19710, manager.suggest(Role.STORAGE, serverId("10.0.1.1")).path("raftPort").asInt(), "同机第二个节点端口顺延");
+        assertEquals("CONFLICT", assertThrows(ClusterError.class,
+                () -> manager.addNode(Role.STORAGE, serverId("10.0.1.1"), "storage-9", 19710, 19711, 0, "/opt/cengyan/data/s9")).code());
+        assertEquals("CONFLICT", assertThrows(ClusterError.class, () -> manager.suggest(Role.STORAGE, serverId("10.0.1.1"))).code());
     }
 
     @Test void crashingNodeFailsFastWithItsLogs() throws Exception {
@@ -166,7 +166,7 @@ class ClusterManagerTest {
         assertTrue(props.contains("storage_seeds=10.0.2.1:19701"), props);
         assertTrue(props.contains("root_password=db-root-pass"));
         assertTrue(props.contains("compute_members=compute-1@10.0.2.1:19801@10.0.2.1:19800@10.0.2.1:19669"), props);
-        assertTrue(file(a, "/opt/cengyan/nodes/compute-1/node.env").contains("JAVA_OPTS=\"-Xms1g -Xmx4g\""));
+        assertTrue(file(a, "/opt/cengyan/nodes/compute-1/node.env").contains("JAVA_OPTS=\"-Xms4g -Xmx8g\""));
         assertEquals(new java.net.InetSocketAddress("10.0.2.1", 19669).getPort(), manager.databaseTarget().getPort());
         assertEquals("LAST_NODE", assertThrows(ClusterError.class, () -> manager.removeNode("compute-1", false)).code());
     }
@@ -187,10 +187,10 @@ class ClusterManagerTest {
         assertTrue(bad.details().containsKey("STORAGE.write_threads"), bad.details().toString());
         assertTrue(assertThrows(ClusterError.class, () -> manager.saveConfig(Map.of(Role.STORAGE, Map.of("JAVA_OPTS", "-Xmx1g; rm -rf /")), Map.of(), ""))
                 .details().containsKey("STORAGE.JAVA_OPTS"), "JVM 参数不能注入 shell");
-        assertTrue(assertThrows(ClusterError.class, () -> manager.saveConfig(Map.of(Role.COMPUTE, Map.of("query_memory_bytes", "1073741824")), Map.of(), ""))
+        assertTrue(assertThrows(ClusterError.class, () -> manager.saveConfig(Map.of(Role.COMPUTE, Map.of("query_memory_bytes", "8589934592")), Map.of(), ""))
                 .details().containsKey("COMPUTE.query_memory_bytes"), "单查询内存不能超过节点内存");
 
-        ConfigVersion v1 = manager.saveConfig(Map.of(Role.STORAGE, Map.of("write_threads", "16", "admission_threads", "2")), Map.of(), "调大写入线程");
+        ConfigVersion v1 = manager.saveConfig(Map.of(Role.STORAGE, Map.of("write_threads", "16", "admission_threads", "4")), Map.of(), "调大写入线程");
         assertEquals(1, v1.version());
         assertEquals(Map.of("write_threads", "16"), v1.roleDefaults().get(Role.STORAGE), "与默认值相同的项不保存");
         assertEquals(2, manager.overview().path("pendingRestart").asInt(), "两个存储节点待重启，计算节点不受影响");
@@ -221,7 +221,7 @@ class ClusterManagerTest {
     @Test void rollingRestartGoesOneNodeAtATimeInsideMaintenance() throws Exception {
         cluster();
         List<String> order = restartHooks();
-        manager.saveConfig(Map.of(Role.STORAGE, Map.of("write_threads", "16"), Role.COMPUTE, Map.of("query_slots", "8")), Map.of(), "");
+        manager.saveConfig(Map.of(Role.STORAGE, Map.of("write_threads", "16"), Role.COMPUTE, Map.of("query_slots", "4")), Map.of(), "");
         assertEquals(3, manager.overview().path("pendingRestart").asInt());
         TaskRunner.TaskView task = await(manager.restart(List.of()));
         assertEquals(State.DONE, task.state(), task.error());

@@ -149,7 +149,7 @@ public final class StudioServer implements AutoCloseable {
             return;
         }
         try {
-            JsonNode response = cluster != null ? cluster.opsOverview(5000) : computeOps.overview(5000);
+            JsonNode response = cluster != null ? cluster.opsOverview() : computeOps.overview(5000);
             int status = "OK".equals(response.path("code").asText()) ? 200 : 502;
             send(exchange, status, response);
         } catch (IOException ex) {
@@ -269,8 +269,11 @@ public final class StudioServer implements AutoCloseable {
             return;
         }
         String path = exchange.getRequestURI().getPath();
-        String resource = switch (path) {
-            case "/", "/index.html" -> "studio/index.html";
+        boolean appRoute = switch (path) {
+            case "/", "/index.html", "/graph", "/gql", "/running", "/ops", "/cluster" -> true;
+            default -> false;
+        };
+        String resource = appRoute ? "studio/index.html" : switch (path) {
             case "/app.js" -> "studio/app.js";
             case "/app.css" -> "studio/app.css";
             default -> null;

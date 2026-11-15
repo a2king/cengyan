@@ -37,11 +37,8 @@ button, input, textarea, select { font-family: inherit; }
 .menu-label small { color: #abb2c4; font-size: 11px; }
 .studio-menu .ant-menu-item-selected .menu-label small { color: #8794e9; }
 .sider-foot { position: static; right: auto; bottom: auto; left: auto; flex: 0 0 auto; margin: auto 16px 18px; }
-.connection-card, .user-card { display: flex; align-items: center; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 13px; background: #fbfcff; }
-.connection-card { margin-bottom: 10px; }
-.connection-card > div, .user-card-copy { display: flex; flex: 1; flex-direction: column; gap: 1px; }
-.connection-card .ant-typography { font-size: 11px; }
-.online-dot { width: 7px; height: 7px; border-radius: 50%; background: #27a975; box-shadow: 0 0 0 4px #e2f7ed; }
+.user-card { display: flex; align-items: center; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 13px; background: #fbfcff; }
+.user-card-copy { display: flex; flex: 1; flex-direction: column; gap: 1px; }
 .user-card .ant-avatar { flex: 0 0 auto; color: #5268e8; background: #eef0ff; }
 .user-card .ant-typography { font-size: 12px; }
 .studio-header { z-index: 2; display: flex; align-items: center; justify-content: space-between; height: 86px; padding: 0 34px; border-bottom: 1px solid var(--line); }
@@ -104,13 +101,16 @@ button, input, textarea, select { font-family: inherit; }
 .panel-stack { min-width: 0; max-width: 100%; }
 .workspace-card .ant-card-body { padding: 0 24px 24px; }
 .ops-summary-card.workspace-card > .ant-card-body { padding-top: 24px; }
+.ops-summary-card .ant-col { min-width: 0; }
+.ops-summary-card .metric-card { height: 100%; }
+.ops-summary-card .metric-card .ant-statistic-content-value { overflow-wrap: anywhere; }
 .workspace-card .ant-table-wrapper { max-width: 100%; }
 .workspace-card .ant-table-thead > tr > th { white-space: nowrap; }
-.ops-resource-table .ant-table { table-layout: fixed; }
+.ops-resource-table .ant-table { table-layout: auto; width: 100%; }
 .ops-resource-table .ant-table-content { overflow-x: auto; }
-/* antd 会给表格写 min-width:100%，列宽会被拉满。锁成声明宽度后，新增的指标列不再被挤或被拉宽。 */
-.ops-compute-table .ant-table-content > table { width: 832px !important; min-width: 832px !important; max-width: 832px !important; }
-.ops-storage-table .ant-table-content > table { width: 964px !important; min-width: 964px !important; max-width: 964px !important; }
+.ops-resource-table .ant-table-content > table { width: 100% !important; max-width: none !important; }
+.ops-compute-table .ant-table-content > table { min-width: max(100%, 900px) !important; }
+.ops-storage-table .ant-table-content > table { min-width: max(100%, 1040px) !important; }
 .ops-resource-table .ant-table-thead > tr > th,
 .ops-resource-table .ant-table-tbody > tr > td { padding-inline: 8px; white-space: nowrap; }
 .ops-num-col { white-space: nowrap; font-variant-numeric: tabular-nums; }
@@ -124,7 +124,6 @@ button, input, textarea, select { font-family: inherit; }
 .panel-toolbar { align-items: center; }
 .stats-cache-time { margin-top: 2px; }
 .panel-toolbar h4 { margin: 0 0 3px; color: #293352; }
-.detail-card { border: 1px solid #e4e7f2; background: #fbfcff; }
 .code-pill { padding: 4px 8px; color: #4d5fc2; background: #f0f2ff; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
 .property-list { display: flex; flex-direction: column; gap: 3px; }
 .property-row { display: grid; grid-template-columns: minmax(0, 1fr) 126px auto 32px; align-items: center; gap: 8px; }
@@ -133,7 +132,7 @@ button, input, textarea, select { font-family: inherit; }
 .checkbox-field input { accent-color: var(--primary); }
 .metric-card { border: 1px solid var(--line); box-shadow: var(--shadow); }
 .metric-card > .ant-card-body { padding: 24px; }
-.metric-card .ant-statistic-title { margin-top: 0; }
+.metric-card .ant-statistic-title { margin-top: 10px; }
 .cluster-overview .metric-card > .ant-card-body { padding-top: 10px; }
 .metric-card .ant-statistic-content { color: #293352; }
 .metric-card .ant-statistic-content-prefix { color: #6576de; }

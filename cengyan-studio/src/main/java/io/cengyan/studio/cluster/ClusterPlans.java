@@ -67,10 +67,15 @@ final class ClusterPlans {
                 step("检测系统环境", c -> {
                     openWithPassword.run(c);
                     Remote.Probe probe = Remote.probe(session[0]);
-                    c.log(probe.describe() + "，主机名 " + probe.hostname() + "，/opt 可用 " + probe.freeMb() + "MB");
-                    Remote.require(probe, server(id).host());
+                    c.log(probe.describe() + "，主机名 " + probe.hostname() + "，网卡 " + String.join(" ", probe.ips()) + "，/opt 可用 " + probe.freeMb() + "MB");
                     Server s = server(id);
-                    save(s.withProbe(s.hostKey(), probe.arch(), probe.os(), probe.hostname()));
+                    String address = Remote.require(probe, s.host());
+                    Server probed = s.withProbe(s.hostKey(), probe.arch(), probe.os(), probe.hostname());
+                    if (!address.equals(s.host())) {
+                        probed = probed.withHost(address);
+                        c.log("主机名 " + s.host() + " 解析为 " + address + "，节点之间使用这个 IP");
+                    }
+                    save(probed);
                 }),
                 step("安装 Studio 公钥", c -> {
                     openWithPassword.run(c);
@@ -194,7 +199,7 @@ final class ClusterPlans {
             steps.add(step("等待进行中的查询结束", c -> c.await("查询结束", DRAIN_TIMEOUT, () -> idle(id))));
             steps.add(step("从计算成员中移除", c -> m.ops.removeCompute(m.state(), otherCompute(id), id, true)));
         }
-        steps.add(step(deleteData ? "停止服务并删除节点和数据目录" : "停止服务并删除节点（保留数据目录）", c -> {
+        steps.add(step(deleteData ? "停止进程并删除配置和数据目录" : "停止进程并删除配置（保留数据目录）", c -> {
             NodeSpec n = node(id);
             try (RemoteShell shell = m.shell(n.serverId())) { Remote.removeNode(shell, n, deleteData); }
         }));
@@ -281,10 +286,12 @@ final class ClusterPlans {
                 }));
                 steps.add(step(id + "：重启", c -> {
                     c.await("本节点封存完成", JOIN_TIMEOUT, () -> sealed(id));
+                    m.ops.flushStorage(m.state(), node(id));
+                    c.log("已将内存表刷入本地数据库");
                     c.remember("boot." + id, bootId(id));
                     try (RemoteShell shell = m.shell(node(id).serverId())) { Remote.restart(shell, id); }
                 }));
-                steps.add(step(id + "：等待恢复并完成文件比对", c -> {
+                steps.add(step(id + "：等待恢复", c -> {
                     c.await("节点恢复", JOIN_TIMEOUT, () -> storageRecovered(c, id));
                     markDeployed(c, id);
                 }));
@@ -377,7 +384,7 @@ final class ClusterPlans {
         return n == null ? "" : n.path("bootId").asText();
     }
 
-    /** 新进程已启动、比对完成、本节点所有副本可信，且没有分片在写入或同步。新出现丢失分片时立即失败。 */
+    /** 新进程已打开本地库。已应用位置落后时由 Raft 重放日志。新出现丢失分片时立即失败。 */
     private boolean storageRecovered(Context c, String id) {
         JsonNode status = m.ops.maintenanceStatus(m.state());
         int lost = status.path("partitions").path("lost").asInt();
@@ -386,7 +393,7 @@ final class ClusterPlans {
         JsonNode n = statusNode(status, id);
         if (n == null || !n.path("reachable").asBoolean()) throw new ClusterError("PROGRESS", "节点尚未启动");
         if (n.path("bootId").asText().equals(c.param("boot." + id))) throw new ClusterError("PROGRESS", "节点尚未重启");
-        if (!n.path("resumed").asBoolean()) throw new ClusterError("PROGRESS", "正在比对本地数据文件");
+        if (!n.path("resumed").asBoolean()) throw new ClusterError("PROGRESS", "正在打开本地数据库并重放日志");
         if (n.path("untrustedReplicas").asInt() > 0) throw new ClusterError("PROGRESS", n.path("untrustedReplicas").asInt() + " 个副本比对不一致，正在全量同步");
         JsonNode parts = status.path("partitions");
         if (parts.path("writing").asInt() > 0 || parts.path("frozen").asInt() > 0) throw new ClusterError("PROGRESS", "分片同步中");

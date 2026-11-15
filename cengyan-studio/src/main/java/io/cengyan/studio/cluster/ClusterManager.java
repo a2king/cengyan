@@ -21,11 +21,19 @@ public final class ClusterManager implements AutoCloseable {
     final TaskRunner tasks;
     /** 添加服务器时的 root 密码，只在内存中保存到免密登录验证通过为止，不写盘。 */
     final Map<String, String> passwords = new ConcurrentHashMap<>();
+    private OpsMonitor opsMonitor;
 
     public static ClusterManager open(Path home) throws IOException {
         Path data = home.resolve("data");
         ClusterStore store = new ClusterStore(data);
-        return new ClusterManager(store, new Bundle(home), new ClusterOps(), new SshShell.Factory(store.dataDir()));
+        ClusterManager manager = new ClusterManager(store, new Bundle(home), new ClusterOps(), new SshShell.Factory(store.dataDir()));
+        try {
+            manager.opsMonitor = OpsMonitor.start(manager);
+            return manager;
+        } catch (IOException | RuntimeException ex) {
+            manager.close();
+            throw ex;
+        }
     }
 
     ClusterManager(ClusterStore store, Bundle bundle, ClusterOps ops, RemoteShell.Factory shells) throws IOException {
@@ -85,6 +93,8 @@ public final class ClusterManager implements AutoCloseable {
     /** 添加节点表单的预填值：下一个节点 ID、该服务器上不冲突的端口、默认数据目录。 */
     public ObjectNode suggest(Role role, String serverId) {
         ClusterState state = state();
+        if (state.nodes().stream().anyMatch(n -> n.serverId().equals(serverId) && n.role() == role))
+            throw new ClusterError("CONFLICT", "同一台服务器只能部署一个" + (role == Role.STORAGE ? "存储节点" : "计算节点") + "。存储和计算可以部署在同一台机器上");
         String prefix = role == Role.STORAGE ? "storage-" : "compute-";
         int next = state.nodes().stream().filter(n -> n.id().startsWith(prefix)).mapToInt(n -> number(n.id())).max().orElse(0) + 1;
         String id = prefix + next;
@@ -114,6 +124,8 @@ public final class ClusterManager implements AutoCloseable {
         if (server.status() != ServerStatus.READY) throw new ClusterError("INVALID_STATE", "服务器尚未就绪");
         if (id == null || !id.matches("[a-z][a-z0-9_-]{0,31}")) throw new ClusterError("INVALID_ARGUMENT", "节点 ID 只能包含小写字母、数字、下划线和短横线，以字母开头，最长 32 位");
         if (state.node(id).isPresent()) throw new ClusterError("CONFLICT", "节点 ID 已存在：" + id);
+        if (state.nodes().stream().anyMatch(n -> n.serverId().equals(serverId) && n.role() == role))
+            throw new ClusterError("CONFLICT", "同一台服务器只能部署一个" + (role == Role.STORAGE ? "存储节点" : "计算节点") + "。存储和计算可以部署在同一台机器上");
         if (role == Role.STORAGE) clientPort = 0;
         List<Integer> ports = role == Role.STORAGE ? List.of(raftPort, rpcPort) : List.of(raftPort, rpcPort, clientPort);
         if (ports.stream().anyMatch(p -> p < 1024 || p > 65535)) throw new ClusterError("INVALID_ARGUMENT", "端口必须在 1024 到 65535 之间");
@@ -144,6 +156,7 @@ public final class ClusterManager implements AutoCloseable {
             if (node.role() == Role.COMPUTE && others.isEmpty()) throw new ClusterError("LAST_NODE", "不能移除最后一个计算节点");
             if (node.role() == Role.STORAGE && others.isEmpty()) throw new ClusterError("LAST_NODE", "不能移除最后一个存储节点");
         }
+        if (node.role() == Role.STORAGE) deleteData = true;
         return tasks.submit("node.remove", Map.of("node", id, "deleteData", Boolean.toString(deleteData)));
     }
 
@@ -337,13 +350,26 @@ public final class ClusterManager implements AutoCloseable {
                 .map(n -> java.net.InetSocketAddress.createUnresolved(ConfigRenderer.host(state, n), n.clientPort())).orElse(null);
     }
 
-    /** 运维总览：以 root 登录受管计算节点调用 ops.overview。 */
-    public JsonNode opsOverview(int timeoutMs) throws IOException {
-        ClusterState state = state();
-        NodeSpec via = state.nodes(Role.COMPUTE).stream().filter(n -> n.joined() && n.status() == NodeStatus.RUNNING).findFirst()
-                .orElseThrow(() -> new IOException("集群还没有运行中的计算节点"));
-        try { return ops.computeAdmin(state, via, ClusterStore.JSON.createObjectNode().put("op", "ops.overview"), timeoutMs); }
-        catch (ClusterError ex) { throw new IOException(ex.getMessage(), ex); }
+    /** 运维总览只读本机监控库，不访问 Storage 或 Compute。 */
+    public ObjectNode opsOverview() {
+        if (opsMonitor == null) {
+            ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK").put("clusterHealth", "UNKNOWN");
+            empty.putArray("computeNodes");
+            empty.putArray("storageNodes");
+            empty.putArray("shards");
+            empty.putArray("events");
+            return empty;
+        }
+        try { return opsMonitor.overview(); }
+        catch (RuntimeException ex) {
+            ObjectNode failed = ClusterStore.JSON.createObjectNode().put("code", "OK").put("clusterHealth", "UNKNOWN")
+                    .put("message", "监控记录暂不可读：" + (ex.getMessage() == null ? "监控库读取失败" : ex.getMessage()));
+            failed.putArray("computeNodes");
+            failed.putArray("storageNodes");
+            failed.putArray("shards");
+            failed.putArray("events");
+            return failed;
+        }
     }
 
     private static Map<String, String> trim(Map<String, String> values) {
@@ -356,5 +382,8 @@ public final class ClusterManager implements AutoCloseable {
         try { return Integer.parseInt(id.substring(id.lastIndexOf('-') + 1)); } catch (RuntimeException ex) { return 0; }
     }
 
-    @Override public void close() { tasks.close(); }
+    @Override public void close() {
+        if (opsMonitor != null) opsMonitor.close();
+        tasks.close();
+    }
 }

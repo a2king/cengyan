@@ -57,12 +57,29 @@ export class CengyanApi {
     return info;
   }
 
+  setGraph(graph: string) {
+    this.graph = graph;
+    storage.saveGraph(graph);
+  }
+
+  currentGraph(): string {
+    return this.graph;
+  }
+
   async query(query: string, timeoutMs = 10000): Promise<QueryResponse> {
     const use = /^\s*USE\s+([\p{L}][\p{L}\p{N}_]*)\s*;?\s*$/iu.exec(query);
-    const target = use ? use[1] : this.graph;
-    const response = await this.request('/api/query', { query, timeoutMs, graph: target });
-    if (use) { this.graph = target; storage.saveGraph(target); }
-    return response;
+    const target = use ? use[1] : usesCurrentGraph(query) ? this.graph : '';
+    try {
+      const response = await this.request('/api/query', { query, timeoutMs, graph: target });
+      if (use) this.setGraph(target);
+      return response;
+    } catch (error) {
+      if (target && target === this.graph && error instanceof Error
+          && (error.message.includes(`图已删除：${target}`) || error.message.includes(`图不存在：${target}`))) {
+        this.setGraph('');
+      }
+      throw error;
+    }
   }
 
   async queries(): Promise<QueryResponse> {
@@ -149,6 +166,10 @@ export function rowsAsObjects<T extends object = Record<string, unknown>>(respon
   return (response.rows || []).map((row) => Object.fromEntries(columns.map((column, index) => [column, row[index]])) as T);
 }
 
+function usesCurrentGraph(query: string): boolean {
+  return !/^\s*(?:SHOW\s+GRAPHS|SHOW\s+ALIASES|CREATE\s+GRAPH)\b/i.test(query);
+}
+
 export function escapeIdent(value: string): string {
   if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(value) || value.length > 128) {
     throw new Error('名字只能使用英文字母、数字和下划线，并且要以字母开头');
@@ -156,6 +177,17 @@ export function escapeIdent(value: string): string {
   return value;
 }
 
-export function graphFromRows(response: QueryResponse): Array<{ name: string; comment?: string }> {
-  return (response.rows || []).map((row) => ({ name: String(row[0]), comment: row[1] == null ? undefined : String(row[1]) }));
+export function graphFromRows(response: QueryResponse): Array<{ name: string; comment?: string; idType?: string; idLength?: number }> {
+  const columns = response.columns || [];
+  return (response.rows || []).map((row) => {
+    const record = Object.fromEntries(columns.map((column, index) => [column, row[index]]));
+    const comment = record.comment ?? row[1];
+    const length = Number(record.vertexIdLength);
+    return {
+      name: String(record.name ?? row[0]),
+      comment: comment == null || comment === '' ? undefined : String(comment),
+      idType: record.vertexIdType == null ? undefined : String(record.vertexIdType),
+      idLength: Number.isFinite(length) && length > 0 ? length : undefined,
+    };
+  });
 }

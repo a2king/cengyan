@@ -147,6 +147,7 @@ final class Fakes {
             return maintenance;
         }
         @Override void exitMaintenance(ClusterState state) { calls.add("exit"); maintenance = ""; sealedBoot.clear(); }
+        @Override void flushStorage(ClusterState state, ClusterState.NodeSpec node) { calls.add("flush " + node.id()); }
         @Override boolean transferLeader(ClusterState state, String nodeId) { calls.add("transfer " + nodeId); return false; }
 
         @Override JsonNode maintenanceStatus(ClusterState state) {

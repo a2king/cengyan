@@ -5,7 +5,6 @@ import {
   Alert,
   App as AntApp,
   Avatar,
-  Badge,
   Button,
   Card,
   Col,
@@ -56,7 +55,6 @@ import {
   Table2,
   Trash2,
   Workflow,
-  X,
 } from 'lucide-react';
 import { CengyanApi, escapeIdent, graphFromRows, rowsAsObjects, storage } from './api';
 import { ClusterApi } from './clusterApi';
@@ -68,10 +66,22 @@ const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
 
 const TYPES = ['BOOL', 'INT64', 'DOUBLE', 'STRING', 'DATETIME'];
-const NODE_ID_TYPES = [
-  { value: 'INT', label: 'INT（整数）' },
+
+function mentionsMissingGraph(error: unknown, name: string): boolean {
+  if (!(error instanceof Error) || !name) return false;
+  return error.message.includes(`图已删除：${name}`) || error.message.includes(`图不存在：${name}`);
+}
+const GRAPH_ID_TYPES = [
+  { value: 'INT64', label: 'INT64（整数）' },
   { value: 'STRING', label: 'STRING（字符串）' },
 ];
+
+function graphKeySpec(idType?: string, idLength?: number) {
+  const stringId = (idType || 'INT64').toUpperCase() === 'STRING';
+  if (!stringId) return { sqlType: 'INT64', length: 64, label: 'INT64', clause: 'ID INT64' };
+  const length = Math.min(64, idLength && idLength > 0 ? idLength : 64);
+  return { sqlType: 'STRING', length, label: `STRING(${length})`, clause: `ID STRING(${length})` };
+}
 const DEFAULT_QUERY = '';
 const LEGACY_SAMPLE_QUERY = "MATCH (a:Person)-[e:knows]->(b) RETURN a, e, b";
 // Keep the Studio interaction limits explicit for the table and graph result views.
@@ -94,6 +104,32 @@ const COMPATIBILITY_MARKER = [
 function canWrite(role: string) { return role === 'write'; }
 
 type NavKey = 'graph' | 'gql' | 'running' | 'ops' | 'cluster';
+
+const NAV_ROUTES: Record<NavKey, string> = {
+  graph: '/graph',
+  gql: '/gql',
+  running: '/running',
+  ops: '/ops',
+  cluster: '/cluster',
+};
+
+function normalizePath(pathname: string) {
+  const path = pathname.replace(/\/+$/, '');
+  return path || '/';
+}
+
+function navFromPath(pathname: string): NavKey | null {
+  const path = normalizePath(pathname);
+  const match = (Object.entries(NAV_ROUTES) as Array<[NavKey, string]>).find(([, route]) => route === path);
+  return match?.[0] ?? (path === '/' ? 'graph' : null);
+}
+
+function rememberNav(nav: NavKey, replace = false) {
+  const path = NAV_ROUTES[nav];
+  if (normalizePath(window.location.pathname) === path) return;
+  const update = replace ? window.history.replaceState : window.history.pushState;
+  update.call(window.history, { nav }, '', path);
+}
 type GraphTab = 'nodes' | 'rels' | 'indexes' | 'stats' | 'aliases' | 'replicas';
 
 export function App() {
@@ -108,7 +144,7 @@ export function App() {
     }, handleLogout);
   }
   const api = apiRef.current;
-  const [activeNav, setActiveNav] = useState<NavKey>('graph');
+  const [activeNav, setActiveNav] = useState<NavKey>(() => navFromPath(window.location.pathname) ?? 'graph');
   const [graphView, setGraphView] = useState<'spaces' | 'workspace'>('spaces');
   const [createGraphOpen, setCreateGraphOpen] = useState(false);
   const [graphTab, setGraphTab] = useState<GraphTab>('nodes');
@@ -127,7 +163,6 @@ export function App() {
     opsRefresh.current = refresh;
     setOpsRefreshing(refreshing);
   }, []);
-  const [nodeHealth, setNodeHealth] = useState({ storageAlive: 0, storageTotal: 0, computeAlive: 0, computeTotal: 0, loading: true });
   const [clusterManaged, setClusterManaged] = useState(false);
   const [standaloneCluster, setStandaloneCluster] = useState(false);
   const clusterApiRef = useRef<ClusterApi | undefined>(undefined);
@@ -137,6 +172,7 @@ export function App() {
   const [notificationApi, notificationContextHolder] = notification.useNotification();
 
   function handleLogout() {
+    apiRef.current?.setGraph('');
     storage.clearSession();
     setSession(null);
     setCurrentGraph('');
@@ -147,30 +183,51 @@ export function App() {
     if (!session) return;
     setLoadingSpaces(true);
     setBootError('');
-    try {
+    const load = async () => {
       const [graphsResponse, aliasesResponse] = await Promise.all([
         api.query('SHOW GRAPHS'),
         api.query('SHOW ALIASES'),
       ]);
       const graphs = graphFromRows(graphsResponse);
-      const aliases = rowsAsObjects<{ alias: string; canonical: string }>(aliasesResponse);
+      const aliases = rowsAsObjects<{ alias: string; graph: string }>(aliasesResponse);
       const aliasMap = new Map<string, string[]>();
       aliases.forEach((alias) => {
-        const list = aliasMap.get(alias.canonical) || [];
+        const list = aliasMap.get(alias.graph) || [];
         list.push(alias.alias);
-        aliasMap.set(alias.canonical, list);
+        aliasMap.set(alias.graph, list);
       });
-      setSpaces(graphs.map((graph) => ({ ...graph, aliases: aliasMap.get(graph.name) || [] })));
-      if (currentGraph && graphs.some((graph) => graph.name === currentGraph)) {
-        await api.query(`USE ${escapeIdent(currentGraph)}`);
+      return { graphs, spaces: graphs.map((graph) => ({ ...graph, aliases: aliasMap.get(graph.name) || [] })) };
+    };
+    const releaseMissingGraph = () => {
+      api.setGraph('');
+      setCurrentGraph('');
+      setGraphView('spaces');
+    };
+    let listed = false;
+    try {
+      let loaded: Awaited<ReturnType<typeof load>>;
+      try {
+        loaded = await load();
+      } catch (error) {
+        const selected = currentGraph || api.currentGraph();
+        if (!selected || !mentionsMissingGraph(error, selected)) throw error;
+        releaseMissingGraph();
+        loaded = await load();
       }
-      if (currentGraph && !graphs.some((graph) => graph.name === currentGraph)) {
-        setCurrentGraph('');
-        storage.saveGraph('');
-        setGraphView('spaces');
+      setSpaces(loaded.spaces);
+      listed = true;
+      const selected = currentGraph || api.currentGraph();
+      if (selected && loaded.graphs.some((graph) => graph.name === selected)) {
+        if (!currentGraph) setCurrentGraph(selected);
+        await api.query(`USE ${escapeIdent(selected)}`);
+      } else if (selected) {
+        releaseMissingGraph();
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : '无法读取图空间';
+      const selected = currentGraph || api.currentGraph();
+      if (selected && mentionsMissingGraph(error, selected)) releaseMissingGraph();
+      if (listed && mentionsMissingGraph(error, selected)) return;
       setBootError(messageText);
       if (messageText.includes('FORBIDDEN') || messageText.includes('请先登录')) {
         handleLogout();
@@ -184,31 +241,6 @@ export function App() {
   useEffect(() => {
     if (session) void refreshSpaces();
   }, [session, refreshSpaces]);
-
-  const refreshNodeHealth = useCallback(async () => {
-    if (!session) return;
-    try {
-      const overview = await api.opsOverview();
-      const storageNodes = overview.storageNodes || [];
-      const computeNodes = overview.computeNodes || [];
-      setNodeHealth({
-        storageAlive: storageNodes.filter((row) => row.state !== 'UNAVAILABLE').length,
-        storageTotal: storageNodes.length,
-        computeAlive: computeNodes.filter((row) => row.state !== 'UNAVAILABLE').length,
-        computeTotal: computeNodes.length,
-        loading: false,
-      });
-      return;
-    } catch {
-      setNodeHealth((current) => ({ ...current, loading: false }));
-    }
-  }, [api, session]);
-
-  useEffect(() => {
-    void refreshNodeHealth();
-    const timer = window.setInterval(() => void refreshNodeHealth(), 5000);
-    return () => window.clearInterval(timer);
-  }, [refreshNodeHealth]);
 
   useEffect(() => {
     if (!session) return undefined;
@@ -237,6 +269,19 @@ export function App() {
   }, [api]);
 
   useEffect(() => {
+    if (navFromPath(window.location.pathname) == null || normalizePath(window.location.pathname) === '/') {
+      rememberNav(navFromPath(window.location.pathname) ?? 'graph', true);
+    }
+    const onPop = () => {
+      const next = navFromPath(window.location.pathname) ?? 'graph';
+      setActiveNav(next);
+      if (next === 'graph') setGraphView('spaces');
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  useEffect(() => {
     if (activeNav === 'gql') setGqlMounted(true);
   }, [activeNav]);
 
@@ -247,10 +292,12 @@ export function App() {
   const handleLogin = async (info: SessionInfo) => {
     storage.saveSession(info);
     setSession(info);
+    api.setGraph('');
     setCurrentGraph('');
-    storage.saveGraph('');
     setGraphView('spaces');
-    setActiveNav('graph');
+    const next = navFromPath(window.location.pathname) ?? 'graph';
+    setActiveNav(next);
+    rememberNav(next, true);
     messageApi.success('已连接到图数据库');
   };
 
@@ -261,6 +308,7 @@ export function App() {
       storage.saveGraph(name);
       if (openWorkspace) {
         setActiveNav('graph');
+        rememberNav('graph');
         setGraphView('workspace');
         setGraphTab('nodes');
       }
@@ -272,8 +320,8 @@ export function App() {
   };
 
   const switchGraphFromEditor = (name: string) => {
+    api.setGraph(name);
     setCurrentGraph(name);
-    storage.saveGraph(name);
     notificationApi.success({
       message: '图空间已切换',
       description: `已切换 ${name} 图空间`,
@@ -369,15 +417,11 @@ export function App() {
                 const next = key as NavKey;
                 setActiveNav(next);
                 if (next === 'graph') setGraphView('spaces');
+                rememberNav(next);
               }}
               className="studio-menu"
             />
             <div className="sider-foot">
-              <div className="connection-card">
-                <span className="online-dot" />
-                 <div><Text strong>集群节点状态</Text><Text type="secondary">存储: {nodeHealth.loading ? '读取中' : `${nodeHealth.storageAlive}/${nodeHealth.storageTotal}`}</Text><Text type="secondary">计算: {nodeHealth.loading ? '读取中' : `${nodeHealth.computeAlive}/${nodeHealth.computeTotal}`}</Text></div>
-                <Badge status="success" />
-              </div>
               <div className="user-card">
                 <Avatar size={34} icon={<CircleUserRound size={18} />} />
                 <div className="user-card-copy"><Text strong>{session.user}</Text><Text type="secondary">{writable ? '读写角色' : '只读角色'}</Text></div>
@@ -411,7 +455,7 @@ export function App() {
                 graphView === 'spaces' ? (
                    <SpaceOverview api={api} spaces={spaces} currentGraph={currentGraph} canWrite={writable} onRefresh={refreshSpaces} onOpen={(name) => void selectGraph(name, true)} openCreate={createGraphOpen} onCreateChange={setCreateGraphOpen} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
                 ) : (
-                   <GraphWorkspace api={api} graph={currentGraph} aliases={spaces.find((space) => space.name === currentGraph)?.aliases || []} tab={graphTab} setTab={setGraphTab} canWrite={writable} onChanged={refreshSpaces} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
+                   <GraphWorkspace api={api} graph={currentGraph} aliases={spaces.find((space) => space.name === currentGraph)?.aliases || []} idType={spaces.find((space) => space.name === currentGraph)?.idType} idLength={spaces.find((space) => space.name === currentGraph)?.idLength} tab={graphTab} setTab={setGraphTab} canWrite={writable} onChanged={refreshSpaces} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
                 )
               )}
               {gqlMounted && (
@@ -528,7 +572,7 @@ async function typeSchemaStatement(api: CengyanApi, type: TypeRow, node: boolean
   const properties = rowsAsObjects<TypeProperty>(response)
     .map((property) => `${escapeIdent(property.property)} ${property.type}${property.nullable ? ' NULL' : ''}${quoteComment(property.comment)}`)
     .join(', ');
-  const idClause = node ? ` ID ${type.idType || 'INT'}(${Math.trunc(Number(type.idLength || 19))})` : '';
+  const idClause = node ? ` ${graphKeySpec(type.idType, type.idLength).clause}` : '';
   return `CREATE ${node ? 'NODE' : 'REL'} TYPE ${escapeIdent(type.name)}${quoteComment(type.comment)}${idClause} (${properties})`;
 }
 
@@ -547,11 +591,25 @@ function SpaceOverview({ api, spaces, currentGraph, canWrite, onRefresh, onOpen,
   const [graphForm] = Form.useForm();
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState('');
+  const idType = Form.useWatch('idType', graphForm) || 'INT64';
 
-  const createGraph = async (values: { name: string; parts: number; comment?: string }) => {
+  const createGraph = async (values: { name: string; parts: number; replicas: number; idType: 'INT64' | 'STRING'; idLength?: number; comment?: string }) => {
+    const stringId = values.idType === 'STRING';
+    const idLength = Number(values.idLength);
+    if (stringId && (!Number.isInteger(idLength) || idLength < 1 || idLength > 64)) {
+      setLocalError('字符串主键长度必须是 1 到 64 之间的整数');
+      return;
+    }
+    const copies = Math.trunc(values.replicas) + 1;
+    const comment = values.comment?.trim() ? ` COMMENT '${values.comment.trim().replaceAll("'", "''")}'` : '';
+    const idClause = stringId ? `ID STRING(${idLength})` : 'ID INT64';
     setBusy(true); setLocalError('');
-    try { await api.query(`CREATE GRAPH ${escapeIdent(values.name.trim())} PARTS ${Math.trunc(values.parts)}${values.comment ? ` COMMENT '${values.comment.replaceAll("'", "''")}'` : ''}`); onCreateChange(false); graphForm.resetFields(); await onRefresh(); }
-    catch (reason) { setLocalError(reason instanceof Error ? reason.message : '创建图空间失败'); }
+    try {
+      await api.query(`CREATE GRAPH ${escapeIdent(values.name.trim())} PARTS ${Math.trunc(values.parts)} REPLICAS ${copies} ${idClause}${comment}`);
+      onCreateChange(false);
+      graphForm.resetFields();
+      await onRefresh();
+    } catch (reason) { setLocalError(reason instanceof Error ? reason.message : '创建图空间失败'); }
     finally { setBusy(false); }
   };
 
@@ -576,14 +634,29 @@ function SpaceOverview({ api, spaces, currentGraph, canWrite, onRefresh, onOpen,
           <div className="space-card-bottom"><div className="space-card-actions"><Button className="space-card-action-button" variant="outlined" color="primary" size="small" icon={<Copy size={14} />} onClick={(event) => { event.stopPropagation(); void exportSchema(space.name); }}>导出 Schema</Button>{canWrite && <Button className="space-card-action-button" variant="outlined" color="danger" size="small" icon={<Trash2 size={14} />} onClick={(event) => { event.stopPropagation(); dropGraph(space.name); }}>删除</Button>}</div></div>
      </Card></Col>; })}{!spaces.length && <Col span={24}><Card className="empty-card"><Empty image={<FolderKanban size={38} strokeWidth={1.3} />} description={canWrite ? '还没有图空间，先创建一个吧' : '暂时没有可访问的图空间'}>{canWrite && <Button type="primary" icon={<Plus size={16} />} onClick={() => onCreateChange(true)}>创建第一个图空间</Button>}</Empty></Card></Col>}</Row>
     <Card className="info-card" bordered={false}><div className="info-icon"><Activity size={18} /></div><div><Text strong>建议的工作流</Text><Text type="secondary">先在图模式配置 schema，再到 GQL 查询数据；查询页右上角可以随时切换空间。</Text></div></Card>
-      <Modal title="新建图空间" open={openCreate} onCancel={() => onCreateChange(false)} onOk={() => graphForm.submit()} confirmLoading={busy} okText="创建" cancelText="取消"><Form form={graphForm} layout="vertical" initialValues={{ parts: 32 }} onFinish={(values) => void createGraph(values)}><Form.Item name="name" label="空间名称" rules={[{ required: true, message: '请输入空间名称' }]}><Input prefix={<Database size={16} />} placeholder="例如 Company" /></Form.Item><Form.Item name="parts" label="分片数量" initialValue={32} rules={[{ required: true, message: '请输入分片数量' }, { type: 'number', min: 1, max: 4096, transform: (value) => Number(value), message: '分片数量必须在 1 到 4096 之间' }]}><InputNumber min={1} max={4096} precision={0} defaultValue={32} style={{ width: '100%' }} /></Form.Item><Form.Item name="comment" label="空间注释"><Input.TextArea rows={3} placeholder="说明这个图空间的业务用途" /></Form.Item></Form></Modal>
+      <Modal title="新建图空间" open={openCreate} width={640} onCancel={() => onCreateChange(false)} onOk={() => graphForm.submit()} confirmLoading={busy} okText="创建" cancelText="取消">
+        <Form form={graphForm} layout="vertical" initialValues={{ parts: 32, replicas: 0, idType: 'INT64', idLength: 64 }} onFinish={(values) => void createGraph(values)}>
+          <Form.Item name="name" label="空间名称" rules={[{ required: true, message: '请输入空间名称' }]}><Input prefix={<Database size={16} />} placeholder="例如 Company" /></Form.Item>
+          <Row gutter={12}>
+            <Col span={12}><Form.Item name="parts" label="分片数量" rules={[{ required: true, message: '请输入分片数量' }, { type: 'number', min: 1, max: 4096, transform: (value) => Number(value), message: '分片数量必须在 1 到 4096 之间' }]}><InputNumber min={1} max={4096} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col span={12}><Form.Item name="replicas" label="副本数量" extra="0 表示只有一份数据、没有副本，最多 5" rules={[{ required: true, message: '请输入副本数量' }, { type: 'number', min: 0, max: 5, transform: (value) => Number(value), message: '副本数量必须在 0 到 5 之间' }]}><InputNumber min={0} max={5} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
+          </Row>
+          <Row gutter={12}>
+            <Col span={12}><Form.Item name="idType" label="主键类型" rules={[{ required: true, message: '请选择主键类型' }]}><Select options={GRAPH_ID_TYPES} onChange={(value: 'INT64' | 'STRING') => graphForm.setFieldValue('idLength', 64)} /></Form.Item></Col>
+            <Col span={12}>{idType === 'STRING'
+              ? <Form.Item name="idLength" label="主键长度" extra="字符串主键的最大长度，范围 1 到 64" rules={[{ validator: (_, value) => !Number.isInteger(Number(value)) || Number(value) < 1 || Number(value) > 64 ? Promise.reject(new Error('请输入 1 到 64 的整数')) : Promise.resolve() }]}><InputNumber min={1} max={64} precision={0} style={{ width: '100%' }} /></Form.Item>
+              : <Form.Item label="主键长度"><Input disabled value="固定 INT64（64 位）" /></Form.Item>}</Col>
+          </Row>
+          <Form.Item name="comment" label="空间注释"><Input.TextArea rows={3} placeholder="说明这个图空间的业务用途" /></Form.Item>
+        </Form>
+      </Modal>
   </div>;
 }
 
-function GraphWorkspace({ api, graph, aliases, tab, setTab, canWrite, onChanged, onCopied }: { api: CengyanApi; graph: string; aliases: string[]; tab: GraphTab; setTab: (tab: GraphTab) => void; canWrite: boolean; onChanged: () => Promise<void>; onCopied: () => void }) {
+function GraphWorkspace({ api, graph, aliases, idType, idLength, tab, setTab, canWrite, onChanged, onCopied }: { api: CengyanApi; graph: string; aliases: string[]; idType?: string; idLength?: number; tab: GraphTab; setTab: (tab: GraphTab) => void; canWrite: boolean; onChanged: () => Promise<void>; onCopied: () => void }) {
   const items: TabsProps['items'] = [
-    { key: 'nodes', label: <span className="tab-label"><Boxes size={16} />点类型</span>, children: <TypesPanel api={api} graph={graph} node canWrite={canWrite} onCopied={onCopied} /> },
-    { key: 'rels', label: <span className="tab-label"><GitBranch size={16} />边类型</span>, children: <TypesPanel api={api} graph={graph} node={false} canWrite={canWrite} onCopied={onCopied} /> },
+    { key: 'nodes', label: <span className="tab-label"><Boxes size={16} />点类型</span>, children: <TypesPanel api={api} graph={graph} node canWrite={canWrite} onCopied={onCopied} idType={idType} idLength={idLength} /> },
+    { key: 'rels', label: <span className="tab-label"><GitBranch size={16} />边类型</span>, children: <TypesPanel api={api} graph={graph} node={false} canWrite={canWrite} onCopied={onCopied} idType={idType} idLength={idLength} /> },
     { key: 'indexes', label: <span className="tab-label"><Search size={16} />索引</span>, children: <IndexesPanel api={api} graph={graph} canWrite={canWrite} /> },
     { key: 'stats', label: <span className="tab-label"><Gauge size={16} />统计信息</span>, children: <StatsPanel api={api} graph={graph} /> },
     { key: 'aliases', label: <span className="tab-label"><Copy size={16} />别名管理</span>, children: <AliasPanel api={api} graph={graph} aliases={aliases} canWrite={canWrite} onChanged={onChanged} /> },
@@ -679,12 +752,13 @@ function ReplicaPanel({ api, graph, canWrite, active }: { api: CengyanApi; graph
   </div>;
 }
 
-function TypesPanel({ api, graph, node, canWrite, onCopied }: { api: CengyanApi; graph: string; node: boolean; canWrite: boolean; onCopied: () => void }) {
+function TypesPanel({ api, graph, node, canWrite, onCopied, idType, idLength }: { api: CengyanApi; graph: string; node: boolean; canWrite: boolean; onCopied: () => void; idType?: string; idLength?: number }) {
   const [rows, setRows] = useState<TypeRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
   const [detail, setDetail] = useState<{ name: string; rows: TypeProperty[] } | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [createForm] = Form.useForm();
   const kind = node ? 'NODE' : 'REL';
   const title = node ? '点类型' : '边类型';
@@ -696,33 +770,32 @@ function TypesPanel({ api, graph, node, canWrite, onCopied }: { api: CengyanApi;
     finally { setLoading(false); }
   }, [api, node, title]);
   useEffect(() => { void load(); }, [load, graph]);
-
-  const idType = Form.useWatch('idType', createForm) || 'INT';
+  const keySpec = graphKeySpec(idType, idLength);
 
   const create = async (values: {
     name: string;
     comment?: string;
-    idType?: 'INT' | 'STRING';
-    idLength?: number;
     properties?: Array<{ name?: string; type?: string; nullable?: boolean; comment?: string }>;
   }) => {
-    if (node) {
-      const idLength = Number(values.idLength);
-      const maxLength = values.idType === 'INT' ? 19 : 4096;
-      if (!Number.isInteger(idLength) || idLength < 1 || idLength > maxLength) {
-        setError(`${values.idType === 'INT' ? '整数' : '字符串'} ID 长度必须是 1 到 ${maxLength} 之间的整数`);
-        return;
-      }
-    }
     const props = (values.properties || []).filter((item) => item.name?.trim()).map((item) => `${escapeIdent(item.name!.trim())} ${item.type || 'STRING'}${item.nullable === false ? '' : ' NULL'}${item.comment ? ` COMMENT '${item.comment.replaceAll("'", "''")}'` : ''}`);
-    const idClause = node
-      ? ` ID ${values.idType || 'INT'}(${Math.trunc(Number(values.idLength))})`
-      : '';
+    const idClause = node ? ` ${keySpec.clause}` : '';
     const comment = values.comment ? ` COMMENT '${values.comment.replaceAll("'", "''")}'` : '';
     try { await api.query(`CREATE ${kind} TYPE ${escapeIdent(values.name.trim())}${comment}${idClause} (${props.join(', ')})`); setCreateOpen(false); createForm.resetFields(); await load(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : `创建${title}失败`); }
   };
-  const describe = async (name: string) => { try { const response = await api.query(`DESCRIBE ${kind} TYPE ${escapeIdent(name)}`); setDetail({ name, rows: rowsAsObjects<TypeProperty>(response) }); } catch (reason) { setError(reason instanceof Error ? reason.message : '读取属性失败'); } };
+  const describe = async (name: string) => {
+    setDetail({ name, rows: [] });
+    setDetailLoading(true);
+    try {
+      const response = await api.query(`DESCRIBE ${kind} TYPE ${escapeIdent(name)}`);
+      setDetail({ name, rows: rowsAsObjects<TypeProperty>(response) });
+    } catch (reason) {
+      setDetail(null);
+      setError(reason instanceof Error ? reason.message : '读取列失败');
+    } finally {
+      setDetailLoading(false);
+    }
+  };
   const exportType = async (type: TypeRow) => {
     try { await copyText(await typeSchemaStatement(api, type, node)); onCopied(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : '导出结构失败'); }
@@ -732,7 +805,7 @@ function TypesPanel({ api, graph, node, canWrite, onCopied }: { api: CengyanApi;
     { title: '名称', dataIndex: 'name', width: 200, fixed: 'left', ellipsis: true, render: (value: string, row: TypeRow) => <Tooltip title={row.comment || value}><span className="code-pill">{value}</span></Tooltip> },
     ...(node ? [
       { title: 'ID 类型', dataIndex: 'idType', width: 120, render: (value: string) => value || 'INT' },
-      { title: 'ID 长度', dataIndex: 'idLength', width: 120, render: (value: number, record: TypeRow) => (String(record.idType || 'INT').toUpperCase() === 'STRING' ? value || '-' : '—') },
+      { title: 'ID 长度', dataIndex: 'idLength', width: 120, render: (value: number, record: TypeRow) => (String(record.idType || 'INT').toUpperCase() === 'STRING' ? value || '-' : '64 位') },
       { title: '描述', dataIndex: 'comment', width: 240, ellipsis: true, render: (value: string) => value || '—' },
     ] : [
       { title: '边描述', dataIndex: 'comment', width: 240, ellipsis: true, render: (value: string) => value || '—' },
@@ -742,8 +815,8 @@ function TypesPanel({ api, graph, node, canWrite, onCopied }: { api: CengyanApi;
     { title: '操作', key: 'actions', width: 200, render: (_, record) => <span className="table-actions"><Button type="link" size="small" onClick={() => void describe(record.name)}>查看列</Button><Button type="link" size="small" onClick={() => void exportType(record)}>导出结构</Button></span> },
   ];
   const tableScrollX = columns.reduce((total, column) => total + Number(column.width ?? 0), 0);
-  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>{title}</Title></div><Space>{canWrite && <Button icon={<Plus size={15} />} onClick={() => setCreateOpen(true)}>新建{title}</Button>}<Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></Space></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}{detail && <Card size="small" className="detail-card" title={<span>{detail.name} 的属性</span>} extra={<Button type="text" icon={<X size={15} />} onClick={() => setDetail(null)} />}><Table size="small" pagination={false} rowKey="property" columns={[{ title: '属性', dataIndex: 'property' }, { title: '类型', dataIndex: 'type' }, { title: '可空', dataIndex: 'nullable', render: (value: boolean) => value ? <Tag color="blue">NULL</Tag> : <Tag>必填</Tag> }, { title: '注释', dataIndex: 'comment' }]} dataSource={detail.rows} /></Card>}{rows.length ? <Table rowKey="name" loading={loading} columns={columns} dataSource={rows} scroll={{ x: tableScrollX }} pagination={{ pageSize: 8, hideOnSinglePage: true }} /> : <Empty description={`还没有${title}`} />}
-    <Modal title={`新建${title}`} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText="创建" cancelText="取消"><Form form={createForm} layout="vertical" initialValues={{ idType: node ? 'INT' : undefined, idLength: 19, properties: [{ type: 'STRING', nullable: true }] }} onFinish={(values) => void create(values)}><Form.Item name="name" label="类型名称" rules={[{ required: true, message: '请输入类型名称' }]}><Input placeholder={node ? '例如 Person' : '例如 knows'} /></Form.Item>{node && <Row gutter={12}><Col span={12}><Form.Item name="idType" label="ID 类型" rules={[{ required: true, message: '请选择 ID 类型' }]}><Select options={NODE_ID_TYPES} onChange={(value: 'INT' | 'STRING') => createForm.setFieldValue('idLength', value === 'INT' ? 19 : 64)} /></Form.Item></Col><Col span={12}><Form.Item name="idLength" label="ID 长度" extra={idType === 'STRING' ? '字符串 ID 的最大字节长度，范围 1 到 4096' : '整数 ID 的十进制位数，范围 1 到 19'} rules={[{ validator: (_, value) => { const maxLength = idType === 'INT' ? 19 : 4096; return !Number.isInteger(Number(value)) || Number(value) < 1 || Number(value) > maxLength ? Promise.reject(new Error(`请输入 1 到 ${maxLength} 的整数`)) : Promise.resolve(); } }]}><InputNumber min={1} max={idType === 'INT' ? 19 : 4096} precision={0} style={{ width: '100%' }} /></Form.Item></Col></Row>}<Form.List name="properties">{(fields, { add, remove }) => <div className="property-list">{fields.map((field) => <div className="property-row" key={field.key}><Form.Item {...field} name={[field.name, 'name']}><Input placeholder="属性名" /></Form.Item><Form.Item {...field} name={[field.name, 'type']}><Select options={TYPES.map((type) => ({ value: type, label: type }))} /></Form.Item><Form.Item {...field} name={[field.name, 'nullable']} valuePropName="checked"><label className="checkbox-field"><input type="checkbox" />可空</label></Form.Item><Form.Item {...field} name={[field.name, 'comment']}><Input placeholder="字段注释" /></Form.Item><Button type="text" icon={<Trash2 size={15} />} onClick={() => remove(field.name)} /></div>)}<Button type="dashed" block icon={<Plus size={15} />} onClick={() => add({ type: 'STRING', nullable: true })}>添加属性</Button></div>}</Form.List></Form></Modal>
+  return <div className="panel-stack"><div className="panel-toolbar"><div><Title level={4}>{title}</Title></div><Space>{canWrite && <Button icon={<Plus size={15} />} onClick={() => setCreateOpen(true)}>新建{title}</Button>}<Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></Space></div>{error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}<Modal title={detail ? `${detail.name} 的列` : '列详情'} open={detail !== null} width={760} destroyOnHidden onCancel={() => setDetail(null)} footer={<Button onClick={() => setDetail(null)}>关闭</Button>}><Table size="small" pagination={false} rowKey="property" loading={detailLoading} scroll={{ y: 420 }} locale={{ emptyText: detailLoading ? '正在读取列' : '这个类型还没有列' }} columns={[{ title: '属性', dataIndex: 'property', render: (value: string) => <span className="code-pill">{value}</span> }, { title: '类型', dataIndex: 'type', width: 120 }, { title: '可空', dataIndex: 'nullable', width: 90, render: (value: boolean) => value ? <Tag color="blue">NULL</Tag> : <Tag>必填</Tag> }, { title: '注释', dataIndex: 'comment', ellipsis: true, render: (value: string) => value || '—' }]} dataSource={detail?.rows ?? []} /></Modal>{rows.length ? <Table rowKey="name" loading={loading} columns={columns} dataSource={rows} scroll={{ x: tableScrollX }} pagination={{ pageSize: 8, hideOnSinglePage: true }} /> : <Empty description={`还没有${title}`} />}
+    <Modal title={`新建${title}`} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText="创建" cancelText="取消"><Form form={createForm} layout="vertical" initialValues={{ properties: [{ type: 'STRING', nullable: true }] }} onFinish={(values) => void create(values)}><Form.Item name="name" label="类型名称" rules={[{ required: true, message: '请输入类型名称' }]}><Input placeholder={node ? '例如 Person' : '例如 knows'} /></Form.Item><Alert type="info" showIcon message={`主键使用图空间的 ${keySpec.label}`} description="点类型和边类型都使用建图时选定的主键，不能在这里修改。" /><Form.List name="properties">{(fields, { add, remove }) => <div className="property-list">{fields.map((field) => <div className="property-row" key={field.key}><Form.Item {...field} name={[field.name, 'name']}><Input placeholder="属性名" /></Form.Item><Form.Item {...field} name={[field.name, 'type']}><Select options={TYPES.map((type) => ({ value: type, label: type }))} /></Form.Item><Form.Item {...field} name={[field.name, 'nullable']} valuePropName="checked"><label className="checkbox-field"><input type="checkbox" />可空</label></Form.Item><Form.Item {...field} name={[field.name, 'comment']}><Input placeholder="字段注释" /></Form.Item><Button type="text" icon={<Trash2 size={15} />} onClick={() => remove(field.name)} /></div>)}<Button type="dashed" block icon={<Plus size={15} />} onClick={() => add({ type: 'STRING', nullable: true })}>添加属性</Button></div>}</Form.List></Form></Modal>
   </div>;
 }
 
@@ -1056,27 +1129,90 @@ function rateText(value?: unknown) {
   return Number.isFinite(number) && number >= 0 ? `${bytesText(number)}/s` : '—';
 }
 
+function fixedMetric(width: number) {
+  const style = { width, minWidth: width, maxWidth: width };
+  return { width, className: 'ops-num-col ops-fixed-col', onHeaderCell: () => ({ style }), onCell: () => ({ style }) };
+}
+
+function flexColumn(minWidth: number) {
+  const style = { minWidth };
+  return { onHeaderCell: () => ({ style }), onCell: () => ({ style }) };
+}
+
+function identityText(value: unknown) {
+  const text = typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
+  return text || '—';
+}
+
+function timeText(value: unknown) {
+  const time = Number(value);
+  if (!Number.isFinite(time) || time <= 0) return '—';
+  return new Date(time).toLocaleString();
+}
+
+function opsLabel(value: unknown) {
+  switch (String(value || '')) {
+    case 'GOOD': return '良好';
+    case 'HEALTHY': return '正常';
+    case 'REACHABLE': return '可达';
+    case 'CONCERNING': return '关注';
+    case 'DEGRADED': return '缺副本';
+    case 'BAD': return '故障';
+    case 'UNAVAILABLE': return '不可达';
+    case 'INFO': return '信息';
+    case 'WARN': return '警告';
+    case 'ERROR': return '故障';
+    default: return '等待采集';
+  }
+}
+
+function opsTag(value: unknown) {
+  const text = String(value || '');
+  const color = text === 'GOOD' || text === 'HEALTHY' || text === 'REACHABLE' || text === 'INFO' ? 'green'
+    : text === 'CONCERNING' || text === 'DEGRADED' || text === 'WARN' ? 'gold'
+      : text === 'BAD' || text === 'UNAVAILABLE' || text === 'ERROR' ? 'red' : 'default';
+  return <Tag color={color}>{opsLabel(text)}</Tag>;
+}
+
+const hostColumn: NonNullable<TableProps<Record<string, unknown>>['columns']>[number] = {
+  title: '主机名', dataIndex: 'hostname', ellipsis: true, ...flexColumn(160),
+  render: (value: unknown) => <span className="cell-ellipsis" title={identityText(value)}>{identityText(value)}</span>,
+};
+
+const nodeColumn: NonNullable<TableProps<Record<string, unknown>>['columns']>[number] = {
+  title: '节点', dataIndex: 'nodeId', ellipsis: true, ...flexColumn(128),
+  render: (value: unknown) => <span className="code-pill" title={identityText(value)}>{identityText(value)}</span>,
+};
+
+const statusColumns: NonNullable<TableProps<Record<string, unknown>>['columns']> = [
+  { title: '状态', ...fixedMetric(88), render: (_, row) => <span title={identityText(row.message)}>{opsTag(row.state)}</span> },
+  { title: '健康', ...fixedMetric(72), render: (_, row) => opsTag(row.health) },
+  { title: '最近成功', ...flexColumn(168), render: (_, row) => timeText(row.successAt) },
+];
+
 const computeResourceColumns: TableProps<Record<string, unknown>>['columns'] = [
-  { title: '节点', dataIndex: 'nodeId', width: 112, ellipsis: true },
-  { title: '角色', dataIndex: 'role', width: 88 },
-  { title: 'CPU', width: 72, className: 'ops-num-col', render: (_, row) => percentText(row.systemCpuLoad) },
-  { title: '堆内存', width: 168, className: 'ops-num-col', render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` },
-  { title: '执行中', width: 72, className: 'ops-num-col', render: (_, row) => String((row.slots as Record<string, unknown> | undefined)?.active ?? '—') },
-  { title: '排队', width: 64, className: 'ops-num-col', dataIndex: 'queuePending' },
-  { title: '网络流入', width: 128, className: 'ops-num-col ops-fixed-col', render: (_, row) => rateText(row.netInBytesPerSec) },
-  { title: '网络流出', width: 128, className: 'ops-num-col ops-fixed-col', render: (_, row) => rateText(row.netOutBytesPerSec) },
+  hostColumn,
+  nodeColumn,
+  ...statusColumns,
+  { title: 'CPU', ...fixedMetric(72), render: (_, row) => percentText(row.systemCpuLoad) },
+  { title: '堆内存', className: 'ops-num-col', ...flexColumn(168), render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` },
+  { title: '执行中', ...fixedMetric(72), render: (_, row) => String((row.slots as Record<string, unknown> | undefined)?.active ?? '—') },
+  { title: '排队', dataIndex: 'queuePending', ...fixedMetric(64) },
+  { title: '网络流入', ...fixedMetric(128), render: (_, row) => rateText(row.netInBytesPerSec) },
+  { title: '网络流出', ...fixedMetric(128), render: (_, row) => rateText(row.netOutBytesPerSec) },
 ];
 
 const storageResourceColumns: TableProps<Record<string, unknown>>['columns'] = [
-  { title: '节点', dataIndex: 'nodeId', width: 88, ellipsis: true },
-  { title: '角色', dataIndex: 'role', width: 88 },
-  { title: 'CPU', width: 56, className: 'ops-num-col', render: (_, row) => percentText(row.systemCpuLoad) },
-  { title: '堆内存', width: 148, className: 'ops-num-col', render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` },
-  { title: '磁盘可用', width: 84, className: 'ops-num-col', render: (_, row) => bytesText(row.diskUsableBytes) },
-  { title: '磁盘繁忙', width: 104, className: 'ops-num-col ops-fixed-col', render: (_, row) => percentText(row.diskBusy) },
-  { title: '读取速度', width: 128, className: 'ops-num-col ops-fixed-col', render: (_, row) => rateText(row.diskReadBytesPerSec) },
-  { title: '写入速度', width: 128, className: 'ops-num-col ops-fixed-col', render: (_, row) => rateText(row.diskWriteBytesPerSec) },
-  { title: 'Metadata Leader', dataIndex: 'metadataLeaderId', width: 140, ellipsis: true },
+  hostColumn,
+  nodeColumn,
+  ...statusColumns,
+  { title: 'CPU', ...fixedMetric(64), render: (_, row) => percentText(row.systemCpuLoad) },
+  { title: '堆内存', className: 'ops-num-col', ...flexColumn(156), render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` },
+  { title: '磁盘可用', ...fixedMetric(96), render: (_, row) => bytesText(row.diskUsableBytes) },
+  { title: '磁盘繁忙', ...fixedMetric(104), render: (_, row) => percentText(row.diskBusy) },
+  { title: '读取速度', ...fixedMetric(128), render: (_, row) => rateText(row.diskReadBytesPerSec) },
+  { title: '写入速度', ...fixedMetric(128), render: (_, row) => rateText(row.diskWriteBytesPerSec) },
+  { title: 'Metadata Leader', dataIndex: 'metadataLeaderId', ellipsis: true, ...flexColumn(140) },
 ];
 
 function numberValue(value: unknown): number | undefined {
@@ -1157,19 +1293,28 @@ function OpsDashboard({ api, bindRefresh }: { api: CengyanApi; bindRefresh: (ref
   }, [computeNodes, data]);
   return <div className="page-stack workspace-page ops-dashboard">
     {error && <Alert type="warning" showIcon message="集群运维数据暂不可用" description={error} closable onClose={() => setError('')} />}
-    <Card className="workspace-card ops-summary-card" bordered={false} title="计算资源汇总情况">
-      <Row gutter={[16, 16]}>
-        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="平均 CPU 值" value={percentText(computeSummary.averageCpu)} prefix={<Activity size={18} />} /></Card></Col>
-        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="堆内存汇总情况" value={`${bytesText(computeSummary.heapUsed)} / ${bytesText(computeSummary.heapMax)}`} prefix={<Database size={18} />} /></Card></Col>
-        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="磁盘汇总情况" value={`${bytesText(computeSummary.diskUsable)} / ${bytesText(computeSummary.diskTotal)}`} prefix={<Server size={18} />} /></Card></Col>
-        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="执行槽位情况" value={`${computeSummary.slotsActive} / ${computeSummary.slotsCapacity}`} prefix={<Gauge size={18} />} /></Card></Col>
-        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="排队情况" value={computeSummary.queuePending} prefix={<Activity size={18} />} /></Card></Col>
-        <Col xs={24} md={8}><Card className="metric-card"><Statistic title="线程数情况" value={computeSummary.threadCount ?? '—'} prefix={<Workflow size={18} />} /></Card></Col>
+    {data?.message && <Alert type="warning" showIcon message={data.message} />}
+    <Card className="workspace-card" bordered={false} title="集群状态">
+      <Row gutter={[16, 16]} align="middle">
+        <Col xs={24} sm={12} lg={8}><Statistic title="整体" value={opsLabel(data?.clusterHealth)} prefix={<Activity size={18} />} /></Col>
+        <Col xs={24} sm={12} lg={8}><Statistic title="最近采集" value={timeText(data?.collectedAt)} /></Col>
+        <Col xs={24} sm={12} lg={8}><Text type="secondary">监控记录保存在控制台本机，只保留 7 天</Text></Col>
       </Row>
     </Card>
-    <Card className="workspace-card" bordered={false} title="Compute 节点资源"><Table className="ops-resource-table ops-compute-table" tableLayout="fixed" size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={computeNodes} columns={computeResourceColumns} scroll={{ x: 832 }} locale={{ emptyText: '没有 Compute 运维数据' }} /></Card>
-    <Card className="workspace-card" bordered={false} title="Storage 节点资源"><Table className="ops-resource-table ops-storage-table" tableLayout="fixed" size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={storageNodes} columns={storageResourceColumns} scroll={{ x: 964 }} locale={{ emptyText: '没有 Storage 运维数据' }} /></Card>
-    <Card className="workspace-card" bordered={false} title="分片拓扑"><Table size="small" rowKey={(row) => `${row.graphId}-${row.partId}`} pagination={{ pageSize: 10, hideOnSinglePage: true }} dataSource={shards} columns={[{ title: '图', dataIndex: 'graph' }, { title: '分片', dataIndex: 'partId' }, { title: 'Leader', dataIndex: 'leaderId' }, { title: 'Term', dataIndex: 'term' }, { title: 'Applied Index', dataIndex: 'appliedIndex' }, { title: '副本', render: (_, row) => Array.isArray(row.members) ? (row.members as unknown[]).join(', ') : '—' }, { title: '状态', render: (_, row) => <Tag color={row.state === 'UNAVAILABLE' ? 'red' : 'green'}>{String(row.state || 'HEALTHY')}</Tag> }]} locale={{ emptyText: '没有分片拓扑数据' }} /></Card>
+    <Card className="workspace-card ops-summary-card" bordered={false} title="计算资源汇总情况">
+      <Row gutter={[16, 16]}>
+        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="平均 CPU 值" value={percentText(computeSummary.averageCpu)} prefix={<Activity size={18} />} /></Card></Col>
+        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="堆内存汇总情况" value={`${bytesText(computeSummary.heapUsed)} / ${bytesText(computeSummary.heapMax)}`} prefix={<Database size={18} />} /></Card></Col>
+        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="磁盘汇总情况" value={`${bytesText(computeSummary.diskUsable)} / ${bytesText(computeSummary.diskTotal)}`} prefix={<Server size={18} />} /></Card></Col>
+        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="执行槽位情况" value={`${computeSummary.slotsActive} / ${computeSummary.slotsCapacity}`} prefix={<Gauge size={18} />} /></Card></Col>
+        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="排队情况" value={computeSummary.queuePending} prefix={<Activity size={18} />} /></Card></Col>
+        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="线程数情况" value={computeSummary.threadCount ?? '—'} prefix={<Workflow size={18} />} /></Card></Col>
+      </Row>
+    </Card>
+    <Card className="workspace-card" bordered={false} title="Compute 节点资源"><Table className="ops-resource-table ops-compute-table" tableLayout="auto" size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={computeNodes} columns={computeResourceColumns} locale={{ emptyText: '没有 Compute 运维数据' }} /></Card>
+    <Card className="workspace-card" bordered={false} title="Storage 节点资源"><Table className="ops-resource-table ops-storage-table" tableLayout="auto" size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={storageNodes} columns={storageResourceColumns} locale={{ emptyText: '没有 Storage 运维数据' }} /></Card>
+    <Card className="workspace-card" bordered={false} title="分片拓扑"><Table size="small" rowKey={(row) => `${row.graphId}-${row.partId}`} pagination={{ pageSize: 10, hideOnSinglePage: true }} dataSource={shards} columns={[{ title: '图', dataIndex: 'graph' }, { title: '分片', dataIndex: 'partId' }, { title: 'Leader', dataIndex: 'leaderId' }, { title: 'Term', dataIndex: 'term' }, { title: 'Applied Index', dataIndex: 'appliedIndex' }, { title: '副本', render: (_, row) => Array.isArray(row.members) ? (row.members as unknown[]).join(', ') : '—' }, { title: '状态', render: (_, row) => opsTag(row.state) }]} locale={{ emptyText: '没有分片拓扑数据' }} /></Card>
+    <Card className="workspace-card" bordered={false} title="最近记录"><Table size="small" rowKey={(row) => `${row.ts}-${row.event}-${row.nodeId}-${row.message}`} pagination={{ pageSize: 10, hideOnSinglePage: true }} dataSource={data?.events || []} columns={[{ title: '时间', render: (_, row) => timeText(row.ts), width: 180 }, { title: '级别', width: 80, render: (_, row) => opsTag(row.level) }, { title: '节点', dataIndex: 'nodeId', width: 140, render: (value: unknown) => identityText(value) }, { title: '说明', dataIndex: 'message' }]} locale={{ emptyText: '最近 7 天还没有状态变化' }} /></Card>
   </div>;
 }
 
