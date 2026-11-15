@@ -15,7 +15,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
-ROLES = ("storage", "compute", "studio", "cli")
+ROLES = ("storage", "compute", "studio", "client")
 # Studio deploys Storage/Compute to managed servers over SSH; their jars ship under nodes/.
 NODE_ROLES = ("storage", "compute")
 ROLE_CONFIGS = ("studio",)
@@ -44,7 +44,8 @@ def copy_file(source, target):
 
 def verify_jar(jar, role):
     main = {"storage": "io.cengyan.storage.StorageServer", "compute": "io.cengyan.compute.ComputeServer",
-             "cli": "io.cengyan.cli.CengyanCli", "studio": "io.cengyan.studio.StudioServer"}[role]
+             "client": "io.cengyan.client.CengyanClient",
+             "studio": "io.cengyan.studio.StudioServer"}[role]
     with zipfile.ZipFile(jar) as archive:
         if archive.testzip() is not None:
             raise RuntimeError(f"Corrupt JAR: {jar}")

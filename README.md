@@ -44,7 +44,7 @@ bash build-dist.sh
 ```text
 cengyan-storage.jar            数据库 Storage 角色
 cengyan-compute.jar            数据库 Compute 角色
-cengyan-cli.jar                可选交互式客户端（不是数据库进程）
+cengyan-client.jar             客户端：交互 GQL，以及 import 批量导入
 cengyan-studio.jar             可选 Web 客户端服务（不是另一套数据库）
 config/{storage,compute,studio}.properties
 bin/start-cluster-node.sh
@@ -137,7 +137,7 @@ with ClusterClient([('127.0.0.1', 19669)], password='你的初始化密码') as 
 Java CLI 可以连接 Compute，保存登录令牌并在客户端附带图上下文：
 
 ```bash
-java -jar cengyan-cli.jar --host 127.0.0.1 --port 19669
+java -jar cengyan-client.jar --host 127.0.0.1 --port 19669
 ```
 
 ```text
@@ -162,7 +162,7 @@ Studio 前后端代码作为可选客户端保留，配置 `db_host/db_port` 指
 | cengyan-distributed | 图目录、图实体、事务、索引、Schema 和副本任务 |
 | cengyan-parser / query | GQL 解析、远程查询协调、表达式、DuckDB |
 | cengyan-storage / compute | 两个数据库角色入口 |
-| cengyan-cli / studio | 可选客户端工具 |
+| cengyan-client / studio | 可选客户端工具 |
 
 ## 验证与边界
 

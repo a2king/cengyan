@@ -20,7 +20,7 @@
         <module>cengyan-storage</module>
         <module>cengyan-parser</module>
         <module>cengyan-query</module>
-        <module>cengyan-cli</module>
+        <module>cengyan-client</module>
         <module>cengyan-studio</module>
     </modules>
 
@@ -31,6 +31,7 @@
 
         <rocksdb.version>11.8.1</rocksdb.version>
         <duckdb.version>1.5.6.0</duckdb.version>
+        <sqlite.version>3.47.2.0</sqlite.version>
         <netty.version>4.1.139.Final</netty.version>
         <jackson.version>2.22.4</jackson.version>
         <antlr.version>4.13.2</antlr.version>
@@ -111,6 +112,11 @@
                 <groupId>org.duckdb</groupId>
                 <artifactId>duckdb_jdbc</artifactId>
                 <version>${duckdb.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.xerial</groupId>
+                <artifactId>sqlite-jdbc</artifactId>
+                <version>${sqlite.version}</version>
             </dependency>
             <dependency>
                 <groupId>io.netty</groupId>

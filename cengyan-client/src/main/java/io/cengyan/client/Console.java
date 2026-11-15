@@ -1,4 +1,4 @@
-package io.cengyan.cli;
+package io.cengyan.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -16,54 +16,41 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-/**
- * 交互式客户端。一行 GQL 包成 {@code execute}，以冒号开头的行当作管理命令。
- */
-public final class CengyanCli {
+/** 交互式 GQL 和管理命令。不带 import 子命令时使用。 */
+final class Console {
     private static final ObjectMapper MAPPER = new ObjectMapper();
-
     private String session = "";
     private String graph = "";
 
-    public static void main(String[] args) throws Exception {
+    static void run(String[] args) throws Exception {
         String host = "127.0.0.1";
         int port = 19669;
         List<String> rest = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "--host" -> {
-                    host = args[++i];
-                }
-                case "--port" -> {
-                    port = Integer.parseInt(args[++i]);
-                }
+                case "--host" -> host = args[++i];
+                case "--port" -> port = Integer.parseInt(args[++i]);
                 default -> rest.add(args[i]);
             }
         }
-        CengyanCli cli = new CengyanCli();
+        Console console = new Console();
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(host, port), 3000);
             socket.setTcpNoDelay(true);
-            BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            BufferedWriter writer = new BufferedWriter(
-                    new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
             if (!rest.isEmpty()) {
-                cli.roundTrip(writer, reader, String.join(" ", rest));
+                console.roundTrip(writer, reader, String.join(" ", rest));
                 return;
             }
-            System.out.println("层岩图数据库客户端。输入 GQL，ping 检查连接，exit 退出。");
+            System.out.println("层岩图数据库客户端。输入 GQL，ping 检查连接，exit 退出。批量导入使用 import 子命令。");
             BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
             String line;
             while ((line = stdin.readLine()) != null) {
                 String trimmed = line.trim();
-                if (trimmed.equalsIgnoreCase("exit") || trimmed.equalsIgnoreCase("quit")) {
-                    return;
-                }
-                if (trimmed.isEmpty()) {
-                    continue;
-                }
-                cli.roundTrip(writer, reader, trimmed);
+                if (trimmed.equalsIgnoreCase("exit") || trimmed.equalsIgnoreCase("quit")) return;
+                if (trimmed.isEmpty()) continue;
+                console.roundTrip(writer, reader, trimmed);
             }
         }
     }
@@ -93,9 +80,7 @@ public final class CengyanCli {
                 node.put("op", "login");
                 node.put("session", session);
                 node.put("user", part(parts, 1));
-                node.put("password", parts.length > 2
-                        ? String.join(" ", Arrays.copyOfRange(parts, 2, parts.length))
-                        : "");
+                node.put("password", parts.length > 2 ? String.join(" ", Arrays.copyOfRange(parts, 2, parts.length)) : "");
             } else {
                 node.put("op", "admin");
                 node.put("session", session);
@@ -117,22 +102,16 @@ public final class CengyanCli {
                     case "dropUser" -> node.put("user", part(parts, 1));
                     case "addStorage", "addCompute", "setPartCount", "rebuildIndex" ->
                             throw new IllegalArgumentException("旧单机管理命令已移除；新增节点请使用角色配置启动并自动 Join，分片数建图后固定");
-                    case "drainStorage", "removeStorage", "drainCompute", "removeCompute" -> {
-                        String target = part(parts, 1);
-                        node.put("nodeId", target);
-                    }
+                    case "drainStorage", "removeStorage", "drainCompute", "removeCompute" -> node.put("nodeId", part(parts, 1));
                     case "addReplica" -> {
                         node.put("graph", part(parts, 1));
                         node.put("replicas", parseInt(part(parts, 2)));
                     }
                     case "showMembers" -> node.put("graph", part(parts, 1));
                     case "stats" -> {
-                        if ("refresh".equalsIgnoreCase(part(parts, 1))) {
-                            node.put("refresh", true);
-                        }
+                        if ("refresh".equalsIgnoreCase(part(parts, 1))) node.put("refresh", true);
                     }
-                    default -> {
-                    }
+                    default -> { }
                 }
             }
         } else {
@@ -149,22 +128,9 @@ public final class CengyanCli {
         return MAPPER.writeValueAsString(node);
     }
 
-    private static String part(String[] parts, int index) {
-        return parts.length > index ? parts[index] : "";
-    }
-
-    private static int parseInt(String text) {
-        if (text == null || text.isBlank()) {
-            return 0;
-        }
-        return Integer.parseInt(text);
-    }
-
     private void print(String response) throws IOException {
         JsonNode node = MAPPER.readTree(response);
-        if (node.hasNonNull("session") && !node.get("session").asText().isEmpty()) {
-            session = node.get("session").asText();
-        }
+        if (node.hasNonNull("session") && !node.get("session").asText().isEmpty()) session = node.get("session").asText();
         String code = node.path("code").asText("");
         if (!"OK".equals(code)) {
             System.err.println(code + " " + node.path("message").asText(""));
@@ -178,9 +144,7 @@ public final class CengyanCli {
         }
         StringBuilder header = new StringBuilder();
         for (JsonNode column : columns) {
-            if (!header.isEmpty()) {
-                header.append('\t');
-            }
+            if (!header.isEmpty()) header.append('\t');
             header.append(column.asText());
         }
         System.out.println(header);
@@ -188,13 +152,18 @@ public final class CengyanCli {
             for (JsonNode row : rows) {
                 StringBuilder line = new StringBuilder();
                 for (JsonNode cell : row) {
-                    if (!line.isEmpty()) {
-                        line.append('\t');
-                    }
+                    if (!line.isEmpty()) line.append('\t');
                     line.append(cell.isTextual() ? cell.asText() : cell.toString());
                 }
                 System.out.println(line);
             }
         }
+    }
+
+    private static String part(String[] parts, int index) { return parts.length > index ? parts[index] : ""; }
+
+    private static int parseInt(String text) {
+        if (text == null || text.isBlank()) return 0;
+        return Integer.parseInt(text);
     }
 }

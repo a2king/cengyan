@@ -5,7 +5,7 @@
 
 内容：
   cengyan-studio.jar       Studio 控制台（网页、集群管理）
-  cengyan-cli.jar          可选 Java 交互式客户端
+  cengyan-client.jar       客户端。无参数进入交互；import 子命令做批量导入
   nodes/                  Studio 下发到各服务器的 Storage / Compute 程序和日志配置
   jdk/                    离线 JDK 21（Linux x64、aarch64），Studio 推送到各服务器
   config/studio.properties Studio 监听地址等
