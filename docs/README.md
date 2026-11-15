@@ -4,6 +4,10 @@
 
 - [GQL 与层岩扩展总览](gql/00-和标准相比.md)
 - [批量导入](bulk-import.md)
+- [分布式实体计数与升级说明](distributed-count-store.md)
+- [多机器存储与独立计算集群方案](distributed-architecture.md)
+- [dev1.0.0 分布式实现进度](distributed-implementation-status.md)
+- [Linux 部署（单节点和多节点）](linux-cluster-deployment.md)
 - [性能测试记录](perf-report.md)
 - [标准与扩展边界](gql/09-标准与扩展边界.md)
 - [后续改造路线图](gql/10-改造路线图.md)
@@ -24,5 +28,5 @@
 - 标准 GQL 子集、层岩扩展和执行策略分开描述；
 - `COMMENT` 是 Schema 元数据扩展，不是普通解析阶段注释；
 - `bulkInsert` 是 JSON 导入协议，不是 GQL 文本语句；
-- 文档中的 `0` 预算表示不限，具体部署可以在 `cengyan.properties` 中设置正数；
+- 当前使用 Storage/Compute 角色配置，资源额度按角色校验为有限正数；旧单机配置和执行器已移除；
 - 网络 `execute` 一次执行一条语句，Studio 和 Python 文件执行器可以顺序发送多条语句。

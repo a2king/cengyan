@@ -38,45 +38,30 @@ require_java21() {
 
 require_java21
 command -v mvn >/dev/null 2>&1 || { echo '[ERROR] 未找到 Maven。请安装 Maven，并将 mvn 加入 PATH。' >&2; exit 1; }
-command -v zip >/dev/null 2>&1 || { echo '[ERROR] 未找到 zip。请安装 zip 后重试。' >&2; exit 1; }
-
-VERSION="$(sed -n 's/.*<version>[[:space:]]*\([^<[:space:]]*\)[[:space:]]*<\/version>.*/\1/p' "$ROOT_DIR/pom.xml" | head -n 1)"
-if [[ -z "$VERSION" ]]; then
-    echo '[ERROR] 无法从 pom.xml 读取项目版本。' >&2
-    exit 1
-fi
-PACKAGE_NAME="cengyan-$VERSION"
-DIST_DIR="$ROOT_DIR/dist"
-PACKAGE_ROOT="$DIST_DIR/$PACKAGE_NAME"
-ARCHIVE_PATH="$DIST_DIR/$PACKAGE_NAME-linux.zip"
-
-echo '开始构建 cengyan-server 和 cengyan-studio ...'
-(cd "$ROOT_DIR" && mvn -DskipTests -pl cengyan-server,cengyan-studio -am clean package)
-
-rm -rf "$PACKAGE_ROOT" "$ARCHIVE_PATH"
-mkdir -p "$PACKAGE_ROOT"/{bin,config,data,logs,pid,tmp,lib}
-
-SERVER_JAR="$ROOT_DIR/cengyan-server/target/cengyan-server-$VERSION.jar"
-STUDIO_JAR="$ROOT_DIR/cengyan-studio/target/cengyan-studio-$VERSION.jar"
-for jar in "$SERVER_JAR" "$STUDIO_JAR"; do
-    if [[ ! -f "$jar" ]]; then
-        echo "[ERROR] 未找到构建产物：$jar" >&2
-        exit 1
-    fi
+command -v python3 >/dev/null || { echo '[ERROR] 构建机需要 Python 3.11+' >&2; exit 1; }
+python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
+TARGET=linux
+SKIP_WEB=false
+MAVEN_ARGS=(clean package)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --target) TARGET="${2:?--target requires linux}"; shift 2 ;;
+        --skip-tests) MAVEN_ARGS+=(-DskipTests); shift ;;
+        --skip-web) SKIP_WEB=true; shift ;;
+        *) echo "Unknown option: $1" >&2; exit 2 ;;
+    esac
 done
-cp "$SERVER_JAR" "$PACKAGE_ROOT/cengyan-server.jar"
-cp "$STUDIO_JAR" "$PACKAGE_ROOT/cengyan-studio.jar"
-cp "$ROOT_DIR/cengyan.properties" "$PACKAGE_ROOT/config/cengyan.properties"
-cp "$ROOT_DIR/cengyan.properties" "$PACKAGE_ROOT/config/cengyan.properties.example"
-cp "$ROOT_DIR/packaging/studio.properties" "$PACKAGE_ROOT/config/studio.properties"
-cp "$ROOT_DIR/packaging/studio.properties" "$PACKAGE_ROOT/config/studio.properties.example"
-cp "$ROOT_DIR/packaging/bin/"*.sh "$PACKAGE_ROOT/bin/"
-cp "$ROOT_DIR/packaging/bin/java.env" "$PACKAGE_ROOT/bin/java.env"
-cp "$ROOT_DIR/packaging/PACKAGE-README.txt" "$PACKAGE_ROOT/README.txt"
-cp "$ROOT_DIR/packaging/lib/README.txt" "$PACKAGE_ROOT/lib/README.txt"
-chmod +x "$PACKAGE_ROOT/bin/"*.sh
-sed -i 's/\r$//' "$PACKAGE_ROOT/bin/"*.sh "$PACKAGE_ROOT/bin/java.env"
-
-zip -rq "$ARCHIVE_PATH" -D -C "$DIST_DIR" "$PACKAGE_NAME"
-echo "打包完成：$PACKAGE_ROOT"
-echo "压缩包：$ARCHIVE_PATH"
+case "$TARGET" in linux) ;; *) echo 'Only the Linux tar.gz package is supported' >&2; exit 2 ;; esac
+# Fail before the long build when the offline JDKs that Studio deploys are missing.
+for jdk in jdk-21-linux-x64.tar.gz jdk-21-linux-aarch64.tar.gz; do
+    [[ -f "$ROOT_DIR/packaging/jdk/$jdk" ]] || { echo "[ERROR] 缺少离线 JDK：packaging/jdk/$jdk。请下载 Temurin 21 Linux JDK 的 .tar.gz 并按此文件名保存" >&2; exit 1; }
+done
+# Keep Maven and Surefire on the same JDK even when JAVA_HOME was initially unset.
+if [[ -z "${JAVA_HOME:-}" ]]; then export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$JAVA_EXE")")")"; fi
+if [[ "$SKIP_WEB" == false ]]; then
+    command -v npm >/dev/null || { echo '[ERROR] 构建 Web 需要 Node.js/npm' >&2; exit 1; }
+    (cd "$ROOT_DIR/cengyan-studio-web" && npm ci --no-audit --no-fund && npm run build)
+fi
+(cd "$ROOT_DIR" && mvn "${MAVEN_ARGS[@]}")
+python3 "$ROOT_DIR/packaging/assemble-dist.py" --target "$TARGET"
+echo 'Linux tar.gz 打包完成；bin 内文件权限为 777，原有 dist 解压目录和数据未改动。'

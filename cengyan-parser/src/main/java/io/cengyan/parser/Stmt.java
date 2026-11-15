@@ -4,10 +4,11 @@ import java.util.List;
 
 /** 一条语句。字段名沿用用户写下的大小写。 */
 public sealed interface Stmt {
-    record CreateGraph(String name, int parts, String comment, boolean ifNotExists) implements Stmt {
-        public CreateGraph(String name) { this(name, 1, null, false); }
-        public CreateGraph(String name, String comment) { this(name, 1, comment, false); }
-        public CreateGraph(String name, int parts, String comment) { this(name, parts, comment, false); }
+    record CreateGraph(String name, int parts, String comment, boolean ifNotExists, int replicas, String idType, int idLength) implements Stmt {
+        public CreateGraph(String name) { this(name, 1, null, false, 1, "INT", 0); }
+        public CreateGraph(String name, String comment) { this(name, 1, comment, false, 1, "INT", 0); }
+        public CreateGraph(String name, int parts, String comment) { this(name, parts, comment, false, 1, "INT", 0); }
+        public CreateGraph(String name, int parts, String comment, boolean ifNotExists) { this(name, parts, comment, ifNotExists, 1, "INT", 0); }
     }
 
     record Use(String name) implements Stmt {
@@ -36,14 +37,19 @@ public sealed interface Stmt {
     record Describe(boolean node, String name) implements Stmt {
     }
 
-    record CreateType(boolean node, String name, String comment, String idType, int idLength, List<Field> fields,
-                      boolean ifNotExists) implements Stmt {
+    record CreateType(boolean node, String name, String comment, String idType, int idLength, boolean idSpecified,
+                      List<Field> fields, boolean ifNotExists) implements Stmt {
         public CreateType(boolean node, String name, String idType, int idLength, List<Field> fields) {
-            this(node, name, null, idType, idLength, fields, false);
+            this(node, name, null, idType, idLength, true, fields, false);
         }
 
         public CreateType(boolean node, String name, String comment, String idType, int idLength, List<Field> fields) {
-            this(node, name, comment, idType, idLength, fields, false);
+            this(node, name, comment, idType, idLength, true, fields, false);
+        }
+
+        public CreateType(boolean node, String name, String comment, String idType, int idLength, List<Field> fields,
+                          boolean ifNotExists) {
+            this(node, name, comment, idType, idLength, true, fields, ifNotExists);
         }
     }
 

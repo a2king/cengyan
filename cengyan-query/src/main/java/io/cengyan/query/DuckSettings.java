@@ -95,6 +95,8 @@ final class DuckSettings {
         } else if (raw.endsWith("TB")) {
             multiplier = 1024L * 1024L * 1024L * 1024L;
             raw = raw.substring(0, raw.length() - 2);
+        } else if (raw.endsWith("B")) {
+            raw = raw.substring(0, raw.length() - 1);
         }
         try {
             return Math.multiplyExact(Long.parseLong(raw), multiplier);

@@ -1,5 +1,6 @@
 import unittest
-from cengyan import Result
+
+from pycengyan import Result
 
 
 class ResultTest(unittest.TestCase):

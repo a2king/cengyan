@@ -135,7 +135,7 @@ final class TreeText {
     }
 
     private static String id(Stmt.CreateType type) {
-        if (!type.node() || ("INT".equalsIgnoreCase(type.idType()) && type.idLength() == 19)) {
+        if (!type.node() || ("INT".equalsIgnoreCase(type.idType()) && type.idLength() == 64)) {
             return "";
         }
         return " id=" + type.idType().toUpperCase(java.util.Locale.ROOT) + "(" + type.idLength() + ")";

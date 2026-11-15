@@ -21,12 +21,16 @@ export interface QueryResponse {
 export interface StudioConfig {
   graphMaxNodes: number;
   tableMaxNodes: number;
+  /** Studio 以 --home 启动，启用了服务器和节点管理。 */
+  clusterManaged?: boolean;
 }
 
 export interface GraphSpace {
   name: string;
   aliases: string[];
   comment?: string;
+  idType?: string;
+  idLength?: number;
 }
 
 export interface TypeRow {
@@ -58,4 +62,40 @@ export interface StatsRow {
   target: 'NODE' | 'REL';
   name: string;
   count: number;
+}
+
+export interface OpsOverview {
+  code: string;
+  message?: string;
+  nodeId?: string;
+  role?: string;
+  slots?: { capacity?: number; active?: number; reserved?: number; available?: number; memoryReserved?: number; diskReserved?: number };
+  queuePending?: number;
+  proxied?: number;
+  runningQueries?: number;
+  heapUsedBytes?: number;
+  heapMaxBytes?: number;
+  threadCount?: number;
+  processCpuLoad?: number;
+  systemCpuLoad?: number;
+  systemMemoryBytes?: number;
+  systemFreeMemoryBytes?: number;
+  diskTotalBytes?: number;
+  diskUsableBytes?: number;
+  diskBusy?: number;
+  diskReadBytesPerSec?: number;
+  diskWriteBytesPerSec?: number;
+  netInBytesPerSec?: number;
+  netOutBytesPerSec?: number;
+  clientRequestsTotal?: number;
+  clientCompletedTotal?: number;
+  clientFailedTotal?: number;
+  clientBytesInTotal?: number;
+  clientBytesOutTotal?: number;
+  computeNodes?: Array<Record<string, unknown>>;
+  storageNodes?: Array<Record<string, unknown>>;
+  shards?: Array<Record<string, unknown>>;
+  clusterHealth?: string;
+  collectedAt?: number;
+  events?: Array<{ ts: number; nodeId: string; level: string; event: string; message: string }>;
 }

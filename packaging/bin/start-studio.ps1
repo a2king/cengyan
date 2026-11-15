@@ -8,6 +8,7 @@ $pidFile = Join-Path $pidDir 'studio.pid'
 $logFile = Join-Path $logDir 'studio.log'
 $errorFile = Join-Path $logDir 'studio-error.log'
 $jar = Join-Path $appHome 'cengyan-studio.jar'
+$logConfig = Join-Path $appHome 'config\logging.properties'
 
 if ($env:JAVA_HOME) {
     $javaExe = Join-Path $env:JAVA_HOME 'bin\java.exe'
@@ -28,6 +29,7 @@ $major = if ($version -match '^1\.(\d+)') { [int]$Matches[1] } else { [int](($ve
 if ($major -ne 21) { throw "项目必须使用 Java 21，当前检测到 Java $major（$version）。请设置 JAVA_HOME 指向 JDK 21 后重试。" }
 
 if (-not (Test-Path -LiteralPath $jar)) { throw "未找到 $jar" }
+if (-not (Test-Path -LiteralPath $logConfig -PathType Leaf)) { throw "未找到日志配置：$logConfig" }
 
 $studioHost = '0.0.0.0'
 $studioPort = '19670'
@@ -35,6 +37,10 @@ $dbHost = '127.0.0.1'
 $dbPort = '19669'
 $graphMaxNodes = '2000'
 $tableMaxNodes = '2000'
+$computeHost = ''
+$computePort = '0'
+$computeUser = ''
+$computePassword = ''
 $config = Join-Path $appHome 'config\studio.properties'
 if (Test-Path -LiteralPath $config) {
     foreach ($line in Get-Content -LiteralPath $config) {
@@ -46,6 +52,10 @@ if (Test-Path -LiteralPath $config) {
                 'db_port' { $dbPort = $Matches[2] }
                 'graph_max_nodes' { $graphMaxNodes = $Matches[2] }
                 'table_max_nodes' { $tableMaxNodes = $Matches[2] }
+                'compute_host' { $computeHost = $Matches[2] }
+                'compute_port' { $computePort = $Matches[2] }
+                'compute_user' { $computeUser = $Matches[2] }
+                'compute_password' { $computePassword = $Matches[2] }
             }
         }
     }
@@ -60,7 +70,7 @@ if (Test-Path -LiteralPath $pidFile) {
 }
 
 $process = Start-Process -FilePath $javaExe `
-    -ArgumentList @('-jar', $jar, '--host', $studioHost, '--port', $studioPort, '--db-host', $dbHost, '--db-port', $dbPort, '--graph-max-nodes', $graphMaxNodes, '--table-max-nodes', $tableMaxNodes) `
+    -ArgumentList @("`"-Djava.util.logging.config.file=$logConfig`"", '-jar', $jar, '--host', $studioHost, '--port', $studioPort, '--db-host', $dbHost, '--db-port', $dbPort, '--graph-max-nodes', $graphMaxNodes, '--table-max-nodes', $tableMaxNodes, '--compute-host', $computeHost, '--compute-port', $computePort, '--compute-user', $computeUser, '--compute-password', $computePassword) `
     -WorkingDirectory $appHome `
     -RedirectStandardOutput $logFile `
     -RedirectStandardError $errorFile `

@@ -1,4 +1,9 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿param(
+    [ValidateSet('linux')][string]$Target = 'linux',
+    [switch]$SkipTests,
+    [switch]$SkipWeb
+)
+$ErrorActionPreference = 'Stop'
 
 function Get-Java21 {
     $javaExe = $null
@@ -41,65 +46,6 @@ function Get-Java21 {
     return $javaExe
 }
 
-function Get-ProjectVersion([string]$pomPath) {
-    $match = [regex]::Match((Get-Content -Raw -LiteralPath $pomPath), '<version>\s*([^<\s]+)\s*</version>')
-    if (-not $match.Success) {
-        throw "无法从 $pomPath 读取项目版本。"
-    }
-    return $match.Groups[1].Value
-}
-
-function New-ZipArchiveWithUnixPermissions([string]$sourceRoot, [string]$archivePath) {
-    Add-Type -AssemblyName System.IO.Compression
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-    $sourceRoot = (Get-Item -LiteralPath $sourceRoot).FullName.TrimEnd('\')
-    $packageName = Split-Path -Leaf $sourceRoot
-    $archive = [System.IO.Compression.ZipFile]::Open(
-        $archivePath,
-        [System.IO.Compression.ZipArchiveMode]::Create
-    )
-    try {
-        function ConvertTo-SignedInt32([long]$value) {
-            if ($value -gt [int32]::MaxValue) {
-                return [int]([int64]$value - 4294967296)
-            }
-            return [int]$value
-        }
-
-        $directoryMode = ConvertTo-SignedInt32 0x41ED0000 # drwxr-xr-x
-        $fileMode = ConvertTo-SignedInt32 0x81A40000      # -rw-r--r--
-        $executableMode = ConvertTo-SignedInt32 0x81ED0000 # -rwxr-xr-x
-
-        $rootEntry = $archive.CreateEntry("$packageName/")
-        $rootEntry.ExternalAttributes = $directoryMode
-
-        Get-ChildItem -LiteralPath $sourceRoot -Recurse -Force | ForEach-Object {
-            $relativePath = $_.FullName.Substring($sourceRoot.Length).TrimStart('\').Replace('\', '/')
-            $entryName = "$packageName/$relativePath"
-            if ($_.PSIsContainer) {
-                $entry = $archive.CreateEntry("$entryName/")
-                $entry.ExternalAttributes = $directoryMode
-                return
-            }
-
-            $entry = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                $archive,
-                $_.FullName,
-                $entryName,
-                [System.IO.Compression.CompressionLevel]::Optimal
-            )
-            if ($_.Extension -eq '.sh') {
-                $entry.ExternalAttributes = $executableMode
-            } else {
-                $entry.ExternalAttributes = $fileMode
-            }
-        }
-    } finally {
-        $archive.Dispose()
-    }
-}
-
 $repoRoot = $PSScriptRoot
 $javaExe = Get-Java21
 $maven = Get-Command mvn.cmd -ErrorAction SilentlyContinue
@@ -107,104 +53,38 @@ if (-not $maven) {
     throw '未找到 Maven。请安装 Maven，并将 mvn 加入 PATH。'
 }
 
-$version = Get-ProjectVersion (Join-Path $repoRoot 'pom.xml')
-$packageName = "cengyan-$version"
-$distDir = Join-Path $repoRoot 'dist'
-$packageRoot = Join-Path $distDir $packageName
-$windowsArchivePath = Join-Path $distDir "$packageName-windows.zip"
-$linuxArchivePath = Join-Path $distDir "$packageName-linux.zip"
+$python = Get-Command python -ErrorAction SilentlyContinue
+if (-not $python) { throw '打包需要 Python 3.11+（仅构建机需要，部署机无需 Python 即可运行 JAR）。' }
+& $python.Source -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
+if ($LASTEXITCODE -ne 0) { throw '打包需要 Python 3.11+' }
+# Fail before the long build when the offline JDKs that Studio deploys are missing.
+foreach ($jdk in 'jdk-21-linux-x64.tar.gz', 'jdk-21-linux-aarch64.tar.gz') {
+    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot "packaging/jdk/$jdk"))) {
+        throw "缺少离线 JDK：packaging/jdk/$jdk。请下载 Temurin 21 Linux JDK 的 .tar.gz 并按此文件名保存"
+    }
+}
 
-Write-Host '开始构建 cengyan-server 和 cengyan-studio ...'
 Push-Location $repoRoot
 try {
-    & $maven.Source '-DskipTests' '-pl' 'cengyan-server,cengyan-studio' '-am' 'clean' 'package'
-    if ($LASTEXITCODE -ne 0) {
-        throw "Maven 构建失败，退出码：$LASTEXITCODE"
+    if (-not $SkipWeb) {
+        $npm = Get-Command npm.cmd -ErrorAction Stop
+        Push-Location (Join-Path $repoRoot 'cengyan-studio-web')
+        try {
+            & $npm.Source ci --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { throw 'npm ci 失败' }
+            & $npm.Source run build
+            if ($LASTEXITCODE -ne 0) { throw 'Studio Web 构建失败' }
+        } finally { Pop-Location }
     }
+    # Never run two Maven reactors against the same target directories concurrently.
+    $arguments = @('clean','package')
+    if ($SkipTests) { $arguments += '-DskipTests'; Write-Warning '已显式跳过 Java 测试。' }
+    & $maven.Source @arguments
+    if ($LASTEXITCODE -ne 0) { throw "Maven 构建失败，退出码：$LASTEXITCODE" }
+    & $python.Source (Join-Path $repoRoot 'packaging/assemble-dist.py') --target $Target
+    if ($LASTEXITCODE -ne 0) { throw '归档或产物校验失败；未发布新的完整部署包。' }
 } finally {
     Pop-Location
 }
-
-if (Test-Path -LiteralPath $packageRoot) {
-    Remove-Item -Recurse -Force -LiteralPath $packageRoot
-}
-foreach ($archivePath in @($windowsArchivePath, $linuxArchivePath)) {
-    if (Test-Path -LiteralPath $archivePath) {
-        Remove-Item -Force -LiteralPath $archivePath
-    }
-}
-
-$null = New-Item -ItemType Directory -Force -Path `
-    (Join-Path $packageRoot 'bin'),
-    (Join-Path $packageRoot 'config'),
-    (Join-Path $packageRoot 'data'),
-    (Join-Path $packageRoot 'logs'),
-    (Join-Path $packageRoot 'pid'),
-    (Join-Path $packageRoot 'tmp'),
-    (Join-Path $packageRoot 'lib')
-
-$serverJar = Join-Path $repoRoot "cengyan-server\target\cengyan-server-$version.jar"
-$studioJar = Join-Path $repoRoot "cengyan-studio\target\cengyan-studio-$version.jar"
-foreach ($jar in @($serverJar, $studioJar)) {
-    if (-not (Test-Path -LiteralPath $jar)) {
-        throw "未找到构建产物：$jar"
-    }
-}
-Copy-Item -LiteralPath $serverJar -Destination (Join-Path $packageRoot 'cengyan-server.jar')
-Copy-Item -LiteralPath $studioJar -Destination (Join-Path $packageRoot 'cengyan-studio.jar')
-
-Copy-Item -LiteralPath (Join-Path $repoRoot 'cengyan.properties') -Destination (Join-Path $packageRoot 'config\cengyan.properties')
-Copy-Item -LiteralPath (Join-Path $repoRoot 'cengyan.properties') -Destination (Join-Path $packageRoot 'config\cengyan.properties.example')
-Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\studio.properties') -Destination (Join-Path $packageRoot 'config\studio.properties')
-Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\studio.properties') -Destination (Join-Path $packageRoot 'config\studio.properties.example')
-
-Copy-Item -Path (Join-Path $repoRoot 'packaging\bin\*') -Destination (Join-Path $packageRoot 'bin') -Recurse
-$utf8 = New-Object System.Text.UTF8Encoding $false
-Get-ChildItem -LiteralPath (Join-Path $packageRoot 'bin') -File | Where-Object { $_.Extension -eq '.sh' -or $_.Name -eq 'java.env' } | ForEach-Object {
-    $text = [System.IO.File]::ReadAllText($_.FullName) -replace "`r`n", "`n" -replace "`r", "`n"
-    [System.IO.File]::WriteAllText($_.FullName, $text, $utf8)
-}
-Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\PACKAGE-README.txt') -Destination (Join-Path $packageRoot 'README.txt')
-Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\lib\README.txt') -Destination (Join-Path $packageRoot 'lib\README.txt')
-
-for ($attempt = 1; $attempt -le 3; $attempt++) {
-    try {
-        Compress-Archive -Path $packageRoot -DestinationPath $windowsArchivePath -CompressionLevel Optimal -ErrorAction Stop
-        break
-    } catch {
-        if ($attempt -eq 3) {
-            throw
-        }
-        Start-Sleep -Seconds 2
-    }
-}
-
-$linuxTempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "$packageName-linux-$PID"
-$linuxPackageRoot = Join-Path $linuxTempRoot $packageName
-try {
-    $null = New-Item -ItemType Directory -Force -Path `
-        (Join-Path $linuxPackageRoot 'bin'),
-        (Join-Path $linuxPackageRoot 'config'),
-        (Join-Path $linuxPackageRoot 'data'),
-        (Join-Path $linuxPackageRoot 'logs'),
-        (Join-Path $linuxPackageRoot 'pid'),
-        (Join-Path $linuxPackageRoot 'tmp'),
-        (Join-Path $linuxPackageRoot 'lib')
-    Copy-Item -LiteralPath (Join-Path $packageRoot 'cengyan-server.jar') -Destination $linuxPackageRoot
-    Copy-Item -LiteralPath (Join-Path $packageRoot 'cengyan-studio.jar') -Destination $linuxPackageRoot
-    Copy-Item -LiteralPath (Join-Path $packageRoot 'README.txt') -Destination $linuxPackageRoot
-    Copy-Item -Path (Join-Path $packageRoot 'config\*') -Destination (Join-Path $linuxPackageRoot 'config') -Recurse
-    Copy-Item -Path (Join-Path $packageRoot 'lib\*') -Destination (Join-Path $linuxPackageRoot 'lib') -Recurse
-    Copy-Item -Path (Join-Path $packageRoot 'bin\*.sh') -Destination (Join-Path $linuxPackageRoot 'bin')
-    Copy-Item -LiteralPath (Join-Path $packageRoot 'bin\java.env') -Destination (Join-Path $linuxPackageRoot 'bin')
-    New-ZipArchiveWithUnixPermissions $linuxPackageRoot $linuxArchivePath
-} finally {
-    if (Test-Path -LiteralPath $linuxTempRoot) {
-        Remove-Item -Recurse -Force -LiteralPath $linuxTempRoot
-    }
-}
-Write-Host "打包完成：$packageRoot"
-Write-Host "Windows 压缩包：$windowsArchivePath"
-Write-Host "Linux 压缩包：$linuxArchivePath（已保留 .sh 的可执行权限）"
-
+Write-Host "Linux tar.gz 打包完成：$(Join-Path $repoRoot 'dist')；bin 内文件权限为 777，原有解压目录和数据未改动。"
 

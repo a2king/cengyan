@@ -131,6 +131,18 @@ class GqlSyntaxTest {
         Stmt.CreateType type = (Stmt.CreateType) Gql.parse(
                 "CREATE NODE TYPE Company COMMENT '企业节点' ID STRING(32) (name STRING NULL COMMENT '名称')");
         assertEquals("企业节点", type.comment());
+        assertEquals("STRING", type.idType());
+        assertEquals(32, type.idLength());
+        Stmt.CreateGraph keyed = (Stmt.CreateGraph) Gql.parse("CREATE GRAPH demo PARTS 32 REPLICAS 2 ID STRING(64) COMMENT '关系'");
+        assertEquals(32, keyed.parts());
+        assertEquals(2, keyed.replicas());
+        assertEquals("STRING", keyed.idType());
+        assertEquals(64, keyed.idLength());
+        assertEquals("关系", keyed.comment());
+        Stmt.CreateGraph integer = (Stmt.CreateGraph) Gql.parse("CREATE GRAPH demo ID INT64");
+        assertEquals("INT", integer.idType());
+        assertEquals(64, integer.idLength());
+        assertEquals(1, integer.replicas());
         assertEquals("名称", type.fields().get(0).comment());
     }
 }

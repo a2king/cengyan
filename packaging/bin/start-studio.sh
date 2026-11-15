@@ -9,7 +9,12 @@ PID_FILE="$PID_DIR/studio.pid"
 LOG_FILE="$LOG_DIR/studio.log"
 
 source "$SCRIPT_DIR/check-java.sh"
-require_java21
+if ! require_java21 2>/dev/null; then
+    echo "[INFO] 未找到可用的 Java 21（JAVA_HOME / PATH），改用发布包自带的 JDK" >&2
+    use_bundled_jdk "$APP_HOME" || exit 1
+fi
+LOG_CONFIG="$APP_HOME/config/logging.properties"
+[[ -r "$LOG_CONFIG" ]] || { echo "[ERROR] Studio logging config not found/readable: $LOG_CONFIG" >&2; exit 1; }
 
 [[ -f "$APP_HOME/cengyan-studio.jar" ]] || { echo "[ERROR] 未找到 $APP_HOME/cengyan-studio.jar" >&2; exit 1; }
 
@@ -19,6 +24,10 @@ DB_HOST=127.0.0.1
 DB_PORT=19669
 GRAPH_MAX_NODES=2000
 TABLE_MAX_NODES=2000
+COMPUTE_HOST=
+COMPUTE_PORT=0
+COMPUTE_USER=
+COMPUTE_PASSWORD=
 if [[ -f "$APP_HOME/config/studio.properties" ]]; then
     value_for() {
         awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" {sub(/^[[:space:]]*/, "", $2); sub(/[[:space:]]*$/, "", $2); print $2; exit}' "$APP_HOME/config/studio.properties"
@@ -29,6 +38,10 @@ if [[ -f "$APP_HOME/config/studio.properties" ]]; then
     [[ -n "$(value_for db_port)" ]] && DB_PORT="$(value_for db_port)"
     [[ -n "$(value_for graph_max_nodes)" ]] && GRAPH_MAX_NODES="$(value_for graph_max_nodes)"
     [[ -n "$(value_for table_max_nodes)" ]] && TABLE_MAX_NODES="$(value_for table_max_nodes)"
+    [[ -n "$(value_for compute_host)" ]] && COMPUTE_HOST="$(value_for compute_host)"
+    [[ -n "$(value_for compute_port)" ]] && COMPUTE_PORT="$(value_for compute_port)"
+    [[ -n "$(value_for compute_user)" ]] && COMPUTE_USER="$(value_for compute_user)"
+    [[ -n "$(value_for compute_password)" ]] && COMPUTE_PASSWORD="$(value_for compute_password)"
 fi
 
 mkdir -p "$PID_DIR" "$LOG_DIR"
@@ -43,13 +56,18 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 
 cd "$APP_HOME"
-nohup "$JAVA_EXE" -jar "$APP_HOME/cengyan-studio.jar" \
+nohup "$JAVA_EXE" "-Djava.util.logging.config.file=$LOG_CONFIG" -jar "$APP_HOME/cengyan-studio.jar" \
+    --home "$APP_HOME" \
     --host "$STUDIO_HOST" \
     --port "$STUDIO_PORT" \
     --db-host "$DB_HOST" \
     --db-port "$DB_PORT" \
     --graph-max-nodes "$GRAPH_MAX_NODES" \
     --table-max-nodes "$TABLE_MAX_NODES" \
+    --compute-host "$COMPUTE_HOST" \
+    --compute-port "$COMPUTE_PORT" \
+    --compute-user "$COMPUTE_USER" \
+    --compute-password "$COMPUTE_PASSWORD" \
     >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$PID_FILE"

@@ -18,18 +18,22 @@ import java.nio.charset.StandardCharsets;
 final class DbClient {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private final String host;
-    private final int port;
+    private final java.util.function.Supplier<InetSocketAddress> target;
 
     DbClient(String host, int port) {
-        this.host = host;
-        this.port = port;
+        this(() -> InetSocketAddress.createUnresolved(host, port));
+    }
+
+    /** 每次请求重新取目标地址：受管集群中计算节点增减后无需重启 Studio。 */
+    DbClient(java.util.function.Supplier<InetSocketAddress> target) {
+        this.target = target;
     }
 
     String exchange(ObjectNode request, int timeoutMs) throws IOException {
         int wait = Math.max(timeoutMs, 1000) + 3000;
+        InetSocketAddress address = target.get();
         try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 3000);
+            socket.connect(new InetSocketAddress(address.getHostString(), address.getPort()), 3000);
             socket.setTcpNoDelay(true);
             socket.setSoTimeout(wait);
             BufferedWriter writer = new BufferedWriter(

@@ -7,7 +7,7 @@ script: statement (';' statement)* ';'? EOF;
 
 statement
     : EXPLAIN MATCH node (edge node)? whereClause? returnClause orderClause? skipClause? limitClause? #explainMatch
-    | CREATE GRAPH name=IDENT PARTS INTEGER_LIT COMMENT STRING_LIT? #createGraph
+    | CREATE GRAPH name=IDENT (PARTS INTEGER_LIT)? (REPLICAS INTEGER_LIT)? (ID (INT64 | STRING) '(' INTEGER_LIT ')')? COMMENT STRING_LIT? #createGraph
     | USE name=IDENT                                          #useGraph
     | CREATE ALIAS alias=IDENT FOR GRAPH target=IDENT         #createAlias
     | DROP ALIAS name=IDENT                                   #dropAlias
