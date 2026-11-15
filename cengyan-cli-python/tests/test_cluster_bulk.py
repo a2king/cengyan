@@ -102,6 +102,24 @@ class ClusterBulkTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ClusterGraph(FakeClient(), "g").insert_nodes("N", [{"id": 0}], start_batch=value, align_partitions=False)
 
+    def test_edge_without_id_is_rejected_before_any_write(self):
+        for row in ({"src": "a", "dst": "b"}, {"id": None, "src": "a", "dst": "b"}, "e1"):
+            client = FakeClient()
+            with self.assertRaises(BulkInsertError) as caught:
+                ClusterGraph(client, "g").insert_edges("E", [row])
+            self.assertEqual("INVALID_ARGUMENT", caught.exception.code)
+            self.assertEqual(0, caught.exception.response["confirmed"])
+            self.assertEqual([], client.payloads)
+
+    def test_edge_missing_id_stops_after_confirmed_batches(self):
+        client = FakeClient()
+        rows = [{"id": "e1", "src": "a", "dst": "b"}, {"id": "e2", "src": "a", "dst": "c"}, {"src": "a", "dst": "d"}]
+        with self.assertRaises(BulkInsertError) as caught:
+            ClusterGraph(client, "g").insert_edges("E", rows, batch_size=2)
+        self.assertEqual(2, caught.exception.response["confirmed"])
+        self.assertEqual(1, len(client.payloads))
+        self.assertEqual(["e1", "e2"], [row["id"] for row in client.payloads[0]["rows"]])
+
     def test_skip_missing_flag_is_edge_only(self):
         client = FakeClient()
         ClusterGraph(client, "g").insert_edges("E", [{"id": "e", "src": "a", "dst": "b"}], skip_missing_endpoints=True)

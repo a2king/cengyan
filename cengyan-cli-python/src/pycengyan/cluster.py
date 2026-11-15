@@ -140,6 +140,10 @@ class ClusterGraph:
 
     def insert_edges(self, type_name, rows, *, batch_size=1024, max_batch_bytes=4 * 1024 * 1024,
                      skip_missing_endpoints=False, request_id=None, start_batch=0):
+        """批量写边。每一行都必须带边主键 ``id``，以及 ``src``、``dst``。
+
+        缺 ``id`` 的行在进入网络请求前就被拒绝，已确认批次的进度保留在异常里。
+        """
         return self._bulk("edge", type_name, rows, batch_size, max_batch_bytes, skip_missing_endpoints,
                           request_id, start_batch)
 
@@ -244,11 +248,20 @@ class ClusterGraph:
             if batch and (len(batch) == batch_size or size + row_size > max_bytes):
                 send()
                 batch, size = [], _BATCH_HEADER_BYTES
+            # 已满批次先发出，再拒绝缺 id 的边，避免把已凑满的行留在未发送缓冲里。
+            if kind == "edge":
+                self._require_edge_id(row, progress)
             batch.append(row)
             size += row_size
         if batch:
             send()
         return progress
+
+    @staticmethod
+    def _require_edge_id(row, progress):
+        """边主键与库内规则一致：调用方给出 id，客户端不从端点推导。"""
+        if not isinstance(row, dict) or "id" not in row or row["id"] is None:
+            raise BulkInsertError("边写入必须带 id", "INVALID_ARGUMENT", dict(progress))
 
     @staticmethod
     def _annotate(error, request_id, progress):
