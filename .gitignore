@@ -27,3 +27,6 @@ __pycache__/
 session/
 # Local IDE launch config with machine-specific paths.
 .claude/
+docs/
+packaging/
+dev-scripts/
