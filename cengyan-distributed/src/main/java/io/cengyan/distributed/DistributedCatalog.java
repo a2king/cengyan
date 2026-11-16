@@ -17,6 +17,7 @@ public final class DistributedCatalog {
         return "raft";
     }
     public static ByteString graphKey(String name) { return TransactionEngine.text("catalog/graph/" + name); }
+    public static ByteString graphCreateErrorKey(String name) { return TransactionEngine.text("catalog/createError/" + name); }
 
     public GraphDefinition graph(String name) {
         ByteString bytes = storage.get(0, 0, graphKey(name));
@@ -102,6 +103,7 @@ public final class DistributedCatalog {
         } else {
             definition = allocate(name, requestId, partitions, replicas, vertexType, edgeType, comment, vertexLength, edgeLength, null);
         }
+        try {
         for (int part = 0; part < definition.getPartitions(); part++) {
             DataGroupSpec.Builder spec = DataGroupSpec.newBuilder().setGraphId(definition.getId()).setPartId(part).setDataMode(dataMode(nodes));
             Map<String, Integer> rotation = new HashMap<>();
@@ -123,9 +125,10 @@ public final class DistributedCatalog {
             storage.route(definition.getId(), part, spec.getMembersList().stream().map(DistributedCatalog::address).toList());
         }
         GraphDefinition active = definition.toBuilder().setState("ACTIVE").build();
-        try {
             storage.write(0, 0, StorageGateway.batch("graph.activate/" + definition.getId())
                     .addConditions(StorageGateway.condition(key, definition.toByteString())).addMutations(TransactionEngine.put(key, active.toByteString())).build());
+            storage.write(0, 0, StorageGateway.batch("graph.createError.clear/" + definition.getId())
+                    .addMutations(Mutation.newBuilder().setKey(graphCreateErrorKey(name)).setDelete(true).build()).build());
             return active;
         } catch (ClusterException ex) {
             if (!ex.code().equals("WRITE_CONFLICT")) throw ex;
@@ -134,7 +137,24 @@ public final class DistributedCatalog {
                     && current.getPartitions() == partitions && current.getReplicas() == replicas
                     && current.getVertexIdType() == vertexType && current.getEdgeIdType() == edgeType) return current;
             throw ex;
+        } catch (RuntimeException ex) {
+            try {
+                storage.write(0, 0, StorageGateway.batch("graph.createError/" + definition.getId())
+                        .addConditions(StorageGateway.condition(graphCreateErrorKey(name), null))
+                        .addMutations(TransactionEngine.put(graphCreateErrorKey(name), TransactionEngine.text(ex.getMessage() == null ? ex.toString() : ex.getMessage())))
+                        .build());
+            } catch (RuntimeException ignored) { }
+            throw ex;
         }
+    }
+
+    /** 重新执行一个遗留 CREATING 图的分片建组和 ACTIVE 激活流程。 */
+    public GraphDefinition recoverCreate(String name) {
+        GraphDefinition current = graph(name);
+        if (!"CREATING".equals(current.getState())) return current;
+        return create("repair-create-" + UUID.randomUUID(), name, current.getPartitions(), current.getReplicas(),
+                current.getVertexIdType(), current.getEdgeIdType(), current.getComment(),
+                current.getVertexIdLength(), current.getEdgeIdLength());
     }
 
     private GraphDefinition allocate(String name, String requestId, int partitions, int replicas,
@@ -257,6 +277,21 @@ public final class DistributedCatalog {
         // 状态提交后立即返回。清空 RocksDB 和 Raft 文件可能很慢，同步等完会超时，目录却留下。
         // 各 Storage 看到 DROPPED 后，在后台卸下 Group 并立刻删除文件，不等 Schema 租约，也不限速。
         // 删除只针对这个 graphId；同名重建会得到新 graphId。历史 Metadata 记录仍保留。
+    }
+
+    /** 管理员清理遗留 CREATING 图；不创建数据组，只把目录推进到 DROPPED 交给后台回收。 */
+    public void forceDropGraph(String requestId, String name) {
+        ByteString key = graphKey(name);
+        ByteString bytes = storage.get(0, 0, key);
+        if (bytes == null) throw new ClusterException("GRAPH_NOT_FOUND", "图不存在：" + name);
+        GraphDefinition current = parseGraph(bytes);
+        if ("DROPPED".equals(current.getState())) return;
+        if (!"CREATING".equals(current.getState()) && !"ACTIVE".equals(current.getState())) {
+            throw new ClusterException("GRAPH_STATE", "图当前状态不支持删除：" + current.getState());
+        }
+        storage.write(0, 0, StorageGateway.batch("catalog.forceDrop/" + requestId)
+                .addConditions(StorageGateway.condition(key, current.toByteString()))
+                .addMutations(TransactionEngine.put(key, current.toBuilder().setState("DROPPED").build().toByteString())).build());
     }
 
     public void update(String requestId, GraphDefinition old, GraphDefinition next) {

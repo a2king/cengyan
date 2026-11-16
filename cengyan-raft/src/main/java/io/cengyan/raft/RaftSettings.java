@@ -12,12 +12,28 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /** 共识参数显式启用落盘、线性一致读取和安全快照清理。 */
-public record RaftSettings(long segmentBytes, long snapshotEntries, long retainedEntries, int retainedSnapshots) {
+public record RaftSettings(long segmentBytes, long snapshotEntries, long retainedEntries, int retainedSnapshots,
+                           long rpcTimeoutMinMs, long rpcTimeoutMaxMs,
+                           long firstElectionTimeoutMinMs, long firstElectionTimeoutMaxMs) {
+    /**
+     * 首次选主超时保持 Ratis 的默认：不设置时它从 {@code raft.server.rpc.timeout.min} 继承。
+     * 显式调大只适合跨机房部署，单机会让进程启动后的第一个选主慢到秒级。
+     */
+    public RaftSettings(long segmentBytes, long snapshotEntries, long retainedEntries, int retainedSnapshots) {
+        this(segmentBytes, snapshotEntries, retainedEntries, retainedSnapshots, 600, 1200, 0, 0);
+    }
+
     public RaftSettings {
-        if (segmentBytes < 1024 * 1024 || snapshotEntries < 1 || retainedEntries < 0 || retainedSnapshots < 1) {
+        if (segmentBytes < 1024 * 1024 || snapshotEntries < 1 || retainedEntries < 0 || retainedSnapshots < 1
+                || rpcTimeoutMinMs < 1 || rpcTimeoutMaxMs < rpcTimeoutMinMs
+                || (firstElectionTimeoutMinMs != 0 && firstElectionTimeoutMinMs < rpcTimeoutMaxMs)
+                || (firstElectionTimeoutMaxMs != 0 && firstElectionTimeoutMaxMs < firstElectionTimeoutMinMs)) {
             throw new IllegalArgumentException("Raft 日志和快照配置无效");
         }
     }
+
+    /** 首次选主超时是否由本配置显式指定；为 0 时沿用 Ratis 从 rpc 超时继承的值。 */
+    public boolean customFirstElectionTimeout() { return firstElectionTimeoutMinMs > 0 && firstElectionTimeoutMaxMs > 0; }
 
     public static RaftSettings defaults() { return new RaftSettings(16L * 1024 * 1024, 2_000, 1_000, 1); }
 
@@ -50,8 +66,14 @@ public record RaftSettings(long segmentBytes, long snapshotEntries, long retaine
         RaftServerConfigKeys.Read.setOption(properties, RaftServerConfigKeys.Read.Option.LINEARIZABLE);
         // 租约有效时读不再等一轮心跳。多机必须同步时钟，这是部署前提。
         RaftServerConfigKeys.Read.setLeaderLeaseEnabled(properties, true);
-        RaftServerConfigKeys.Rpc.setTimeoutMin(properties, TimeDuration.valueOf(600, TimeUnit.MILLISECONDS));
-        RaftServerConfigKeys.Rpc.setTimeoutMax(properties, TimeDuration.valueOf(1200, TimeUnit.MILLISECONDS));
+        RaftServerConfigKeys.Rpc.setTimeoutMin(properties, TimeDuration.valueOf(rpcTimeoutMinMs, TimeUnit.MILLISECONDS));
+        RaftServerConfigKeys.Rpc.setTimeoutMax(properties, TimeDuration.valueOf(rpcTimeoutMaxMs, TimeUnit.MILLISECONDS));
+        if (customFirstElectionTimeout()) {
+            RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMin(properties,
+                    TimeDuration.valueOf(firstElectionTimeoutMinMs, TimeUnit.MILLISECONDS));
+            RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMax(properties,
+                    TimeDuration.valueOf(firstElectionTimeoutMaxMs, TimeUnit.MILLISECONDS));
+        }
         return properties;
     }
 }

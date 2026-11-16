@@ -70,6 +70,7 @@ public final class ComputeServer implements AutoCloseable {
     private final HostMetrics hostMetrics = new HostMetrics();
     private record AuthCache(TokenAuthority.User user, long expiresAt) { }
     private final ConcurrentMap<String, AuthCache> authCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Object> authLocks = new ConcurrentHashMap<>();
     private volatile String publicKey;
     private record Work(ObjectNode request, boolean write, long deadline, CompletableFuture<ObjectNode> result) { }
     private volatile String maintenanceId = "";
@@ -90,7 +91,10 @@ public final class ComputeServer implements AutoCloseable {
         if (joining) bootstrap.add(RaftPeer.newBuilder().setId(config.nodeId()).setAddress(config.raft()).setClientAddress(config.rpc()).setAdminAddress(config.client())
                 .setStartupRole(org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER).build());
         var group = RaftGroup.valueOf(GroupIds.compute(config.clusterId()), bootstrap);
-        control = new RaftNode(config.clusterId(), config.nodeId(), config.raft().getHostString(), config.raft().getPort(), config.directory().resolve("control"), group, RaftSettings.defaults());
+        control = new RaftNode(config.clusterId(), config.nodeId(), config.raft().getHostString(), config.raft().getPort(), config.directory().resolve("control"), group,
+                new RaftSettings(16L * 1024 * 1024, 2_000, 1_000, 1,
+                        config.raftRpcTimeoutMinMs(), config.raftRpcTimeoutMaxMs(),
+                        config.raftFirstElectionTimeoutMinMs(), config.raftFirstElectionTimeoutMaxMs()));
         membership = new ComputeMembership(config, control);
         slots = new ExecutionSlots(config.slots(), config.nodeMemory(), config.nodeDisk(), Duration.ofSeconds(5));
         queue = new AdmissionQueue<>(config.queueCapacity(), Duration.ofMillis(config.queueTimeoutMs()));
@@ -539,7 +543,8 @@ public final class ComputeServer implements AutoCloseable {
                     IdType.valueOf(request.path("vertexIdType").asText("INT64")), IdType.valueOf(request.path("edgeIdType").asText("INT64")));
             return ok().put("graphId", definition.getId()).put("rowsAffected", 1);
         }
-        if (op.equals("importPlan") || op.equals("importStage") || op.equals("importCommit") || op.equals("importHeartbeat") || op.equals("importFinish")) {
+        if (op.equals("importPlan") || op.equals("importStage") || op.equals("importCommit") || op.equals("importStatus")
+                || op.equals("importRecover") || op.equals("importHeartbeat") || op.equals("importFinish")) {
             return new BulkImport(storage, catalog, graph).handle(request);
         }
         if (op.equals("bulkTopology")) return bulkTopology(graphName);
@@ -642,6 +647,14 @@ public final class ComputeServer implements AutoCloseable {
             var response = ok(); response.set("columns", JSON.valueToTree(List.of("bytes")));
             response.set("rows", JSON.valueToTree(List.of(List.of(bytes)))); return response;
         }
+        if (op.equals("admin") && request.path("command").asText().equals("repairGraphCreate")) {
+            GraphDefinition definition = catalog.recoverCreate(request.path("graph").asText());
+            return ok().put("graphId", definition.getId()).put("state", definition.getState()).put("rowsAffected", 1);
+        }
+        if (op.equals("admin") && request.path("command").asText().equals("forceDropGraph")) {
+            catalog.forceDropGraph(id, request.path("graph").asText());
+            return ok().put("rowsAffected", 1);
+        }
         if (op.equals("execute")) {
             Map<String, Object> params = request.has("params") ? JSON.convertValue(request.get("params"), new TypeReference<>() { }) : Map.of();
             var engine = new RemoteQueryEngine(storage, work.resolve("duck"), config.queryMemory() + "B", config.queryDisk() + "B", 1);
@@ -693,11 +706,17 @@ public final class ComputeServer implements AutoCloseable {
         long now = System.nanoTime();
         AuthCache cache = authCache.get(claims.user());
         if (cache == null || now - cache.expiresAt() >= 0) {
-            JsonNode user = auth("auth.user", JSON.createObjectNode().put("user", claims.user()), "user-state");
-            if (user.isNull()) throw new ClusterException("UNAUTHENTICATED", "用户不存在或被禁用");
-            TokenAuthority.User record = JSON.treeToValue(user, TokenAuthority.User.class);
-            cache = new AuthCache(record, now + TimeUnit.SECONDS.toNanos(2));
-            authCache.put(claims.user(), cache);
+            synchronized (authLocks.computeIfAbsent(claims.user(), ignored -> new Object())) {
+                cache = authCache.get(claims.user());
+                now = System.nanoTime();
+                if (cache == null || now - cache.expiresAt() >= 0) {
+                    JsonNode user = auth("auth.user", JSON.createObjectNode().put("user", claims.user()), "user-state");
+                    if (user.isNull()) throw new ClusterException("UNAUTHENTICATED", "用户不存在或被禁用");
+                    TokenAuthority.User record = JSON.treeToValue(user, TokenAuthority.User.class);
+                    cache = new AuthCache(record, now + TimeUnit.MILLISECONDS.toNanos(config.authCacheTtlMs()));
+                    authCache.put(claims.user(), cache);
+                }
+            }
         }
         if (!cache.user().enabled() || cache.user().version() != claims.version() || !cache.user().role().equals(claims.role())) {
             throw new ClusterException("UNAUTHENTICATED", "认证版本或权限已更新，请重新登录");

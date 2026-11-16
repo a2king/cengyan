@@ -67,6 +67,17 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
     public long backgroundIntervalMs() { return operationalNumber("background_interval_ms", 10000); }
     /** 快照拷贝带宽。已删除图的数据目录不使用这个限速。 */
     public long backgroundBytesPerSecond() { return operationalNumber("background_bytes_per_second", 32L * 1024 * 1024); }
+    /**
+     * 已删除图目录的删除速度。删除文件只改元数据，默认 0 不限速；只在开启在线 discard、
+     * 大文件 unlink 引起 TRIM 尖峰的磁盘上设成正数。
+     */
+    public long droppedGraphDeleteBytesPerSecond() {
+        String text = operationalText("dropped_graph_delete_bytes_per_second");
+        if (text.isEmpty()) return 0;
+        long value = Long.parseLong(text);
+        if (value < 0) throw new IllegalArgumentException("dropped_graph_delete_bytes_per_second 不能为负数");
+        return value;
+    }
     /** 已提交历史版本在分片库里的保留期；到期后压缩成基线以回收空间。 */
     public long versionRetentionMs() { return operationalNumber("version_retention_ms", io.cengyan.distributed.VersionMaintenance.DEFAULT_RETENTION_MS); }
     public String zone() { return operationalText("zone"); }
@@ -114,7 +125,9 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
                 endpoint(required(p, "rpc_address")), endpoint(required(p, "raft_address")), directory, members,
                 new RaftSettings(number(p, "raft_log_segment_bytes", 64L * 1024 * 1024),
                         number(p, "raft_snapshot_entries", 2_000), number(p, "raft_log_retained_entries", 1_000),
-                        Math.toIntExact(number(p, "raft_snapshot_retained", 1))),
+                        Math.toIntExact(number(p, "raft_snapshot_retained", 1)),
+                        number(p, "raft_rpc_timeout_min_ms", 600), number(p, "raft_rpc_timeout_max_ms", 1200),
+                        number(p, "raft_first_election_timeout_min_ms", 3000), number(p, "raft_first_election_timeout_max_ms", 5000)),
                 Math.toIntExact(number(p, "rpc_max_payload_bytes", 64L * 1024 * 1024)),
                 Math.toIntExact(number(p, "rpc_max_inflight", 128)),
                 Math.toIntExact(number(p, "admission_threads", 4)), Math.toIntExact(number(p, "admission_queue", 512)),
@@ -130,6 +143,7 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
         if (!dataMode.equals("raft")) throw new IllegalArgumentException("data_storage_mode 必须为 raft");
         operations.setProperty("data_storage_mode", dataMode);
         for (String key : List.of("replica_recovery_timeout_ms", "background_interval_ms", "background_bytes_per_second",
+                "dropped_graph_delete_bytes_per_second",
                 "idempotency_window_ms", "version_retention_ms", "version_read_protection_ms", "zone", "rack")) {
             if (p.containsKey(key)) operations.setProperty(key, p.getProperty(key));
         }

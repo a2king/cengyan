@@ -136,22 +136,30 @@ public final class SchemaController {
         if (System.currentTimeMillis() <= retainUntil) return;
         for (int part = 0; part < before.getPartitions(); part++) {
             for (byte kind : new byte[] {16, 17, 18, 19, 32}) {
-                ByteString prefix = ByteString.copyFrom(ByteBuffer.allocate(9).put(kind).putLong(before.getGeneration()).array());
-                ByteString after = ByteString.EMPTY; String scan = "";
-                do {
-                    ScanPage page = storage.scan(before.getId(), part, prefix, after, 128, scan);
-                    if (page.getEntriesCount() > 0) {
-                        String end = Base64.getUrlEncoder().withoutPadding().encodeToString(page.getLastKey().toByteArray());
-                        String id = "schema.gc/" + task.getTaskId() + "/" + part + "/" + kind + "/" + Integer.toUnsignedString(end.hashCode());
-                        var command = StorageGateway.batch(id);
-                        for (var entry : page.getEntriesList()) command.addMutations(Mutation.newBuilder().setKey(entry.getKey()).setDelete(true));
-                        storage.write(before.getId(), part, command.build());
-                    }
-                    if (!page.getMore()) break; after = page.getLastKey(); scan = page.getCursorId();
-                } while (true);
+                deletePrefix(task, before.getId(), part, ByteString.copyFrom(ByteBuffer.allocate(9).put(kind).putLong(before.getGeneration()).array()),
+                        Byte.toString(kind));
+            }
+            // 独立 Column Family 里的索引键不在默认 CF 的 [32][generation] 范围内，按每个索引的完整前缀路由到它的 CF 再清一次。
+            for (IndexDefinition index : before.getIndexesList()) {
+                ByteString prefix = EntityCodec.indexPrefix(index, before);
+                deletePrefix(task, before.getId(), part, prefix, "idx-" + Integer.toUnsignedString(prefix.hashCode()));
             }
         }
         stage(task, "CLEANED");
+    }
+    private void deletePrefix(SchemaMigrationTask task, long graphId, int part, ByteString prefix, String label) {
+        ByteString after = ByteString.EMPTY; String scan = "";
+        do {
+            ScanPage page = storage.scan(graphId, part, prefix, after, 128, scan);
+            if (page.getEntriesCount() > 0) {
+                String end = Base64.getUrlEncoder().withoutPadding().encodeToString(page.getLastKey().toByteArray());
+                String id = "schema.gc/" + task.getTaskId() + "/" + part + "/" + label + "/" + Integer.toUnsignedString(end.hashCode());
+                var command = StorageGateway.batch(id);
+                for (var entry : page.getEntriesList()) command.addMutations(Mutation.newBuilder().setKey(entry.getKey()).setDelete(true));
+                storage.write(graphId, part, command.build());
+            }
+            if (!page.getMore()) break; after = page.getLastKey(); scan = page.getCursorId();
+        } while (true);
     }
     private SchemaMigrationTask stage(SchemaMigrationTask old, String stage) {
         SchemaMigrationTask next = old.toBuilder().setStage(stage).build();

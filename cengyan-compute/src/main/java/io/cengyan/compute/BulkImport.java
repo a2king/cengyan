@@ -1,5 +1,7 @@
 package io.cengyan.compute;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.protobuf.ByteString;
@@ -18,12 +20,14 @@ import io.cengyan.protocol.proto.ClusterProtocol.Node;
 import io.cengyan.protocol.proto.ClusterProtocol.PropertyDefinition;
 import io.cengyan.protocol.proto.ClusterProtocol.TypeDefinition;
 import io.cengyan.protocol.proto.ClusterProtocol.WriteBatch;
+import io.cengyan.protocol.proto.ClusterProtocol.RpcResponse;
 
 import java.time.Duration;
 import java.util.Base64;
 
 /** 把客户端的导入文件块转到分片的每个副本，再提交只含校验和的摄入指令。 */
 final class BulkImport {
+    private static final ObjectMapper JSON = new ObjectMapper();
     private final StorageGateway storage;
     private final DistributedCatalog catalog;
     private final DistributedGraph graph;
@@ -39,6 +43,8 @@ final class BulkImport {
             case "importPlan" -> plan(request);
             case "importStage" -> stage(request);
             case "importCommit" -> commit(request);
+            case "importStatus" -> status(request);
+            case "importRecover" -> recover(request);
             case "importHeartbeat" -> heartbeat(request);
             case "importFinish" -> finish(request);
             default -> throw new ClusterException("UNSUPPORTED", "未知导入操作");
@@ -112,6 +118,33 @@ final class BulkImport {
         var result = storage.write(graphId, part, command, Duration.ofMinutes(30));
         if (!result.getCode().equals("OK")) throw new ClusterException(result.getCode(), result.getMessage());
         return ok().put("affected", result.getAffected());
+    }
+
+    private ObjectNode status(ObjectNode request) throws Exception {
+        long graphId = request.path("graphId").asLong();
+        int part = request.path("part").asInt();
+        String checksum = request.path("checksum").asText();
+        hex(checksum);
+        ObjectNode result = ok().put("graphId", graphId).put("part", part).put("checksum", checksum);
+        var replicas = result.putArray("replicas");
+        for (Node member : members(graphId, part)) {
+            ObjectNode item = replicas.addObject().put("nodeId", member.getNodeId());
+            try {
+                RpcResponse response = storage.direct(DistributedCatalog.address(member), "import.status",
+                        ByteString.copyFrom(JSON.writeValueAsBytes(request)), Duration.ofSeconds(10));
+                if (response.getCode().equals("OK")) item.setAll((ObjectNode) JSON.readTree(response.getBody().toByteArray()));
+                else item.put("code", response.getCode()).put("message", response.getMessage());
+            } catch (RuntimeException ex) {
+                item.put("code", "FAILED").put("message", ex.getMessage() == null ? ex.toString() : ex.getMessage());
+            }
+        }
+        return result;
+    }
+
+    private ObjectNode recover(ObjectNode request) throws Exception {
+        if (request.path("sessionId").asText().isBlank()) throw new ClusterException("INVALID_ARGUMENT", "缺少 sessionId");
+        // importCommit 在服务端按 sessionId-part-checksum 前缀生成稳定 requestId，重复调用是幂等的。
+        return commit(request);
     }
 
     private ObjectNode heartbeat(ObjectNode request) {

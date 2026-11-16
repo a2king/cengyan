@@ -41,6 +41,7 @@ import java.util.Map;
  * 计数增减先写入暂存文件再摄入，这样进程内重试不会把已写入的键再算一遍。
  */
 final class ImportApplier {
+    record Status(long readyBytes, long partialBytes, boolean ready, String owner, boolean applied, BatchResult result) { }
     private ImportApplier() { }
 
     static void stage(Path staging, ImportChunk chunk, long now) throws IOException {
@@ -72,6 +73,17 @@ final class ImportApplier {
     static long stagedBytes(Path staging, byte[] checksum) throws IOException {
         Path source = staging.resolve(hex(checksum) + ".sst");
         return Files.isRegularFile(source) ? Files.size(source) : 0;
+    }
+
+    static Status status(RocksDB db, Path staging, byte[] checksum) throws IOException, RocksDBException {
+        String hex = hex(checksum);
+        Path ready = staging.resolve(hex + ".sst");
+        Path partial = staging.resolve(hex + ".partial");
+        byte[] done = db.get(marker(checksum));
+        return new Status(Files.isRegularFile(ready) ? Files.size(ready) : 0,
+                Files.isRegularFile(partial) ? Files.size(partial) : 0,
+                Files.isRegularFile(ready), sessionOwner(staging, checksum), done != null,
+                done == null ? null : BatchResult.parseFrom(done));
     }
 
     static String sessionOwner(Path staging, byte[] checksum) throws IOException {
@@ -296,7 +308,7 @@ final class ImportApplier {
         return value.toByteArray();
     }
 
-    private static byte[] marker(byte[] checksum) {
+    static byte[] marker(byte[] checksum) {
         return prefixed(checksum, (byte) 4);
     }
 

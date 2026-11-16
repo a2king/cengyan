@@ -5,12 +5,33 @@ import java.net.*;
 import java.nio.file.*;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 public record ComputeConfig(String clusterId, String nodeId, InetSocketAddress client, InetSocketAddress rpc,
                             InetSocketAddress raft, Path directory, List<Peer> members, List<InetSocketAddress> storageSeeds,
                             int slots, int queueCapacity, long queueTimeoutMs, long executionTimeoutMs,
                             long queryMemory, long nodeMemory, long queryDisk, long nodeDisk,
-                            int resultMaxRows, int resultMaxBytes, String rootPassword) {
+                             int resultMaxRows, int resultMaxBytes, String rootPassword, long authCacheTtlMs,
+                             long raftRpcTimeoutMinMs, long raftRpcTimeoutMaxMs,
+                             long raftFirstElectionTimeoutMinMs, long raftFirstElectionTimeoutMaxMs) {
+    public ComputeConfig(String clusterId, String nodeId, InetSocketAddress client, InetSocketAddress rpc,
+                         InetSocketAddress raft, Path directory, List<Peer> members, List<InetSocketAddress> storageSeeds,
+                         int slots, int queueCapacity, long queueTimeoutMs, long executionTimeoutMs,
+                         long queryMemory, long nodeMemory, long queryDisk, long nodeDisk,
+                         int resultMaxRows, int resultMaxBytes, String rootPassword) {
+        this(clusterId, nodeId, client, rpc, raft, directory, members, storageSeeds, slots, queueCapacity,
+                queueTimeoutMs, executionTimeoutMs, queryMemory, nodeMemory, queryDisk, nodeDisk,
+                resultMaxRows, resultMaxBytes, rootPassword, 30_000);
+    }
+    public ComputeConfig(String clusterId, String nodeId, InetSocketAddress client, InetSocketAddress rpc,
+                         InetSocketAddress raft, Path directory, List<Peer> members, List<InetSocketAddress> storageSeeds,
+                         int slots, int queueCapacity, long queueTimeoutMs, long executionTimeoutMs,
+                         long queryMemory, long nodeMemory, long queryDisk, long nodeDisk,
+                         int resultMaxRows, int resultMaxBytes, String rootPassword, long authCacheTtlMs) {
+        this(clusterId, nodeId, client, rpc, raft, directory, members, storageSeeds, slots, queueCapacity,
+                queueTimeoutMs, executionTimeoutMs, queryMemory, nodeMemory, queryDisk, nodeDisk,
+                resultMaxRows, resultMaxBytes, rootPassword, authCacheTtlMs, 600, 1200, 0, 0);
+    }
     public record Peer(String id, InetSocketAddress rpc, InetSocketAddress raft, InetSocketAddress client) {
         public Peer {
             if (id == null || !id.matches("[A-Za-z0-9_-]+") || rpc == null || raft == null || client == null
@@ -24,8 +45,12 @@ public record ComputeConfig(String clusterId, String nodeId, InetSocketAddress c
                 || rootPassword == null || rootPassword.isEmpty() || client.getPort() < 1 || rpc.getPort() < 1 || raft.getPort() < 1
                 || slots < 1 || queueCapacity < 1 || queueTimeoutMs < 1 || executionTimeoutMs < 1 || queryMemory < 1 || nodeMemory < queryMemory
                 || queryDisk < 1 || nodeDisk < queryDisk || resultMaxRows < 1 || resultMaxBytes < 1024 || resultMaxBytes > 64 * 1024 * 1024
-                || executionTimeoutMs > 1800000
-                || client.getPort() == rpc.getPort() || rpc.getPort() == raft.getPort() || client.getPort() == raft.getPort()) {
+                 || executionTimeoutMs > 1800000
+                 || authCacheTtlMs < 1000 || authCacheTtlMs > TimeUnit.HOURS.toMillis(24)
+                 || raftRpcTimeoutMinMs < 1 || raftRpcTimeoutMaxMs < raftRpcTimeoutMinMs
+                 || (raftFirstElectionTimeoutMinMs != 0 && raftFirstElectionTimeoutMinMs < raftRpcTimeoutMaxMs)
+                 || (raftFirstElectionTimeoutMaxMs != 0 && raftFirstElectionTimeoutMaxMs < raftFirstElectionTimeoutMinMs)
+                 || client.getPort() == rpc.getPort() || rpc.getPort() == raft.getPort() || client.getPort() == raft.getPort()) {
             throw new IllegalArgumentException("Compute 地址、容量或预算配置无效");
         }
         members = List.copyOf(members); storageSeeds = List.copyOf(storageSeeds);
@@ -57,7 +82,10 @@ public record ComputeConfig(String clusterId, String nodeId, InetSocketAddress c
                 (int) number(p, "query_slots", 16), (int) number(p, "queue_capacity", 128), number(p, "queue_timeout_ms", 30000),
                 number(p, "max_execution_time_ms", 1800000), number(p, "query_memory_bytes", 67108864), number(p, "node_memory_bytes", 536870912),
                 number(p, "query_temp_bytes", 1073741824), number(p, "node_temp_bytes", 8589934592L),
-                (int) number(p, "result_max_rows", 100000), (int) number(p, "result_max_bytes", 16777216), required(p, "root_password"));
+                 (int) number(p, "result_max_rows", 100000), (int) number(p, "result_max_bytes", 16777216), required(p, "root_password"),
+                  number(p, "auth_cache_ttl_ms", 30_000),
+                  number(p, "raft_rpc_timeout_min_ms", 600), number(p, "raft_rpc_timeout_max_ms", 1200),
+                  number(p, "raft_first_election_timeout_min_ms", 0), number(p, "raft_first_election_timeout_max_ms", 0));
     }
     public static InetSocketAddress address(String value) {
         URI uri = URI.create("tcp://" + value);

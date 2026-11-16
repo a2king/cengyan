@@ -11,6 +11,7 @@ import io.cengyan.protocol.proto.ClusterProtocol.VersionedCell;
 import io.cengyan.protocol.proto.ClusterProtocol.Entity;
 import io.cengyan.protocol.proto.ClusterProtocol.TransactionRecord;
 import io.cengyan.protocol.proto.ClusterProtocol.BatchValues;
+import io.cengyan.protocol.IndexFamilyName;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.server.RaftServer;
@@ -28,10 +29,13 @@ import java.nio.file.*;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -46,6 +50,8 @@ import java.util.logging.Logger;
  * 查询仅由 Ratis 的线性一致读 API 进入，不自行绕过读屏障。
  */
 public final class RocksStateMachine extends BaseStateMachine {
+    public record ImportStatus(long readyBytes, long partialBytes, boolean ready, String owner,
+                               boolean applied, io.cengyan.protocol.proto.ClusterProtocol.BatchResult result) { }
     static { RocksDB.loadLibrary(); }
     private static final byte[] APPLIED = {0};
     private static final byte[] CONTROLLER_EPOCH = {0, 1};
@@ -76,6 +82,15 @@ public final class RocksStateMachine extends BaseStateMachine {
     private static final Cache BLOCK_CACHE = new LRUCache(256L * 1024 * 1024);
     private static final Filter BLOOM = new BloomFilter(10);
     private Options options;
+    private DBOptions dbOptions;
+    /** 每个已打开 CF 的选项。RocksJava 要求选项对象活到数据库关闭之后。 */
+    private final List<ColumnFamilyOptions> familyOptions = new ArrayList<>();
+    /** 已打开的全部 Column Family（含 default）。只在持有 dbLock 写锁时修改。 */
+    private final Map<String, ColumnFamilyHandle> families = new HashMap<>();
+    /** 已通过 Raft 创建、可以读写的索引 Column Family。 */
+    private final Map<String, ColumnFamilyHandle> activeIndexes = new HashMap<>();
+    /** 已通过 Raft 删除的索引。读视为空，迟到的写入直接丢弃；物理 CF 可能还在等刷盘后删除。 */
+    private final Set<String> droppedIndexes = new HashSet<>();
     private WriteOptions writes;
     private RocksDB db;
     private Path stateDirectory;
@@ -103,6 +118,13 @@ public final class RocksStateMachine extends BaseStateMachine {
     private final long snapshotBytesPerSecond;
     /** 图空间已经删除。新的导入和查询直接拒绝；正在进行的调用结束于关闭数据库之前。 */
     private volatile boolean dropping;
+    private static final byte PHYSICAL_NAMESPACE = 2;
+    /** 索引 CF 登记：[6][CF 名称] -> ACTIVE/DROPPED，与数据和 APPLIED 在同一个 WriteBatch 里提交。 */
+    private static final byte INDEX_REGISTRY = 6;
+    private static final byte[] REGISTRY_ACTIVE = {1};
+    private static final byte[] REGISTRY_DROPPED = {2};
+    /** indexId -> CF 名称。避免每次读写索引键都算一次 SHA-256。 */
+    private static final Map<String, String> FAMILY_NAMES = new java.util.concurrent.ConcurrentHashMap<>();
     public RocksStateMachine() { this(64L * 1024 * 1024); }
     public RocksStateMachine(long snapshotBytesPerSecond) {
         if (snapshotBytesPerSecond < 1) throw new IllegalArgumentException("快照带宽必须为正数");
@@ -118,13 +140,12 @@ public final class RocksStateMachine extends BaseStateMachine {
             machine.liveDirectory = directory;
             machine.importStaging = directory.resolve("import-staging");
             Files.createDirectories(machine.importStaging);
-            machine.options = databaseOptions(true);
+            machine.openDatabase(directory, true);
             machine.writes = new WriteOptions().setDisableWAL(true).setSync(false);
-            machine.db = RocksDB.open(machine.options, directory.toString());
             EntityCountStore.initialize(machine.db, machine.writes);
             machine.register();
             return machine;
-        } catch (RocksDBException ex) { machine.closeDatabase(); throw new IOException(ex); }
+        } catch (RocksDBException | IOException ex) { machine.closeDatabase(); throw ex instanceof IOException io ? io : new IOException(ex); }
     }
 
     /** 重新打开已经存在的分片目录。调用方需要先确认目录属于本集群。 */
@@ -136,13 +157,12 @@ public final class RocksStateMachine extends BaseStateMachine {
         machine.importStaging = directory.resolve("import-staging");
         Files.createDirectories(machine.importStaging);
         try {
-            machine.options = databaseOptions(false);
+            machine.openDatabase(directory, false);
             machine.writes = new WriteOptions().setDisableWAL(true).setSync(false);
-            machine.db = RocksDB.open(machine.options, directory.toString());
             EntityCountStore.initialize(machine.db, machine.writes);
             machine.register();
             return machine;
-        } catch (RocksDBException ex) { machine.closeDatabase(); throw new IOException(ex); }
+        } catch (RocksDBException | IOException ex) { machine.closeDatabase(); throw ex instanceof IOException io ? io : new IOException(ex); }
     }
 
     /** 把 SST 分块写到本副本。文件不进入 Raft 日志；摄入由随后的导入指令触发。 */
@@ -165,6 +185,17 @@ public final class RocksStateMachine extends BaseStateMachine {
     /** 刷新导入会话心跳。没有心跳满 30 分钟后，暂存文件会被删掉。 */
     public void heartbeatImport(String sessionId) throws IOException {
         heartbeatImport(sessionId, System.currentTimeMillis());
+    }
+
+    public ImportStatus importStatus(byte[] checksum) throws IOException {
+        dbLock.readLock().lock();
+        try {
+            var status = ImportApplier.status(db, importStaging, checksum);
+            return new ImportStatus(status.readyBytes(), status.partialBytes(), status.ready(), status.owner(),
+                    status.applied(), status.result());
+        } catch (org.rocksdb.RocksDBException ex) {
+            throw new IOException("读取导入状态失败", ex);
+        } finally { dbLock.readLock().unlock(); }
     }
 
     void heartbeatImport(String sessionId, long now) throws IOException {
@@ -247,8 +278,7 @@ public final class RocksStateMachine extends BaseStateMachine {
     /** Data replicas run without WAL; flush memtables before the files are trusted across a restart. */
     public synchronized void flushReplica() throws IOException {
         if (!rebuildOnly) throw new IOException("不是重建分片");
-        try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) { db.flush(flush); }
-        catch (RocksDBException ex) { throw new IOException(ex); }
+        flushAll();
     }
 
     /**
@@ -370,18 +400,17 @@ public final class RocksStateMachine extends BaseStateMachine {
         try {
             boolean create = !Files.exists(dbDir.resolve("CURRENT"));
             if (create) Files.createDirectories(dbDir);
-            options = databaseOptions(create);
+            openDatabase(dbDir, create);
             // Raft 日志已经 fsync。内存表没刷盘的部分由日志重放补上，不再为每次写入打开 RocksDB WAL。
             writes = new WriteOptions().setDisableWAL(true).setSync(false);
-            db = RocksDB.open(options, dbDir.toString());
             liveDirectory = dbDir;
             closing = false;
-            register();
             storage.retain(dbDir);
             byte[] applied = db.get(APPLIED);
             TermIndex position = applied == null ? TermIndex.INITIAL_VALUE : decodePosition(applied);
             if (adopted != null && !adopted.equals(position)) throw new IOException("安装的快照与库内应用位置不一致");
             EntityCountStore.initialize(db, writes);
+            register();
             setLastAppliedTermIndex(position);
             if (adopted != null) storage.capture(db, adopted.getTerm(), adopted.getIndex(), snapshotBytesPerSecond);
             else storage.reload();
@@ -420,14 +449,16 @@ public final class RocksStateMachine extends BaseStateMachine {
             boolean releaseImport = false;
             byte[] key = namespace((byte) 1, command.getRequestId().getBytes(StandardCharsets.UTF_8));
             byte[] digest = digest(command.toBuilder().clearExpiresAtMs().clearControllerEpoch().build().toByteArray());
+            IndexChanges indexChanges = new IndexChanges();
             try (org.rocksdb.WriteBatch batch = new org.rocksdb.WriteBatch()) {
                 byte[] currentEpochBytes = db.get(CONTROLLER_EPOCH);
                 long currentEpoch = currentEpochBytes == null ? 0 : ByteBuffer.wrap(currentEpochBytes).getLong();
                 boolean importing = command.hasImportFile();
+                boolean indexing = command.getCreateIndexPrefixesCount() > 0 || command.getDropIndexPrefixesCount() > 0;
                 if (command.getControllerEpoch() != 0 && command.getControllerEpoch() < currentEpoch) {
                     result = failure("STALE_CONTROLLER", "控制命令来自旧 Metadata Leader 任期");
                 } else if (command.getRequestId().isBlank() || command.getRequestId().length() > 256
-                        || (command.getMutationsCount() == 0 && command.getPurgeRequestIdsCount() == 0 && !importing)
+                        || (command.getMutationsCount() == 0 && command.getPurgeRequestIdsCount() == 0 && !indexing && !importing)
                         || command.getExpiresAtMs() <= 0
                         || (command.getPurgeRequestIdsCount() > 0 && command.getPurgeBeforeMs() <= 0)) {
                     result = failure("INVALID_ARGUMENT", "写入批次标识、内容或有效期无效");
@@ -438,7 +469,7 @@ public final class RocksStateMachine extends BaseStateMachine {
                         result = MessageDigest.isEqual(digest, record.getDigest().toByteArray()) ? record.getResult()
                                 : failure("REQUEST_CONFLICT", "相同 requestId 对应不同写入内容；requestId=" + command.getRequestId());
                     } else if (importing) {
-                        if (command.getMutationsCount() > 0 || command.getConditionsCount() > 0 || command.getPurgeRequestIdsCount() > 0) {
+                        if (command.getMutationsCount() > 0 || command.getConditionsCount() > 0 || command.getPurgeRequestIdsCount() > 0 || indexing) {
                             result = failure("INVALID_ARGUMENT", "导入指令不能混入普通写入");
                         } else if (dropping) {
                             result = failure("GRAPH_STATE", "图空间已删除");
@@ -448,10 +479,18 @@ public final class RocksStateMachine extends BaseStateMachine {
                         }
                         batch.put(key, IdempotencyRecord.newBuilder().setDigest(ByteString.copyFrom(digest))
                                 .setResult(result).setExpiresAtMs(command.getExpiresAtMs()).build().toByteArray());
+                    } else if (indexing) {
+                        if (command.getMutationsCount() > 0 || command.getConditionsCount() > 0 || command.getPurgeRequestIdsCount() > 0) {
+                            result = failure("INVALID_ARGUMENT", "索引 Column Family 指令不能混入普通写入");
+                        } else {
+                            result = planIndexChanges(batch, command, indexChanges);
+                        }
+                        batch.put(key, IdempotencyRecord.newBuilder().setDigest(ByteString.copyFrom(digest))
+                                .setResult(result).setExpiresAtMs(command.getExpiresAtMs()).build().toByteArray());
                     } else {
                         boolean matches = true;
                         for (var condition : command.getConditionsList()) {
-                            byte[] current = db.get(namespace((byte) 2, condition.getKey().toByteArray()));
+                            byte[] current = getLogical(condition.getKey().toByteArray());
                             if (condition.getExpectedPresent() != (current != null)
                                     || (current != null && !java.util.Arrays.equals(current, condition.getExpectedValue().toByteArray()))) {
                                 matches = false;
@@ -462,11 +501,18 @@ public final class RocksStateMachine extends BaseStateMachine {
                         if (matches) {
                             var finalValues = new java.util.LinkedHashMap<ByteString, byte[]>();
                             for (var op : command.getMutationsList()) {
-                                byte[] dataKey = namespace((byte) 2, op.getKey().toByteArray());
-                                if (op.getDelete()) batch.delete(dataKey);
-                                else batch.put(dataKey, op.getValue().toByteArray());
+                                Target target = target(op.getKey().toByteArray());
+                                // 索引已删除：旧 Schema 下迟到的写入直接丢弃。各副本在同一日志位置看到同一份登记，结果一致。
+                                if (target.dropped()) continue;
+                                if (op.getDelete()) {
+                                    if (target.family() == null) batch.delete(target.key()); else batch.delete(target.family(), target.key());
+                                } else if (target.family() == null) {
+                                    batch.put(target.key(), op.getValue().toByteArray());
+                                } else {
+                                    batch.put(target.family(), target.key(), op.getValue().toByteArray());
+                                }
                                 if (op.getKey().size() > 9 && (op.getKey().byteAt(0) == 16 || op.getKey().byteAt(0) == 17)) {
-                                    finalValues.put(ByteString.copyFrom(dataKey), op.getDelete() ? null : op.getValue().toByteArray());
+                                    finalValues.put(ByteString.copyFrom(target.key()), op.getDelete() ? null : op.getValue().toByteArray());
                                 }
                                 affected++;
                             }
@@ -491,10 +537,12 @@ public final class RocksStateMachine extends BaseStateMachine {
                 batch.put(APPLIED, position(term, index));
                 db.write(writes, batch);
             }
+            publishIndexChanges(indexChanges);
             if (releaseImport) ImportApplier.release(importStaging, command.getImportFile().getChecksum().toByteArray());
             updateLastAppliedTermIndex(term, index);
             return CompletableFuture.completedFuture(message(result.toByteArray()));
         } catch (Exception ex) {
+            LOG.log(java.util.logging.Level.SEVERE, "分片状态机应用失败，requestId=" + command.getRequestId(), ex);
             return CompletableFuture.failedFuture(new IOException("分片状态机应用失败", ex));
         }
     }
@@ -527,7 +575,7 @@ public final class RocksStateMachine extends BaseStateMachine {
                 var values = BatchValues.newBuilder();
                 long bytes = 0;
                 for (ByteString requested : key.getKeysList()) {
-                    byte[] value = db.get(namespace((byte) 2, requested.toByteArray()));
+                    byte[] value = getLogical(requested.toByteArray());
                     var found = StoredValue.newBuilder().setFound(value != null);
                     if (value != null) { bytes += value.length; found.setValue(ByteString.copyFrom(value)); }
                     if (bytes > 7 * 1024 * 1024) throw new IOException("批量点读结果超过字节上限");
@@ -546,9 +594,17 @@ public final class RocksStateMachine extends BaseStateMachine {
                 if (key.getLimit() < 1 || key.getLimit() > 10000 || key.getMaxBytes() < 1024 || key.getMaxBytes() > 7 * 1024 * 1024) {
                     throw new IOException("扫描批次行数或字节限制无效");
                 }
-                byte namespace = key.getScanIdempotency() ? (byte) 1 : (byte) 2;
-                byte[] prefix = namespace(namespace, key.getKey().toByteArray());
-                byte[] after = key.getAfterKey().isEmpty() ? prefix : namespace(namespace, key.getAfterKey().toByteArray());
+                byte namespace = key.getScanIdempotency() ? (byte) 1 : PHYSICAL_NAMESPACE;
+                Target target = key.getScanIdempotency() ? new Target(null, namespace((byte) 1, key.getKey().toByteArray()), false)
+                        : target(key.getKey().toByteArray());
+                if (target.dropped()) {
+                    // 索引已删除：按空结果返回，续扫的游标一并放掉。
+                    if (!key.getCursorId().isEmpty()) releaseScan(key.getCursorId());
+                    return CompletableFuture.completedFuture(message(ScanPage.getDefaultInstance().toByteArray()));
+                }
+                ColumnFamilyHandle family = target.family();
+                byte[] prefix = target.key();
+                byte[] after = key.getAfterKey().isEmpty() ? prefix : family == null ? namespace(namespace, key.getAfterKey().toByteArray()) : key.getAfterKey().toByteArray();
                 String cursorId = key.getCursorId();
                 ByteString queryIdentity = key.toBuilder().clearAfterKey().clearCursorId().clearScanId().clearLimit().clearMaxBytes().build().toByteString();
                 ScanCursor cursor;
@@ -565,7 +621,7 @@ public final class RocksStateMachine extends BaseStateMachine {
                 }
                 var page = ScanPage.newBuilder();
                 int bytes = 0;
-                try (ReadOptions options = new ReadOptions().setSnapshot(cursor.snapshot()); RocksIterator iterator = db.newIterator(options)) {
+                try (ReadOptions options = new ReadOptions().setSnapshot(cursor.snapshot()); RocksIterator iterator = family == null ? db.newIterator(options) : db.newIterator(family, options)) {
                     iterator.seek(after);
                     if (!key.getAfterKey().isEmpty() && iterator.isValid() && java.util.Arrays.equals(iterator.key(), after)) iterator.next();
                     while (iterator.isValid() && startsWith(iterator.key(), prefix)) {
@@ -597,7 +653,7 @@ public final class RocksStateMachine extends BaseStateMachine {
                             page.setMore(true);
                             break;
                         }
-                        ByteString logicalKey = ByteString.copyFrom(dataKey, 1, dataKey.length - 1);
+                        ByteString logicalKey = family == null ? ByteString.copyFrom(dataKey, 1, dataKey.length - 1) : ByteString.copyFrom(dataKey);
                         page.addEntries(KeyValue.newBuilder().setKey(logicalKey).setValue(ByteString.copyFrom(value)));
                         page.setLastKey(logicalKey);
                         bytes += cost;
@@ -614,7 +670,7 @@ public final class RocksStateMachine extends BaseStateMachine {
                 } else releaseScan(cursorId);
                 return CompletableFuture.completedFuture(message(page.build().toByteArray()));
             }
-            byte[] value = db.get(namespace((byte) 2, key.getKey().toByteArray()));
+            byte[] value = getLogical(key.getKey().toByteArray());
             var result = StoredValue.newBuilder().setFound(value != null);
             if (value != null) result.setValue(ByteString.copyFrom(value));
             return CompletableFuture.completedFuture(message(result.build().toByteArray()));
@@ -627,6 +683,9 @@ public final class RocksStateMachine extends BaseStateMachine {
             final TermIndex position;
             dbLock.writeLock().lock();
             try {
+                // Data Group 被删除/隔离后，Ratis 可能仍触发一次已排队的快照回调。
+                // 此时数据库句柄已关闭，不能再调用 RocksDB Checkpoint。
+                if (db == null || dropping) return -1;
                 flushHeld();
                 position = getLastAppliedTermIndex();
                 if (position.getIndex() < 0) return -1;
@@ -643,7 +702,12 @@ public final class RocksStateMachine extends BaseStateMachine {
 
     private void flushHeld() throws IOException {
         if (db == null || dropping) return;
-        try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) { db.flush(flush); }
+        flushAll();
+    }
+
+    /** 关掉 WAL 后必须把所有 CF 一起刷盘；DBOptions 打开了原子刷盘，APPLIED 与索引数据在同一点落盘。 */
+    private void flushAll() throws IOException {
+        try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) { db.flush(flush, new ArrayList<>(families.values())); }
         catch (RocksDBException ex) { throw new IOException("无法把内存表刷入本地数据库", ex); }
     }
 
@@ -845,6 +909,202 @@ public final class RocksStateMachine extends BaseStateMachine {
         synchronized (compactState) { return bytesSinceCompact; }
     }
 
+    /** 当前分片各 Column Family 已落盘 SST 的大小，不含内存表。 */
+    public Map<String, Long> physicalUsage() {
+        dbLock.readLock().lock();
+        try {
+            Map<String, Long> result = new java.util.TreeMap<>();
+            for (var entry : families.entrySet()) {
+                long bytes = 0;
+                try { bytes = db.getColumnFamilyMetaData(entry.getValue()).size(); }
+                catch (RuntimeException ignored) { }
+                result.put(entry.getKey(), bytes);
+            }
+            return Map.copyOf(result);
+        } finally { dbLock.readLock().unlock(); }
+    }
+
+    private void openDatabase(Path directory, boolean create) throws RocksDBException, IOException {
+        options = databaseOptions(create);
+        // 关掉 WAL 后，各 CF 各自刷盘会让 APPLIED（默认 CF）先于索引 CF 落盘：崩溃后从更晚的位置重放，
+        // 索引 CF 会丢掉中间的写入。原子刷盘让所有 CF 在同一个点一起落盘。
+        dbOptions = new DBOptions(options).setCreateIfMissing(create).setAtomicFlush(true);
+        List<byte[]> names = Files.exists(directory.resolve("CURRENT"))
+                ? RocksDB.listColumnFamilies(options, directory.toString()) : List.of(RocksDB.DEFAULT_COLUMN_FAMILY);
+        List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
+        for (byte[] name : names) {
+            String text = new String(name, StandardCharsets.UTF_8);
+            boolean index = isIndexFamily(text);
+            if (!index && !Arrays.equals(name, RocksDB.DEFAULT_COLUMN_FAMILY)) {
+                throw new IOException("分片库含有本版本不认识的 Column Family：" + text + "。请删除这个分片目录，让副本从 Leader 重新同步");
+            }
+            ColumnFamilyOptions family = index ? indexOptions() : new ColumnFamilyOptions(options);
+            familyOptions.add(family);
+            descriptors.add(new ColumnFamilyDescriptor(name, family));
+        }
+        List<ColumnFamilyHandle> handles = new ArrayList<>();
+        db = RocksDB.open(dbOptions, directory.toString(), descriptors, handles);
+        for (int i = 0; i < handles.size(); i++) families.put(new String(names.get(i), StandardCharsets.UTF_8), handles.get(i));
+        loadIndexRegistry();
+    }
+
+    /**
+     * 打开时库里没有内存表（WAL 关闭），读到的登记都已落盘。DROPPED 但物理 CF 还在，说明上次删除停在刷盘之后，
+     * 这里补做 Drop。登记为 ACTIVE 的 CF 必须存在；没有登记的 CF 是创建命令写入前崩溃留下的，等日志重放时再登记。
+     */
+    private void loadIndexRegistry() throws RocksDBException, IOException {
+        activeIndexes.clear();
+        droppedIndexes.clear();
+        Map<String, Boolean> registry = new HashMap<>();
+        try (RocksIterator iterator = db.newIterator()) {
+            for (iterator.seek(new byte[] {INDEX_REGISTRY}); iterator.isValid() && iterator.key()[0] == INDEX_REGISTRY; iterator.next()) {
+                String name = new String(iterator.key(), 1, iterator.key().length - 1, StandardCharsets.UTF_8);
+                registry.put(name, Arrays.equals(iterator.value(), REGISTRY_DROPPED));
+            }
+            iterator.status();
+        }
+        for (var entry : registry.entrySet()) {
+            String name = entry.getKey();
+            ColumnFamilyHandle handle = families.get(name);
+            if (entry.getValue()) {
+                droppedIndexes.add(name);
+                if (handle != null) dropPhysically(name);
+            } else if (handle == null) {
+                throw new IOException("索引 Column Family 已登记但不存在：" + name);
+            } else activeIndexes.put(name, handle);
+        }
+    }
+
+    private ColumnFamilyOptions indexOptions() {
+        return new ColumnFamilyOptions(options).setWriteBufferSize(16L * 1024 * 1024).setMaxWriteBufferNumber(2)
+                .setCompressionType(CompressionType.LZ4_COMPRESSION).setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)
+                .setTableFormatConfig(new BlockBasedTableConfig().setFilterPolicy(BLOOM).setBlockCache(BLOCK_CACHE).setCacheIndexAndFilterBlocks(true));
+    }
+
+    /** 逻辑键的物理位置。family 为 null 表示默认 CF 的 namespace 2；dropped 表示索引已删除，读为空、写丢弃。 */
+    private record Target(ColumnFamilyHandle family, byte[] key, boolean dropped) { }
+
+    /**
+     * 索引键：已登记 ACTIVE 的写到它自己的 CF；已登记 DROPPED 的视为不存在；没有登记的是升级前的旧索引，
+     * 仍在默认 CF。其他键全部在默认 CF。调用方持有 dbLock。
+     */
+    private Target target(byte[] logicalKey) {
+        String family = indexFamily(logicalKey);
+        if (family != null) {
+            if (droppedIndexes.contains(family)) return new Target(null, null, true);
+            ColumnFamilyHandle handle = activeIndexes.get(family);
+            if (handle != null) return new Target(handle, logicalKey, false);
+        }
+        return new Target(null, namespace(PHYSICAL_NAMESPACE, logicalKey), false);
+    }
+
+    private static String indexFamily(byte[] logicalKey) {
+        String identity = IndexFamilyName.identity(logicalKey);
+        if (identity == null) return null;
+        if (FAMILY_NAMES.size() > 100_000) FAMILY_NAMES.clear();
+        return FAMILY_NAMES.computeIfAbsent(identity, IndexFamilyName::of);
+    }
+
+    private byte[] getLogical(byte[] logicalKey) throws RocksDBException {
+        Target target = target(logicalKey);
+        if (target.dropped()) return null;
+        return target.family() == null ? db.get(target.key()) : db.get(target.family(), target.key());
+    }
+
+    private static boolean isIndexFamily(String name) { return name.matches("idx-[0-9a-f]{64}"); }
+
+    private static byte[] registryKey(String family) { return namespace(INDEX_REGISTRY, family.getBytes(StandardCharsets.UTF_8)); }
+
+    /** 本条日志要创建/删除的索引 CF。batch 写入成功后才改内存状态。 */
+    private static final class IndexChanges {
+        final Map<String, ColumnFamilyHandle> created = new java.util.LinkedHashMap<>();
+        final Set<String> dropped = new java.util.LinkedHashSet<>();
+    }
+
+    /**
+     * 创建：先建物理 CF，再把 ACTIVE 登记放进本条 batch。batch 没落盘就崩溃时，留下一个没有登记的空 CF，
+     * 日志重放会再次登记它。已经 DROPPED 的索引不会重新创建。
+     * 删除：只写 DROPPED 登记，外加一条覆盖升级前旧索引键的 DeleteRange；Drop CF 在 batch 写入后做。
+     */
+    private BatchResult planIndexChanges(org.rocksdb.WriteBatch batch, io.cengyan.protocol.proto.ClusterProtocol.WriteBatch command,
+                                         IndexChanges changes) throws RocksDBException {
+        List<ByteString> all = new ArrayList<>(command.getCreateIndexPrefixesList());
+        all.addAll(command.getDropIndexPrefixesList());
+        for (ByteString prefix : all) {
+            if (!IndexFamilyName.isIndexPrefix(prefix.toByteArray())) return failure("INVALID_ARGUMENT", "索引前缀无效");
+        }
+        long affected = 0;
+        for (ByteString encoded : command.getCreateIndexPrefixesList()) {
+            String name = indexFamily(encoded.toByteArray());
+            if (droppedIndexes.contains(name) || activeIndexes.containsKey(name) || changes.created.containsKey(name)) continue;
+            ColumnFamilyHandle handle = families.get(name);
+            if (handle == null) {
+                ColumnFamilyOptions family = indexOptions();
+                familyOptions.add(family);
+                handle = db.createColumnFamily(new ColumnFamilyDescriptor(name.getBytes(StandardCharsets.UTF_8), family));
+                families.put(name, handle);
+            }
+            batch.put(registryKey(name), REGISTRY_ACTIVE);
+            changes.created.put(name, handle);
+            affected++;
+        }
+        for (ByteString encoded : command.getDropIndexPrefixesList()) {
+            byte[] prefix = encoded.toByteArray();
+            String name = indexFamily(prefix);
+            if (droppedIndexes.contains(name) || !changes.dropped.add(name)) continue;
+            batch.put(registryKey(name), REGISTRY_DROPPED);
+            // 升级前建的索引没有自己的 CF，键在默认 CF：一条范围删除代替逐键删除，空间由后台压实回收。
+            batch.deleteRange(namespace(PHYSICAL_NAMESPACE, prefix), namespace(PHYSICAL_NAMESPACE, successor(prefix)));
+            affected++;
+        }
+        return BatchResult.newBuilder().setCode("OK").setAffected(affected).build();
+    }
+
+    /** batch 已经写入：更新内存登记，再物理删除 CF。调用方持有 dbLock 写锁。 */
+    private void publishIndexChanges(IndexChanges changes) {
+        activeIndexes.putAll(changes.created);
+        List<String> physical = new ArrayList<>();
+        for (String name : changes.dropped) {
+            activeIndexes.remove(name);
+            droppedIndexes.add(name);
+            if (families.containsKey(name)) physical.add(name);
+        }
+        if (physical.isEmpty() || dropping) return;
+        try {
+            // 先让 DROPPED 登记和 APPLIED 一起落盘，再 Drop CF。否则崩溃后会从更早的位置重放，
+            // 重放中的条件读读不到这个 CF，得出与第一次不同的结果，副本就分叉了。
+            flushAll();
+            for (String name : physical) dropPhysically(name);
+        } catch (IOException ex) {
+            LOG.warning("索引 Column Family 的物理删除推迟到下次打开分片：" + ex.getMessage());
+        }
+    }
+
+    /** Drop CF 只改 MANIFEST，SST 在句柄释放后由 RocksDB 直接 unlink，不逐键读写。 */
+    private void dropPhysically(String name) {
+        ColumnFamilyHandle handle = families.get(name);
+        if (handle == null) return;
+        try {
+            db.dropColumnFamily(handle);
+            families.remove(name);
+            handle.close();
+        } catch (RocksDBException ex) {
+            LOG.warning("删除索引 Column Family 失败，下次打开分片时重试：" + name + "，" + ex.getMessage());
+        }
+    }
+
+    /** 字典序上紧跟在所有以 prefix 开头的键之后的第一个键。 */
+    private static byte[] successor(byte[] prefix) {
+        byte[] end = prefix.clone();
+        for (int i = end.length - 1; i >= 0; i--) {
+            if (end[i] != (byte) 0xFF) {
+                end[i]++;
+                return Arrays.copyOf(end, i + 1);
+            }
+        }
+        throw new IllegalArgumentException("前缀没有后继键");
+    }
+
     private static Options databaseOptions(boolean create) {
         var table = new BlockBasedTableConfig().setFilterPolicy(BLOOM).setBlockCache(BLOCK_CACHE).setCacheIndexAndFilterBlocks(true);
         return new Options().setCreateIfMissing(create).setWriteBufferSize(32L * 1024 * 1024).setMaxWriteBufferNumber(2)
@@ -874,8 +1134,17 @@ public final class RocksStateMachine extends BaseStateMachine {
     private void closeDatabase() {
         LIVE.remove(this);
         if (db != null) for (String id : java.util.List.copyOf(scans.keySet())) releaseScan(id);
-        if (db != null) { db.close(); db = null; }
+        if (db != null) {
+            for (ColumnFamilyHandle handle : new ArrayList<>(families.values())) handle.close();
+            families.clear();
+            activeIndexes.clear();
+            droppedIndexes.clear();
+            db.close(); db = null;
+        }
         if (writes != null) { writes.close(); writes = null; }
+        if (dbOptions != null) { dbOptions.close(); dbOptions = null; }
+        for (ColumnFamilyOptions family : familyOptions) family.close();
+        familyOptions.clear();
         if (options != null) { options.close(); options = null; }
     }
     private void releaseScan(String id) {

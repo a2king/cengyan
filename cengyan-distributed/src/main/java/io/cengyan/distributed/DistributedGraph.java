@@ -405,7 +405,8 @@ public final class DistributedGraph {
             throw new ClusterException("TYPE_MISMATCH", "索引属性不存在：" + property);
         }
         GraphDefinition barrier = graph.toBuilder().setState("INDEX_BUILDING").build();
-        task = IndexBuildTask.newBuilder().setRequestId(requestId).setBefore(graph).setIndex(definition).setStage("BUILDING").build();
+        task = IndexBuildTask.newBuilder().setRequestId(requestId).setBefore(graph).setIndex(definition).setStage("BUILDING")
+                .setColumnFamily(true).build();
         storage.write(0, 0, StorageGateway.batch("index.task/" + requestId).addConditions(StorageGateway.condition(taskKey, null))
                 .addConditions(StorageGateway.condition(DistributedCatalog.graphKey(graph.getName()), graph.toByteString()))
                 .addMutations(TransactionEngine.put(taskKey, task.toByteString()))
@@ -414,6 +415,8 @@ public final class DistributedGraph {
     }
     private GraphDefinition buildIndex(IndexBuildTask task) {
         String requestId = task.getRequestId(); GraphDefinition graph = task.getBefore(); IndexDefinition index = task.getIndex();
+        // 先在每个分片建好这个索引的 CF，再写任何索引键。升级前创建的任务没有标记，继续写默认 CF。
+        if (task.getColumnFamily()) createIndexColumnFamilies(task);
         ByteString taskKey = TransactionEngine.text("tasks/index/" + requestId);
         GraphDefinition barrier = graph.toBuilder().setState("INDEX_BUILDING").build();
         for (int part = 0; part < graph.getPartitions(); part++) storage.write(graph.getId(), part,
@@ -468,7 +471,8 @@ public final class DistributedGraph {
     private void failIndexBuild(IndexBuildTask task, GraphDefinition graph, GraphDefinition barrier, RuntimeException failure) {
         try {
             // 已提交的索引分块必须清掉，否则下一次同名重建会看到残留 owner。
-            dropIndexKeys(task);
+            // 一条 Raft 命令删掉整个索引（Drop CF；升级前的旧索引用 DeleteRange），不再逐键扫描删除。
+            dropIndexStorage(task);
             GraphDefinition current = catalog.graph(graph.getName());
             if (current.equals(barrier)) catalog.update(task.getRequestId() + "/restore", barrier, graph);
             unblockIndex(graph, task.getRequestId(), graph.getWriteEpoch());
@@ -512,7 +516,11 @@ public final class DistributedGraph {
         storage.call(graph.getId(), normalized.getCoordinatorPart(), "tx.execute", normalized.getTransactionId(), normalized.toByteString(), Duration.ofMinutes(5));
     }
 
-    /** 删除索引定义及其所有 generation 键；物理清理先于 Catalog 激活，避免旧键继续占用空间。 */
+    /**
+     * 删除索引分两步：这里只把索引从 Catalog 移除（新查询和新写入立即不再使用它），任务停在 DROPPING。
+     * Metadata Leader 上的拓扑恢复线程随后在 {@link #resumeDropIndex} 里等旧 Schema 租约到期，
+     * 再给每个分片发一条 Raft 命令 Drop 这个索引的 Column Family。请求重放时 Catalog 里已经没有该索引，只返回当前 Schema。
+     */
     public GraphDefinition dropIndex(String requestId, String graphName, String indexName) {
         GraphDefinition graph = catalog.graph(graphName); DistributedCatalog.requireWritable(graph);
         ByteString taskKey = TransactionEngine.text("tasks/index/" + requestId);
@@ -532,64 +540,114 @@ public final class DistributedGraph {
             }
             if (task.getStage().equals("FINISHED")) return graph;
         }
-        dropIndexKeys(task);
         GraphDefinition current = catalog.graph(graphName);
+        if (current.getIndexesList().stream().noneMatch(index -> index.getName().equals(indexName))) return current;
         List<IndexDefinition> remaining = current.getIndexesList().stream().filter(item -> !item.getName().equals(indexName)).toList();
         GraphDefinition next = current.toBuilder().clearIndexes().addAllIndexes(remaining)
                 .setSchemaVersion(current.getSchemaVersion() + 1).setWriteEpoch(current.getWriteEpoch() + 1).build();
         if (!current.equals(next)) catalog.update(requestId + "/activate", current, next);
-        GraphDefinition result = catalog.graph(graphName);
-        try {
-            storage.write(0, 0, StorageGateway.batch("index.drop.finished." + requestId)
-                    .addMutations(TransactionEngine.put(taskKey, task.toBuilder().setStage("FINISHED").build().toByteString())).build());
-        } catch (ClusterException ex) { if (!ex.code().equals("WRITE_CONFLICT")) throw ex; }
-        return result;
-    }
-
-    private void dropIndexKeys(IndexBuildTask task) {
-        GraphDefinition graph = task.getBefore();
-        for (int part = 0; part < graph.getPartitions(); part++) {
-            ByteString after = ByteString.EMPTY; String cursor = "";
-            do {
-                ScanPage page = storage.scan(graph.getId(), part, EntityCodec.indexPrefix(task.getIndex(), graph), after, 128, cursor);
-                if (page.getEntriesCount() > 0) {
-                    var command = StorageGateway.batch("index.drop.keys." + task.getRequestId() + "/" + part + "/" + page.getLastKey().hashCode());
-                    for (var entry : page.getEntriesList()) command.addMutations(Mutation.newBuilder().setKey(entry.getKey()).setDelete(true));
-                    storage.write(graph.getId(), part, command.build());
-                }
-                if (!page.getMore()) break; after = page.getLastKey(); cursor = page.getCursorId();
-            } while (true);
-        }
+        return catalog.graph(graphName);
     }
 
     private static IndexBuildTask parseIndexTask(ByteString bytes) {
         try { return IndexBuildTask.parseFrom(bytes); }
         catch (Exception ex) { throw new ClusterException("CORRUPT_DATA", "索引任务损坏", ex); }
     }
+
+    /**
+     * 每个任务单独处理：一个分片暂时不可达只让这个任务下一轮重试，不挡住其他任务，
+     * 也不让调用方跳过随后的副本修复。控制面任期变化时整轮停止。
+     */
     public void recoverIndexes() {
         ByteString after = ByteString.EMPTY; String cursor = "";
         do {
             ScanPage page = storage.scan(0, 0, TransactionEngine.text("tasks/index/"), after, 100, cursor);
-            for (var entry : page.getEntriesList()) try {
-                IndexBuildTask task = IndexBuildTask.parseFrom(entry.getValue());
-                if (task.getStage().equals("BUILDING")) buildIndex(task);
-                else if (task.getStage().equals("DROPPING")) resumeDropIndex(task);
-            } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "索引恢复任务损坏", ex); }
+            for (var entry : page.getEntriesList()) {
+                IndexBuildTask task = parseIndexTask(entry.getValue());
+                try {
+                    if (task.getStage().equals("BUILDING")) buildIndex(task);
+                    else if (task.getStage().equals("DROPPING")) resumeDropIndex(task);
+                } catch (ClusterException ex) {
+                    if (ex.code().equals("STALE_CONTROLLER")) throw ex;
+                    System.err.println("索引任务 " + task.getRequestId() + " 本轮未完成，稍后重试：" + ex.code() + " " + ex.getMessage());
+                } catch (RuntimeException ex) {
+                    System.err.println("索引任务 " + task.getRequestId() + " 本轮未完成，稍后重试：" + ex);
+                }
+            }
             if (!page.getMore()) break; after = page.getLastKey(); cursor = page.getCursorId();
         } while (true);
     }
 
     private void resumeDropIndex(IndexBuildTask task) {
-        dropIndexKeys(task);
-        GraphDefinition current = catalog.graph(task.getBefore().getName());
+        GraphDefinition before = task.getBefore();
+        ByteString taskKey = TransactionEngine.text("tasks/index/" + task.getRequestId());
+        GraphDefinition current;
+        try { current = catalog.graph(before.getName()); }
+        catch (ClusterException ex) { if (!ex.code().equals("GRAPH_NOT_FOUND")) throw ex; current = null; }
+        if (current == null || current.getId() != before.getId() || current.getState().equals("DROPPED")) {
+            // 整张图已删除（同名重建会得到新 graphId）：数据目录由 DroppedGraphCleanup 整体删除，
+            // 不能按名字去动新图的 Catalog。
+            finishIndexTask(taskKey, task);
+            return;
+        }
         if (current.getIndexesList().stream().anyMatch(index -> index.getName().equals(task.getIndex().getName()))) {
             GraphDefinition next = current.toBuilder().clearIndexes()
                     .addAllIndexes(current.getIndexesList().stream().filter(index -> !index.getName().equals(task.getIndex().getName())).toList())
                     .setSchemaVersion(current.getSchemaVersion() + 1).setWriteEpoch(current.getWriteEpoch() + 1).build();
             catalog.update(task.getRequestId() + "/recover-activate", current, next);
+            current = next;
         }
+        // 删除前发放的旧 Schema 租约里，查询仍可能走这个索引。等这些租约的保留边界过去再删分片上的数据。
+        if (System.currentTimeMillis() <= leaseRetainUntil(before.getId(), current.getSchemaVersion())) return;
+        dropIndexStorage(task);
+        finishIndexTask(taskKey, task);
+    }
+
+    private void finishIndexTask(ByteString taskKey, IndexBuildTask task) {
         storage.write(0, 0, StorageGateway.batch("index.drop.recovered." + task.getRequestId())
-                .addMutations(TransactionEngine.put(TransactionEngine.text("tasks/index/" + task.getRequestId()), task.toBuilder().setStage("FINISHED").build().toByteString())).build());
+                .addMutations(TransactionEngine.put(taskKey, task.toBuilder().setStage("FINISHED").build().toByteString())).build());
+    }
+
+    /** 低于 {@code version} 的各 Schema 版本已授权租约的最晚保留时间；没有租约时为 0。 */
+    private long leaseRetainUntil(long graphId, long version) {
+        long retainUntil = 0;
+        ByteString after = ByteString.EMPTY; String cursor = "";
+        do {
+            ScanPage page = storage.scan(0, 0, TransactionEngine.text("schema/lease/" + graphId + "/"), after, 100, cursor);
+            for (var entry : page.getEntriesList()) {
+                try {
+                    LeaseHorizon horizon = LeaseHorizon.parseFrom(entry.getValue());
+                    if (horizon.getSchemaVersion() < version) retainUntil = Math.max(retainUntil, horizon.getRetainUntilMs());
+                } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "Schema 租约保留边界损坏", ex); }
+            }
+            if (!page.getMore()) break; after = page.getLastKey(); cursor = page.getCursorId();
+        } while (true);
+        return retainUntil;
+    }
+
+    private static ByteString indexStoragePrefix(IndexBuildTask task) {
+        return EntityCodec.indexPrefix(task.getIndex(), task.getBefore());
+    }
+
+    /** 每个分片一条 Raft 命令；requestId 固定，重试时由分片幂等记录返回首次结果。 */
+    private void dropIndexStorage(IndexBuildTask task) {
+        GraphDefinition graph = task.getBefore();
+        ByteString prefix = indexStoragePrefix(task);
+        for (int part = 0; part < graph.getPartitions(); part++) {
+            BatchResult result = storage.write(graph.getId(), part, StorageGateway.batch("index.drop.cf/" + task.getRequestId() + "/" + part)
+                    .addDropIndexPrefixes(prefix).build());
+            if (!result.getCode().equals("OK")) throw new ClusterException(result.getCode(), result.getMessage());
+        }
+    }
+
+    private void createIndexColumnFamilies(IndexBuildTask task) {
+        GraphDefinition graph = task.getBefore();
+        ByteString prefix = indexStoragePrefix(task);
+        for (int part = 0; part < graph.getPartitions(); part++) {
+            BatchResult result = storage.write(graph.getId(), part, StorageGateway.batch("index.create.cf/" + task.getRequestId() + "/" + part)
+                    .addCreateIndexPrefixes(prefix).build());
+            if (!result.getCode().equals("OK")) throw new ClusterException(result.getCode(), result.getMessage());
+        }
     }
     private void settleTransactions(GraphDefinition graph) {
         for (int part = 0; part < graph.getPartitions(); part++) {

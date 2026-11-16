@@ -226,6 +226,15 @@ public final class RaftNode implements AutoCloseable {
 
     /** 立刻清空一个已关闭的隔离目录。{@code stop} 为真时保留剩余文件，下次继续。 */
     public void deleteQuarantined(Path directory, BooleanSupplier stop) throws IOException, InterruptedException {
+        deleteQuarantined(directory, stop, Long.MAX_VALUE);
+    }
+
+    /**
+     * 删除已卸载目录。删除文件只改元数据，不读写文件内容，所以默认不限速；
+     * {@code bytesPerSecond > 0} 时按文件大小摊开删除，只用于开启了在线 discard、
+     * 大文件 unlink 会引起 TRIM 尖峰的磁盘。{@code <= 0} 表示不限速。
+     */
+    public void deleteQuarantined(Path directory, BooleanSupplier stop, long bytesPerSecond) throws IOException, InterruptedException {
         Path raftRoot = raftRoot();
         Path target = directory.toAbsolutePath().normalize();
         if (target.getParent() == null || !target.getParent().equals(raftRoot)) throw new IOException("拒绝删除 Raft 根目录之外的路径");
@@ -236,7 +245,8 @@ public final class RaftNode implements AutoCloseable {
             forgetPending(name);
             return;
         }
-        deleteTree(target, stop == null ? () -> false : stop);
+        boolean limited = bytesPerSecond > 0 && bytesPerSecond != Long.MAX_VALUE;
+        deleteTree(target, stop == null ? () -> false : stop, limited ? new DeleteBudget(bytesPerSecond) : null);
         if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) forgetPending(name);
     }
 
@@ -338,7 +348,22 @@ public final class RaftNode implements AutoCloseable {
 
     private Path raftRoot() { return storageRoot.resolve("raft").toAbsolutePath().normalize(); }
 
-    private static void deleteTree(Path path, BooleanSupplier stop) throws IOException, InterruptedException {
+    private static final class DeleteBudget {
+        private final long bytesPerSecond;
+        private final long startedAt = System.nanoTime();
+        private long bytes;
+        DeleteBudget(long bytesPerSecond) { this.bytesPerSecond = bytesPerSecond; }
+        synchronized void add(long count) throws InterruptedException {
+            long next = Math.addExact(bytes, Math.max(0, count));
+            // 用 double 计算目标时刻：按整数 next * 1e9 计算，超过约 9.2 GB 就会溢出。
+            long expectedNanos = (long) ((double) next * 1_000_000_000L / bytesPerSecond);
+            long wait = expectedNanos - (System.nanoTime() - startedAt);
+            if (wait > 0) TimeUnit.NANOSECONDS.sleep(wait);
+            bytes = next;
+        }
+    }
+
+    private static void deleteTree(Path path, BooleanSupplier stop, DeleteBudget budget) throws IOException, InterruptedException {
         if (stop.getAsBoolean() || Thread.currentThread().isInterrupted()) throw new InterruptedException();
         if (Files.isSymbolicLink(path)) {
             Files.deleteIfExists(path);
@@ -347,10 +372,16 @@ public final class RaftNode implements AutoCloseable {
         if (Files.isDirectory(path)) {
             List<Path> children;
             try (var listed = Files.list(path)) { children = listed.toList(); }
-            for (Path child : children) deleteTree(child, stop);
+            for (Path child : children) deleteTree(child, stop, budget);
             if (stop.getAsBoolean()) throw new InterruptedException();
             Files.deleteIfExists(path);
             return;
+        }
+        if (budget != null) {
+            long size = 0;
+            try { if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) size = Files.size(path); }
+            catch (IOException ignored) { }
+            budget.add(size);
         }
         Files.deleteIfExists(path);
     }

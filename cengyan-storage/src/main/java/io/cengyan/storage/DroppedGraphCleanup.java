@@ -167,7 +167,7 @@ final class DroppedGraphCleanup {
                 for (Path dir : dirs) {
                     if (closed.get()) return;
                     long started = System.nanoTime();
-                    node.deleteQuarantined(dir, closed::get);
+                    node.deleteQuarantined(dir, closed::get, config.droppedGraphDeleteBytesPerSecond());
                     if (!Files.exists(dir)) {
                         log.info("已清空隔离目录 {}，耗时 {} ms", dir.getFileName(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
                     }

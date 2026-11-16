@@ -62,6 +62,11 @@ public final class StorageServer implements AutoCloseable {
     private final ScheduledExecutorService topologyRecovery = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "storage-topology-recovery"); t.setDaemon(true); return t;
     });
+    /** 拓扑/Schema/副本恢复不能占用 RPC 协调线程。 */
+    private final ExecutorService topologyWorkers = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "storage-topology-worker"); t.setDaemon(true); return t;
+    });
+    private final AtomicBoolean topologyRunning = new AtomicBoolean();
     /** Every Storage flushes its local database before a planned restart. */
     private final ScheduledExecutorService maintenance = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "storage-maintenance"); t.setDaemon(true); return t;
@@ -161,6 +166,7 @@ public final class StorageServer implements AutoCloseable {
             gateway.close();
             recovery.shutdownNow();
             recoveryWorkers.shutdownNow();
+            topologyWorkers.shutdownNow();
             coordinators.shutdownNow();
             writers.shutdownNow();
             writeParticipants.shutdownNow();
@@ -187,20 +193,9 @@ public final class StorageServer implements AutoCloseable {
         long topologyInterval = Math.max(2000, config.backgroundIntervalMs());
         topologyRecovery.scheduleWithFixedDelay(() -> {
             if (closed.get()) return;
-            try {
-                var metadata = node.server().getDivision(GroupIds.metadata(config.clusterId()));
-                if (metadata.getInfo().isLeaderReady()) {
-                    long epoch = metadata.getInfo().getCurrentTerm();
-                    try (var guard = StorageGateway.controller(epoch, () -> metadata.getInfo().isLeaderReady() && metadata.getInfo().getCurrentTerm() == epoch)) {
-                    synchronized (topologyController) {
-                        replicaController.recover();
-                        new SchemaController(gateway).recover();
-                        new DistributedGraph(gateway).recoverIndexes();
-                        replicaController.reconcile(config.recoveryTimeoutMs());
-                    }
-                    }
-                }
-            } catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("后台拓扑任务等待恢复：{}", ex.toString()); }
+            if (!topologyRunning.compareAndSet(false, true)) return;
+            try { topologyWorkers.execute(this::recoverTopology); }
+            catch (RejectedExecutionException ex) { topologyRunning.set(false); }
         }, topologyInterval, topologyInterval, TimeUnit.MILLISECONDS);
         if (config.metadataMembers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()))) {
             ScheduledFuture<?>[] retry = new ScheduledFuture<?>[1];
@@ -220,10 +215,44 @@ public final class StorageServer implements AutoCloseable {
         hostMetrics.watch(config.directory());
     }
 
+    private void recoverTopology() {
+        try {
+            var metadata = node.server().getDivision(GroupIds.metadata(config.clusterId()));
+            if (metadata.getInfo().isLeaderReady()) {
+                long epoch = metadata.getInfo().getCurrentTerm();
+                try (var guard = StorageGateway.controller(epoch, () -> metadata.getInfo().isLeaderReady() && metadata.getInfo().getCurrentTerm() == epoch)) {
+                    synchronized (topologyController) {
+                        // 各步互不依赖：一步失败（例如某个索引分片暂时不可达）不能让后面的副本修复跳过。
+                        topologyStep("副本任务恢复", replicaController::recover);
+                        topologyStep("Schema 迁移恢复", () -> new SchemaController(gateway).recover());
+                        topologyStep("索引任务恢复", () -> new DistributedGraph(gateway).recoverIndexes());
+                        topologyStep("副本修复", () -> replicaController.reconcile(config.recoveryTimeoutMs()));
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            if (!closed.get()) org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("后台拓扑任务等待恢复：{}", ex.toString());
+        } finally { topologyRunning.set(false); }
+    }
+
+    /** 控制面任期变化时整轮停止；其他失败只记日志，下一轮重试。 */
+    private void topologyStep(String name, Runnable step) {
+        try { step.run(); }
+        catch (ClusterException ex) {
+            if (ex.code().equals("STALE_CONTROLLER")) throw ex;
+            if (!closed.get()) org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("后台拓扑任务[{}]等待恢复：{}", name, ex.toString());
+        } catch (RuntimeException ex) {
+            if (!closed.get()) org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("后台拓扑任务[{}]等待恢复：{}", name, ex.toString());
+        }
+    }
+
     /** 测试暂停定时清理，改由 {@link #cleanupDroppedGraphs()} 触发。 */
     void pauseDroppedGraphCleanup() { dropCleanup.pause(); }
 
     void cleanupDroppedGraphs() { dropCleanup.runOnce(); }
+
+    /** 测试立即跑一轮拓扑恢复，不必等定时任务。 */
+    void recoverTopologyNow() { recoverTopology(); }
 
     private CompletionStage<RpcResponse> handle(RpcRequest request) {
         if (request.getMethod().equals("ping")) return CompletableFuture.completedFuture(response("OK", "", ByteString.EMPTY));
@@ -449,6 +478,27 @@ public final class StorageServer implements AutoCloseable {
                         }
                         machine.stageImport(chunk);
                         result.complete(response("OK", "", ByteString.EMPTY));
+                        return;
+                    }
+                    if (inbound.getMethod().equals("import.status")) {
+                        var body = new com.fasterxml.jackson.databind.ObjectMapper().readTree(inbound.getBody().toByteArray());
+                        long graphId = body.path("graphId").asLong(inbound.getContext().getGraphId());
+                        int partId = body.path("part").asInt(inbound.getContext().getPartId());
+                        String checksumText = body.path("checksum").asText();
+                        if (checksumText.length() != 64) throw new ClusterException("INVALID_ARGUMENT", "导入校验和必须是 64 位十六进制");
+                        byte[] checksum = new byte[32];
+                        for (int i = 0; i < checksum.length; i++) checksum[i] = (byte) Integer.parseInt(checksumText.substring(i * 2, i * 2 + 2), 16);
+                        var division = node.server().getDivision(GroupIds.data(config.clusterId(), graphId, partId));
+                        if (!(division.getStateMachine() instanceof RocksStateMachine machine)) {
+                            result.complete(response("GROUP_UNAVAILABLE", "分片状态机不可用", ByteString.EMPTY)); return;
+                        }
+                        var status = machine.importStatus(checksum);
+                        var output = new com.fasterxml.jackson.databind.ObjectMapper().createObjectNode()
+                                .put("code", "OK").put("nodeId", config.nodeId()).put("graphId", graphId).put("part", partId)
+                                .put("readyBytes", status.readyBytes()).put("partialBytes", status.partialBytes())
+                                .put("ready", status.ready()).put("applied", status.applied()).put("owner", status.owner() == null ? "" : status.owner());
+                        if (status.result() != null) output.set("result", new com.fasterxml.jackson.databind.ObjectMapper().valueToTree(status.result()));
+                        result.complete(response("OK", "", ByteString.copyFrom(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsBytes(output))));
                         return;
                     }
                     if (inbound.getMethod().equals("data.status")) {
@@ -721,6 +771,12 @@ public final class StorageServer implements AutoCloseable {
                     shard.put("partId", spec.getPartId());
                     shard.put("term", info.getCurrentTerm());
                     shard.put("appliedIndex", info.getLastAppliedIndex());
+                    if (division.getStateMachine() instanceof RocksStateMachine dataMachine) {
+                        var dataUsage = dataMachine.physicalUsage();
+                        var usage = shard.putObject("physicalUsageBytes");
+                        dataUsage.forEach(usage::put);
+                        shard.put("physicalBytes", dataUsage.values().stream().mapToLong(Long::longValue).sum());
+                    }
                     if (info.getLeaderId() != null) shard.put("leaderId", info.getLeaderId().toString());
                     shard.put("leader", info.isLeader());
                     var members = shard.putArray("members");
@@ -1005,6 +1061,7 @@ public final class StorageServer implements AutoCloseable {
         recovery.shutdownNow();
         recoveryWorkers.shutdownNow();
         topologyRecovery.shutdownNow();
+        topologyWorkers.shutdownNow();
         coordinators.shutdownNow();
         writers.shutdownNow();
         writeParticipants.shutdownNow();
@@ -1016,6 +1073,7 @@ public final class StorageServer implements AutoCloseable {
             recovery.awaitTermination(10, TimeUnit.SECONDS);
             recoveryWorkers.awaitTermination(10, TimeUnit.SECONDS);
             topologyRecovery.awaitTermination(10, TimeUnit.SECONDS);
+            topologyWorkers.awaitTermination(10, TimeUnit.SECONDS);
             coordinators.awaitTermination(10, TimeUnit.SECONDS);
             writers.awaitTermination(10, TimeUnit.SECONDS);
             writeParticipants.awaitTermination(10, TimeUnit.SECONDS);

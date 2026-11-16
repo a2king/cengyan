@@ -78,6 +78,12 @@ message WriteBatch {
   uint64 controller_epoch = 7;
   // 行数据在副本本地的 SST 里。日志只记录校验和，重放时按校验和跳过已摄入的文件。
   ImportDirective import_file = 8;
+  // 索引的独立 Column Family。值是逻辑索引键前缀 [32][generation][len][indexId]，
+  // Column Family 名称由状态机按 indexId 算出，客户端不能指定任意名称。
+  // 创建通过 Raft 复制，副本启动时不会自行创建。
+  repeated bytes create_index_prefixes = 9;
+  // 删除索引：读写立即视为空，随后刷盘并 Drop Column Family；升级前写在默认 CF 的旧索引用一条 DeleteRange 删除。
+  repeated bytes drop_index_prefixes = 10;
 }
 enum ImportConflict {
   IMPORT_CONFLICT_UNSPECIFIED = 0;
@@ -259,4 +265,12 @@ message GqlWritePlan {
   bytes digest = 1; repeated Entity updates = 2; repeated Entity deletes = 3; bool completed = 4; uint64 affected = 5;
   repeated Entity expected_entities = 6;
 }
-message IndexBuildTask { string request_id = 1; GraphDefinition before = 2; IndexDefinition index = 3; string stage = 4; string error = 5; }
+message IndexBuildTask {
+  string request_id = 1;
+  GraphDefinition before = 2;
+  IndexDefinition index = 3;
+  string stage = 4;
+  string error = 5;
+  // 为真时索引键写在独立 Column Family。升级前创建、仍在构建的任务为假，继续写默认 CF。
+  bool column_family = 6;
+}
