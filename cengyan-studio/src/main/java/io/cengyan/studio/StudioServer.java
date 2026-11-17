@@ -88,6 +88,8 @@ public final class StudioServer implements AutoCloseable {
         http.createContext("/api/cancel", server::cancel);
         http.createContext("/api/admin", server::admin);
         http.createContext("/api/ops/overview", server::opsOverview);
+        http.createContext("/api/ops/series", server::opsSeries);
+        http.createContext("/api/ops/shards", server::opsShards);
         http.createContext("/", server::page);
         http.start();
         return server;
@@ -155,6 +157,40 @@ public final class StudioServer implements AutoCloseable {
         } catch (IOException ex) {
             send(exchange, 503, error("OPS_UNAVAILABLE", ex.getMessage()));
         }
+    }
+
+    /** 趋势曲线和分片拓扑只在集群托管模式下有：数据来自 Studio 本机的监控库。 */
+    private void opsSeries(HttpExchange exchange) {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            send(exchange, 405, error("SYNTAX", "只接受 GET"));
+            return;
+        }
+        if (cluster == null) {
+            send(exchange, 404, error("OPS_UNAVAILABLE", "没有托管集群，不记录趋势"));
+            return;
+        }
+        String query = exchange.getRequestURI().getRawQuery();
+        String range = "1h";
+        if (query != null) {
+            for (String part : query.split("&")) if (part.startsWith("range=")) range = part.substring("range=".length());
+        }
+        try {
+            send(exchange, 200, cluster.opsSeries(range));
+        } catch (RuntimeException ex) {
+            send(exchange, 503, error("OPS_UNAVAILABLE", ex.getMessage()));
+        }
+    }
+
+    private void opsShards(HttpExchange exchange) {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            send(exchange, 405, error("SYNTAX", "只接受 GET"));
+            return;
+        }
+        if (cluster == null) {
+            send(exchange, 404, error("OPS_UNAVAILABLE", "没有托管集群"));
+            return;
+        }
+        send(exchange, 200, cluster.opsShards());
     }
 
     private void login(HttpExchange exchange) {

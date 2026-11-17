@@ -17,33 +17,49 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Studio 本机的监控库 {@code data/ops.db}。页面只读这里。
- * 样本和事件保留 7 天，节点当前行一直留到节点移出集群。
+ * Studio 本机的监控库 {@code data/ops.db}。
+ * 页面读的当前状态是每轮写完后留在内存里的快照，不碰数据库；趋势曲线走单独的读连接，不等采集写入。
+ * 服务器指标按服务器存数值：15 秒原始点保留 1 天，5 分钟汇总（平均值和最大值）保留 7 天。事件保留 7 天。
  */
 final class OpsStore implements AutoCloseable {
     static final long RETENTION_MS = TimeUnit.DAYS.toMillis(7);
+    static final long POINT_RETENTION_MS = TimeUnit.DAYS.toMillis(1);
+    static final long ROLLUP_MS = TimeUnit.MINUTES.toMillis(5);
     static final long PURGE_EVERY_MS = TimeUnit.HOURS.toMillis(1);
     static final long CONCERN_MS = TimeUnit.SECONDS.toMillis(75);
     static final long BAD_MS = TimeUnit.SECONDS.toMillis(150);
+    /** 服务器级指标。比例是 0..1，速率是字节/秒。 */
+    static final List<String> METRICS = List.of("cpu", "memory", "diskUsed", "diskBusy", "diskRead", "diskWrite", "netIn", "netOut");
+    private static final Set<String> RATES = Set.of("diskRead", "diskWrite", "netIn", "netOut");
+    private static final int EVENTS_SHOWN = 50;
     private static final double DISK_BAD = 0.10;
     private static final double DISK_CONCERN = 0.20;
     private static final double BUSY_CONCERN = 0.90;
 
     private Connection connection;
+    /** 只给趋势曲线用。WAL 下读不挡写，写也不挡读。 */
+    private Connection reader;
+    private final Object readerLock = new Object();
+    private volatile Snapshot snapshot = Snapshot.EMPTY;
 
     OpsStore(Path dataDir) throws IOException {
         Path db = dataDir.resolve("ops.db");
         Files.createDirectories(dataDir);
+        String url = "jdbc:sqlite:" + db.toAbsolutePath().toString().replace('\\', '/');
         try {
             Class.forName("org.sqlite.JDBC");
-            connection = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath().toString().replace('\\', '/'));
+            connection = DriverManager.getConnection(url);
             connection.setAutoCommit(true);
             try (Statement statement = connection.createStatement()) {
                 boolean fresh = true;
@@ -65,14 +81,28 @@ final class OpsStore implements AutoCloseable {
                           message TEXT NOT NULL,
                           payload TEXT NOT NULL
                         )""");
+                // 旧版本按节点存整份 JSON 样本，页面从没读过，换成下面的数值表。
+                statement.execute("DROP TABLE IF EXISTS sample");
                 statement.execute("""
-                        CREATE TABLE IF NOT EXISTS sample (
-                          node_id TEXT NOT NULL,
+                        CREATE TABLE IF NOT EXISTS host_point (
+                          host TEXT NOT NULL,
+                          metric TEXT NOT NULL,
                           ts_ms INTEGER NOT NULL,
-                          payload TEXT NOT NULL,
-                          PRIMARY KEY (node_id, ts_ms)
-                        )""");
-                statement.execute("CREATE INDEX IF NOT EXISTS sample_ts ON sample(ts_ms)");
+                          value REAL NOT NULL,
+                          PRIMARY KEY (host, metric, ts_ms)
+                        ) WITHOUT ROWID""");
+                statement.execute("CREATE INDEX IF NOT EXISTS host_point_ts ON host_point(ts_ms)");
+                statement.execute("""
+                        CREATE TABLE IF NOT EXISTS host_rollup (
+                          host TEXT NOT NULL,
+                          metric TEXT NOT NULL,
+                          bucket_ms INTEGER NOT NULL,
+                          n INTEGER NOT NULL,
+                          total REAL NOT NULL,
+                          peak REAL NOT NULL,
+                          PRIMARY KEY (host, metric, bucket_ms)
+                        ) WITHOUT ROWID""");
+                statement.execute("CREATE INDEX IF NOT EXISTS host_rollup_bucket ON host_rollup(bucket_ms)");
                 statement.execute("""
                         CREATE TABLE IF NOT EXISTS event_log (
                           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,9 +128,16 @@ final class OpsStore implements AutoCloseable {
                         )""");
                 statement.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
             }
+            reader = DriverManager.getConnection(url);
+            try (Statement statement = reader.createStatement()) {
+                statement.execute("PRAGMA busy_timeout=3000");
+                statement.execute("PRAGMA query_only=1");
+            }
         } catch (ClassNotFoundException ex) {
+            close();
             throw new IOException("找不到 SQLite 驱动", ex);
         } catch (SQLException ex) {
+            close();
             throw new IOException("监控库打开失败：" + ex.getMessage(), ex);
         }
         ClusterStore.restrict(db, false);
@@ -110,21 +147,23 @@ final class OpsStore implements AutoCloseable {
     synchronized void record(ClusterState state, Map<String, OpsMonitor.Attempt> attempts, long now) {
         try {
             connection.setAutoCommit(false);
+            Map<String, NodeRow> previousRows = snapshot.nodes;
             Map<String, String> states = new LinkedHashMap<>();
+            Map<String, ObjectNode> fresh = new LinkedHashMap<>();
             List<NodeView> views = new ArrayList<>();
             for (NodeSpec node : state.nodes()) {
                 if (!node.joined()) continue;
                 OpsMonitor.Attempt attempt = attempts.get(node.id());
                 if (attempt == null) attempt = OpsMonitor.Attempt.fail("未采集");
-                Latest previous = latest(node.id());
+                NodeRow previous = previousRows.get(node.id());
                 boolean reachable = attempt.reachable();
                 long successAt = reachable ? now : previous == null ? 0 : previous.successAt;
                 String nodeState = reachable ? "REACHABLE" : "UNAVAILABLE";
-                ObjectNode payload = reachable || previous == null ? storedPayload(attempt.metrics()) : payload(previous.payload);
+                ObjectNode payload = reachable || previous == null ? storedPayload(attempt.metrics()) : previous.payload;
                 String health = health(nodeState, now, successAt, payload);
                 String message = trim(attempt.message());
                 upsertNode(node, nodeState, health, now, successAt, message, payload);
-                if (reachable) insertSample(node.id(), now, payload);
+                if (reachable) fresh.put(node.id(), payload);
                 if (previous == null) {
                     if (!"REACHABLE".equals(nodeState) || !"GOOD".equals(health)) {
                         event(now, node.id(), level(health), "NODE", nodeText(node.id(), nodeState, health, message, payload));
@@ -135,21 +174,15 @@ final class OpsStore implements AutoCloseable {
                 states.put(node.id(), nodeState);
                 views.add(new NodeView(node.role().name(), nodeState, health));
             }
-            try (PreparedStatement existing = connection.prepareStatement("SELECT node_id FROM node_latest");
-                 ResultSet rows = existing.executeQuery()) {
-                List<String> gone = new ArrayList<>();
-                while (rows.next()) {
-                    String id = rows.getString(1);
-                    if (!states.containsKey(id)) gone.add(id);
+            for (String id : previousRows.keySet()) {
+                if (states.containsKey(id)) continue;
+                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM node_latest WHERE node_id=?")) {
+                    delete.setString(1, id);
+                    delete.executeUpdate();
                 }
-                for (String id : gone) {
-                    try (PreparedStatement delete = connection.prepareStatement("DELETE FROM node_latest WHERE node_id=?")) {
-                        delete.setString(1, id);
-                        delete.executeUpdate();
-                    }
-                    event(now, id, "INFO", "NODE_REMOVED", id + " 已移出集群，停止采集");
-                }
+                event(now, id, "INFO", "NODE_REMOVED", id + " 已移出集群，停止采集");
             }
+            recordHosts(state, fresh, now);
             List<ShardView> shards = mergeShards(attempts, states, now);
             String cluster = clusterHealth(views, shards);
             String previousCluster = meta("cluster_health");
@@ -167,69 +200,140 @@ final class OpsStore implements AutoCloseable {
         } finally {
             enableAutoCommit();
         }
+        try { snapshot = load(); }
+        catch (SQLException ex) { throw new IllegalStateException("监控记录读取失败：" + ex.getMessage(), ex); }
     }
 
-    synchronized ObjectNode overview(ClusterState state, long now) {
+    /** 当前状态。只读内存快照；健康按读取时刻重算，采集卡住时页面也会看到节点变旧。 */
+    ObjectNode overview(ClusterState state, long now) {
+        Snapshot current = snapshot;
         ObjectNode result = ClusterStore.JSON.createObjectNode().put("code", "OK");
-        long collectedAt = longMeta("last_round");
-        if (collectedAt > 0) result.put("collectedAt", collectedAt);
+        if (current.collectedAt > 0) result.put("collectedAt", current.collectedAt);
         ArrayNode compute = result.putArray("computeNodes");
         ArrayNode storage = result.putArray("storageNodes");
         List<NodeView> views = new ArrayList<>();
+        Map<String, Integer> leaders = new TreeMap<>();
         for (NodeSpec node : state.nodes()) {
             if (!node.joined()) continue;
-            Latest row = latest(node.id());
+            NodeRow row = current.nodes.get(node.id());
             String nodeState = row == null ? "UNKNOWN" : row.state;
-            ObjectNode payload = row == null ? ClusterStore.JSON.createObjectNode() : payload(row.payload);
+            ObjectNode payload = row == null ? ClusterStore.JSON.createObjectNode() : row.payload;
             long successAt = row == null ? 0 : row.successAt;
             String health = row == null ? "UNKNOWN" : health(nodeState, now, successAt, payload);
             ObjectNode item = ClusterStore.JSON.createObjectNode();
-            item.setAll(payload);
+            item.setAll(payload.deepCopy());
             item.remove("shards");
             item.put("nodeId", node.id());
             item.put("role", node.role().name());
+            item.put("serverId", node.serverId());
             item.put("host", host(state, node));
             String hostname = item.path("hostname").asText("");
-            if (hostname.isBlank()) hostname = state.server(node.serverId()).map(Server::hostname).filter(name -> !name.isBlank()).orElse(host(state, node));
+            if (hostname.isBlank()) hostname = hostName(state, node.serverId(), "");
             item.put("hostname", hostname);
             item.put("state", nodeState);
             item.put("health", health);
             if (successAt > 0) item.put("successAt", successAt);
             if (row != null && !row.message.isBlank()) item.put("message", row.message);
             if (node.role() == Role.COMPUTE) compute.add(item);
-            else storage.add(item);
+            else {
+                storage.add(item);
+                String leader = payload.path("metadataLeaderId").asText("");
+                if ("REACHABLE".equals(nodeState) && !leader.isBlank()) leaders.merge(leader, 1, Integer::sum);
+            }
             views.add(new NodeView(node.role().name(), nodeState, health));
         }
-        ArrayNode shards = result.putArray("shards");
+        leaders.entrySet().stream().max(Map.Entry.comparingByValue()).ifPresent(entry -> result.put("metadataLeaderId", entry.getKey()));
         List<ShardView> shardViews = new ArrayList<>();
-        try (Statement statement = connection.createStatement();
-             ResultSet rows = statement.executeQuery("SELECT graph_id, graph_name, part_id, leader_id, term, applied_index, members, state FROM shard_latest ORDER BY graph_name, part_id")) {
-            while (rows.next()) {
-                ObjectNode shard = shards.addObject();
-                shard.put("graphId", rows.getLong(1));
-                shard.put("graph", rows.getString(2));
-                shard.put("partId", rows.getInt(3));
-                shard.put("leaderId", rows.getString(4));
-                shard.put("term", rows.getLong(5));
-                shard.put("appliedIndex", rows.getLong(6));
-                shard.set("members", members(rows.getString(7)));
-                shard.put("state", rows.getString(8));
-                shardViews.add(new ShardView(rows.getString(8)));
+        ObjectNode summary = result.putObject("shardSummary");
+        int healthy = 0, degraded = 0, unavailable = 0;
+        for (ShardRow shard : current.shards) {
+            shardViews.add(new ShardView(shard.state));
+            switch (shard.state) {
+                case "HEALTHY" -> healthy++;
+                case "DEGRADED" -> degraded++;
+                default -> unavailable++;
             }
-        } catch (SQLException ex) {
-            throw new IllegalStateException("监控记录读取失败：" + ex.getMessage(), ex);
         }
+        summary.put("total", current.shards.size()).put("healthy", healthy).put("degraded", degraded).put("unavailable", unavailable);
         result.put("clusterHealth", clusterHealth(views, shardViews));
         ArrayNode events = result.putArray("events");
-        try (Statement statement = connection.createStatement();
-             ResultSet rows = statement.executeQuery("SELECT ts_ms, node_id, level, event, message FROM event_log ORDER BY id DESC LIMIT 50")) {
-            while (rows.next()) {
-                events.addObject().put("ts", rows.getLong(1)).put("nodeId", rows.getString(2))
-                        .put("level", rows.getString(3)).put("event", rows.getString(4)).put("message", rows.getString(5));
-            }
-        } catch (SQLException ex) {
-            throw new IllegalStateException("监控记录读取失败：" + ex.getMessage(), ex);
+        for (EventRow event : current.events) {
+            events.addObject().put("ts", event.ts).put("nodeId", event.nodeId).put("level", event.level)
+                    .put("event", event.event).put("message", event.message);
         }
+        return result;
+    }
+
+    ObjectNode shards() {
+        Snapshot current = snapshot;
+        ObjectNode result = ClusterStore.JSON.createObjectNode().put("code", "OK");
+        if (current.collectedAt > 0) result.put("collectedAt", current.collectedAt);
+        ArrayNode shards = result.putArray("shards");
+        for (ShardRow row : current.shards) {
+            ObjectNode shard = shards.addObject();
+            shard.put("graphId", row.graphId);
+            shard.put("graph", row.graph);
+            shard.put("partId", row.partId);
+            shard.put("leaderId", row.leaderId);
+            shard.put("term", row.term);
+            shard.put("appliedIndex", row.applied);
+            ArrayNode members = shard.putArray("members");
+            row.members.forEach(members::add);
+            shard.put("state", row.state);
+        }
+        return result;
+    }
+
+    /**
+     * 服务器趋势。1h 读 15 秒原始点；1d 读 5 分钟汇总；7d 把 5 分钟汇总再并成 30 分钟。
+     * 每台服务器一组按时间对齐的数组，缺的点是 null。汇总档同时给出每段的最大值。
+     */
+    ObjectNode series(ClusterState state, String range, long now) {
+        Range window = Range.of(range);
+        long from = now - window.spanMs;
+        ObjectNode result = ClusterStore.JSON.createObjectNode().put("code", "OK")
+                .put("range", window.key).put("stepMs", window.stepMs).put("from", from).put("to", now);
+        Map<String, HostSeries> hosts = new LinkedHashMap<>();
+        for (NodeSpec node : state.nodes()) {
+            if (!node.joined() || hosts.containsKey(node.serverId())) continue;
+            hosts.put(node.serverId(), new HostSeries(node.serverId(), hostName(state, node.serverId(), snapshotHostname(node.serverId(), state)),
+                    state.server(node.serverId()).map(Server::host).orElse("")));
+        }
+        synchronized (readerLock) {
+            try {
+                if (window.rollup) {
+                    try (PreparedStatement statement = reader.prepareStatement("""
+                            SELECT host, metric, (bucket_ms / ?) * ? AS slot, SUM(total), SUM(n), MAX(peak)
+                            FROM host_rollup WHERE bucket_ms >= ? GROUP BY host, metric, slot""")) {
+                        statement.setLong(1, window.stepMs);
+                        statement.setLong(2, window.stepMs);
+                        statement.setLong(3, from - from % window.stepMs);
+                        try (ResultSet rows = statement.executeQuery()) {
+                            while (rows.next()) {
+                                HostSeries host = hosts.get(rows.getString(1));
+                                long n = rows.getLong(5);
+                                if (host == null || n <= 0) continue;
+                                host.put(rows.getString(2), rows.getLong(3), rows.getDouble(4) / n, rows.getDouble(6));
+                            }
+                        }
+                    }
+                } else {
+                    try (PreparedStatement statement = reader.prepareStatement("SELECT host, metric, ts_ms, value FROM host_point WHERE ts_ms >= ?")) {
+                        statement.setLong(1, from);
+                        try (ResultSet rows = statement.executeQuery()) {
+                            while (rows.next()) {
+                                HostSeries host = hosts.get(rows.getString(1));
+                                if (host != null) host.put(rows.getString(2), rows.getLong(3), rows.getDouble(4), Double.NaN);
+                            }
+                        }
+                    }
+                }
+            } catch (SQLException ex) {
+                throw new IllegalStateException("监控曲线读取失败：" + ex.getMessage(), ex);
+            }
+        }
+        ArrayNode out = result.putArray("hosts");
+        for (HostSeries host : hosts.values()) host.write(out.addObject(), window.rollup);
         return result;
     }
 
@@ -244,10 +348,12 @@ final class OpsStore implements AutoCloseable {
         } finally {
             enableAutoCommit();
         }
+        try { snapshot = load(); }
+        catch (SQLException ex) { throw new IllegalStateException("监控记录读取失败：" + ex.getMessage(), ex); }
     }
 
     int rows(String table) {
-        if (!table.equals("sample") && !table.equals("event_log") && !table.equals("node_latest")) throw new IllegalArgumentException(table);
+        if (!Set.of("host_point", "host_rollup", "event_log", "node_latest").contains(table)) throw new IllegalArgumentException(table);
         synchronized (this) {
             try (Statement statement = connection.createStatement();
                  ResultSet rows = statement.executeQuery("SELECT count(*) FROM " + table)) {
@@ -258,25 +364,36 @@ final class OpsStore implements AutoCloseable {
         }
     }
 
-    @Override public synchronized void close() {
-        if (connection == null) return;
-        try (Statement statement = connection.createStatement()) {
-            query(statement, "PRAGMA wal_checkpoint(TRUNCATE)");
-        } catch (SQLException ignored) {
-            /* 关闭时尽量收掉 WAL，失败也要放开文件锁。 */
+    @Override public void close() {
+        synchronized (readerLock) {
+            if (reader != null) {
+                try { reader.close(); }
+                catch (SQLException ignored) { }
+                reader = null;
+            }
         }
-        try { connection.close(); }
-        catch (SQLException ignored) { }
-        connection = null;
+        synchronized (this) {
+            if (connection == null) return;
+            try (Statement statement = connection.createStatement()) {
+                query(statement, "PRAGMA wal_checkpoint(TRUNCATE)");
+            } catch (SQLException ignored) {
+                /* 关闭时尽量收掉 WAL，失败也要放开文件锁。 */
+            }
+            try { connection.close(); }
+            catch (SQLException ignored) { }
+            connection = null;
+        }
     }
 
     private void purgeWithin(long now) throws SQLException {
-        long cutoff = now - RETENTION_MS;
-        try (PreparedStatement samples = connection.prepareStatement("DELETE FROM sample WHERE ts_ms < ?");
+        try (PreparedStatement points = connection.prepareStatement("DELETE FROM host_point WHERE ts_ms < ?");
+             PreparedStatement rollups = connection.prepareStatement("DELETE FROM host_rollup WHERE bucket_ms < ?");
              PreparedStatement events = connection.prepareStatement("DELETE FROM event_log WHERE ts_ms < ?")) {
-            samples.setLong(1, cutoff);
-            events.setLong(1, cutoff);
-            samples.executeUpdate();
+            points.setLong(1, now - POINT_RETENTION_MS);
+            rollups.setLong(1, now - RETENTION_MS);
+            events.setLong(1, now - RETENTION_MS);
+            points.executeUpdate();
+            rollups.executeUpdate();
             events.executeUpdate();
         }
         try (Statement statement = connection.createStatement()) {
@@ -285,11 +402,91 @@ final class OpsStore implements AutoCloseable {
         meta("purge_at", Long.toString(now));
     }
 
+    /** 同一台服务器上的 Compute 和 Storage 报的是同一份机器指标：每项先取 Storage，没有再取 Compute。 */
+    private void recordHosts(ClusterState state, Map<String, ObjectNode> fresh, long now) throws SQLException {
+        Map<String, Map<String, Double>> hosts = new LinkedHashMap<>();
+        for (Role role : List.of(Role.STORAGE, Role.COMPUTE)) {
+            for (NodeSpec node : state.nodes(role)) {
+                ObjectNode payload = fresh.get(node.id());
+                if (payload == null) continue;
+                Map<String, Double> host = hosts.computeIfAbsent(node.serverId(), ignored -> new LinkedHashMap<>());
+                hostMetrics(payload).forEach(host::putIfAbsent);
+            }
+        }
+        if (hosts.isEmpty()) return;
+        long bucket = now - now % ROLLUP_MS;
+        try (PreparedStatement point = connection.prepareStatement("INSERT OR REPLACE INTO host_point (host, metric, ts_ms, value) VALUES (?, ?, ?, ?)");
+             PreparedStatement rollup = connection.prepareStatement("""
+                     INSERT INTO host_rollup (host, metric, bucket_ms, n, total, peak) VALUES (?, ?, ?, 1, ?, ?)
+                     ON CONFLICT(host, metric, bucket_ms) DO UPDATE SET
+                       n=n+1, total=total+excluded.total, peak=max(peak, excluded.peak)""")) {
+            for (var host : hosts.entrySet()) {
+                for (var metric : host.getValue().entrySet()) {
+                    point.setString(1, host.getKey());
+                    point.setString(2, metric.getKey());
+                    point.setLong(3, now);
+                    point.setDouble(4, metric.getValue());
+                    point.addBatch();
+                    rollup.setString(1, host.getKey());
+                    rollup.setString(2, metric.getKey());
+                    rollup.setLong(3, bucket);
+                    rollup.setDouble(4, metric.getValue());
+                    rollup.setDouble(5, metric.getValue());
+                    rollup.addBatch();
+                }
+            }
+            point.executeBatch();
+            rollup.executeBatch();
+        }
+    }
+
+    /** 从一个节点的采集结果里取机器指标。拿不到的项不写，不用 0 冒充。 */
+    static Map<String, Double> hostMetrics(ObjectNode payload) {
+        Map<String, Double> out = new LinkedHashMap<>();
+        ratio(out, "cpu", number(payload, "systemCpuLoad"));
+        double memory = number(payload, "systemMemoryBytes");
+        double available = number(payload, "memAvailableBytes");
+        if (Double.isNaN(available)) available = number(payload, "systemFreeMemoryBytes");
+        if (memory > 0 && !Double.isNaN(available)) ratio(out, "memory", 1 - available / memory);
+        double disk = number(payload, "diskTotalBytes");
+        double usable = number(payload, "diskUsableBytes");
+        if (disk > 0 && !Double.isNaN(usable)) ratio(out, "diskUsed", 1 - usable / disk);
+        ratio(out, "diskBusy", number(payload, "diskBusy"));
+        rate(out, "diskRead", number(payload, "diskReadBytesPerSec"));
+        rate(out, "diskWrite", number(payload, "diskWriteBytesPerSec"));
+        rate(out, "netIn", number(payload, "netInBytesPerSec"));
+        rate(out, "netOut", number(payload, "netOutBytesPerSec"));
+        return out;
+    }
+
+    private static double number(ObjectNode payload, String field) {
+        JsonNode value = payload.get(field);
+        if (value == null || !value.isNumber()) return Double.NaN;
+        double number = value.asDouble();
+        return Double.isFinite(number) && number >= 0 ? number : Double.NaN;
+    }
+
+    private static void ratio(Map<String, Double> out, String key, double value) {
+        if (!Double.isNaN(value)) out.put(key, Math.max(0, Math.min(1, value)));
+    }
+
+    private static void rate(Map<String, Double> out, String key, double value) {
+        if (!Double.isNaN(value)) out.put(key, value);
+    }
+
+    /**
+     * 分片状态以 Storage 上报为准。新版 Storage 不是每轮都报分片：没报的轮次里，分片保持上次的状态，
+     * 只在副本节点不可达时往坏处调；节点状态一变，采集端会马上补一轮分片。
+     */
     private List<ShardView> mergeShards(Map<String, OpsMonitor.Attempt> attempts, Map<String, String> states, long now) throws SQLException {
         Map<String, ShardAcc> fresh = new LinkedHashMap<>();
+        Set<String> reported = new LinkedHashSet<>();
         for (var entry : attempts.entrySet()) {
-            if (!"REACHABLE".equals(states.get(entry.getKey())) || entry.getValue().metrics() == null) continue;
-            for (JsonNode shard : entry.getValue().metrics().path("shards")) {
+            if (!"REACHABLE".equals(states.get(entry.getKey()))) continue;
+            ArrayNode list = entry.getValue().shardList();
+            if (list == null) continue;
+            reported.add(entry.getKey());
+            for (JsonNode shard : list) {
                 if (!shard.isObject() || shard.path("graphId").asLong() <= 0) continue;
                 String key = shard.path("graphId").asLong() + "/" + shard.path("partId").asInt();
                 ShardAcc acc = fresh.computeIfAbsent(key, ignored -> new ShardAcc(shard.path("graphId").asLong(), shard.path("partId").asInt()));
@@ -306,12 +503,13 @@ final class OpsStore implements AutoCloseable {
                 for (JsonNode member : shard.path("members")) if (!member.asText("").isBlank()) acc.members.add(member.asText());
             }
         }
-        Map<String, StoredShard> previous = storedShards();
+        Map<String, ShardRow> previous = new LinkedHashMap<>();
+        for (ShardRow row : snapshot.shards) previous.put(row.key(), row);
         List<ShardView> views = new ArrayList<>();
         for (var entry : fresh.entrySet()) {
             ShardAcc acc = entry.getValue();
             String state = shardState(acc, states);
-            StoredShard before = previous.remove(entry.getKey());
+            ShardRow before = previous.remove(entry.getKey());
             if (before == null) {
                 if (!"HEALTHY".equals(state)) event(now, entry.getKey(), level(state), "SHARD", shardText(acc, state, states));
             } else if (!before.state.equals(state)) {
@@ -321,26 +519,39 @@ final class OpsStore implements AutoCloseable {
             views.add(new ShardView(state));
         }
         for (var entry : previous.entrySet()) {
-            StoredShard old = entry.getValue();
-            boolean covered = !old.members.isEmpty() && old.members.stream().allMatch(member -> "REACHABLE".equals(states.get(member)));
+            ShardRow old = entry.getValue();
+            String label = shardLabel(old.graph, old.graphId, old.partId);
+            boolean covered = !old.members.isEmpty() && reported.containsAll(old.members);
+            boolean silent = old.members.stream().anyMatch(member -> "REACHABLE".equals(states.get(member)) && !reported.contains(member));
             if (covered) {
-                event(now, entry.getKey(), "INFO", "SHARD_GONE", shardLabel(old.graph, old.graphId, old.partId) + " 已不再由存活节点上报");
+                event(now, entry.getKey(), "INFO", "SHARD_GONE", label + " 已不再由存活节点上报");
                 try (PreparedStatement delete = connection.prepareStatement("DELETE FROM shard_latest WHERE shard_key=?")) {
                     delete.setString(1, entry.getKey());
                     delete.executeUpdate();
                 }
+                continue;
+            }
+            String state;
+            String text;
+            if (silent) {
+                // 有副本节点可达只是这轮没报分片，不能据此判定分片丢了。
+                boolean missing = old.members.stream().anyMatch(member -> !"REACHABLE".equals(states.get(member)));
+                state = missing && "HEALTHY".equals(old.state) ? "DEGRADED" : old.state;
+                text = label + " 缺副本：" + String.join(", ", old.members.stream().filter(member -> !"REACHABLE".equals(states.get(member))).toList());
             } else {
-                if (!"UNAVAILABLE".equals(old.state)) {
-                    event(now, entry.getKey(), "ERROR", "SHARD", shardLabel(old.graph, old.graphId, old.partId) + " 没有存活副本上报");
-                }
+                state = "UNAVAILABLE";
+                text = label + " 没有存活副本上报";
+            }
+            if (!state.equals(old.state)) {
+                event(now, entry.getKey(), level(state), "SHARD", text);
                 try (PreparedStatement update = connection.prepareStatement("UPDATE shard_latest SET state=?, updated_at=? WHERE shard_key=?")) {
-                    update.setString(1, "UNAVAILABLE");
+                    update.setString(1, state);
                     update.setLong(2, now);
                     update.setString(3, entry.getKey());
                     update.executeUpdate();
                 }
-                views.add(new ShardView("UNAVAILABLE"));
             }
+            views.add(new ShardView(state));
         }
         return views;
     }
@@ -375,19 +586,6 @@ final class OpsStore implements AutoCloseable {
         }
     }
 
-    private Map<String, StoredShard> storedShards() throws SQLException {
-        Map<String, StoredShard> result = new LinkedHashMap<>();
-        try (Statement statement = connection.createStatement();
-             ResultSet rows = statement.executeQuery("SELECT shard_key, graph_id, graph_name, part_id, members, state FROM shard_latest")) {
-            while (rows.next()) {
-                LinkedHashSet<String> members = new LinkedHashSet<>();
-                for (JsonNode member : members(rows.getString(5))) members.add(member.asText());
-                result.put(rows.getString(1), new StoredShard(rows.getLong(2), rows.getString(3), rows.getInt(4), members, rows.getString(6)));
-            }
-        }
-        return result;
-    }
-
     private void upsertNode(NodeSpec node, String state, String health, long now, long successAt, String message, ObjectNode payload) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement("""
                 INSERT INTO node_latest (node_id, role, state, health, collected_at, success_at, message, payload)
@@ -407,15 +605,6 @@ final class OpsStore implements AutoCloseable {
         }
     }
 
-    private void insertSample(String nodeId, long now, ObjectNode payload) throws SQLException {
-        try (PreparedStatement statement = connection.prepareStatement("INSERT OR REPLACE INTO sample (node_id, ts_ms, payload) VALUES (?, ?, ?)")) {
-            statement.setString(1, nodeId);
-            statement.setLong(2, now);
-            statement.setString(3, payload.toString());
-            statement.executeUpdate();
-        }
-    }
-
     private void event(long now, String nodeId, String level, String name, String message) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(
                 "INSERT INTO event_log (ts_ms, node_id, level, event, message) VALUES (?, ?, ?, ?, ?)")) {
@@ -428,17 +617,31 @@ final class OpsStore implements AutoCloseable {
         }
     }
 
-    private Latest latest(String nodeId) {
-        try (PreparedStatement statement = connection.prepareStatement(
-                "SELECT state, health, success_at, message, payload FROM node_latest WHERE node_id=?")) {
-            statement.setString(1, nodeId);
-            try (ResultSet rows = statement.executeQuery()) {
-                if (!rows.next()) return null;
-                return new Latest(rows.getString(1), rows.getString(2), rows.getLong(3), rows.getString(4), rows.getString(5));
+    /** 从库里重建页面用的快照。只在写连接上、持有本对象锁时调用。 */
+    private Snapshot load() throws SQLException {
+        Map<String, NodeRow> nodes = new LinkedHashMap<>();
+        try (Statement statement = connection.createStatement();
+             ResultSet rows = statement.executeQuery("SELECT node_id, state, health, success_at, message, payload FROM node_latest")) {
+            while (rows.next()) {
+                nodes.put(rows.getString(1), new NodeRow(rows.getString(2), rows.getString(3), rows.getLong(4), rows.getString(5), payload(rows.getString(6))));
             }
-        } catch (SQLException ex) {
-            throw new IllegalStateException("监控记录读取失败：" + ex.getMessage(), ex);
         }
+        List<ShardRow> shards = new ArrayList<>();
+        try (Statement statement = connection.createStatement();
+             ResultSet rows = statement.executeQuery("SELECT graph_id, graph_name, part_id, leader_id, term, applied_index, members, state FROM shard_latest ORDER BY graph_name, part_id")) {
+            while (rows.next()) {
+                List<String> members = new ArrayList<>();
+                for (JsonNode member : members(rows.getString(7))) members.add(member.asText());
+                shards.add(new ShardRow(rows.getLong(1), rows.getString(2), rows.getInt(3), rows.getString(4), rows.getLong(5), rows.getLong(6),
+                        List.copyOf(members), rows.getString(8)));
+            }
+        }
+        List<EventRow> events = new ArrayList<>();
+        try (Statement statement = connection.createStatement();
+             ResultSet rows = statement.executeQuery("SELECT ts_ms, node_id, level, event, message FROM event_log ORDER BY id DESC LIMIT " + EVENTS_SHOWN)) {
+            while (rows.next()) events.add(new EventRow(rows.getLong(1), rows.getString(2), rows.getString(3), rows.getString(4), rows.getString(5)));
+        }
+        return new Snapshot(longMeta("last_round"), Map.copyOf(nodes), List.copyOf(shards), List.copyOf(events));
     }
 
     private String meta(String key) {
@@ -617,6 +820,24 @@ final class OpsStore implements AutoCloseable {
         return state.server(node.serverId()).map(Server::host).orElse("");
     }
 
+    /** 服务器显示名：添加服务器时探测到的主机名，其次节点上报的主机名，最后是地址。 */
+    private static String hostName(ClusterState state, String serverId, String reported) {
+        String probed = state.server(serverId).map(Server::hostname).orElse("");
+        if (!probed.isBlank()) return probed;
+        if (reported != null && !reported.isBlank()) return reported;
+        return state.server(serverId).map(Server::host).orElse(serverId);
+    }
+
+    private String snapshotHostname(String serverId, ClusterState state) {
+        Snapshot current = snapshot;
+        for (NodeSpec node : state.nodes()) {
+            if (!node.serverId().equals(serverId)) continue;
+            NodeRow row = current.nodes.get(node.id());
+            if (row != null && !row.payload.path("hostname").asText("").isBlank()) return row.payload.path("hostname").asText();
+        }
+        return "";
+    }
+
     private static String trim(String message) {
         if (message == null) return "";
         String text = message.replace('\n', ' ').trim();
@@ -630,10 +851,80 @@ final class OpsStore implements AutoCloseable {
         }
     }
 
-    private record Latest(String state, String health, long successAt, String message, String payload) { }
+    /** 趋势的时间范围。1h 用原始点；1d、7d 用汇总。 */
+    record Range(String key, long spanMs, long stepMs, boolean rollup) {
+        static Range of(String key) {
+            return switch (key == null ? "" : key) {
+                case "1d" -> new Range("1d", TimeUnit.DAYS.toMillis(1), ROLLUP_MS, true);
+                case "7d" -> new Range("7d", TimeUnit.DAYS.toMillis(7), TimeUnit.MINUTES.toMillis(30), true);
+                default -> new Range("1h", TimeUnit.HOURS.toMillis(1), OpsMonitor.INTERVAL.toMillis(), false);
+            };
+        }
+    }
+
+    /** 一台服务器的曲线，按时间对齐。 */
+    private static final class HostSeries {
+        final String id;
+        final String name;
+        final String address;
+        final TreeMap<Long, double[]> average = new TreeMap<>();
+        final Map<Long, double[]> peak = new HashMap<>();
+
+        HostSeries(String id, String name, String address) {
+            this.id = id;
+            this.name = name;
+            this.address = address;
+        }
+
+        void put(String metric, long ts, double value, double max) {
+            int index = METRICS.indexOf(metric);
+            if (index < 0) return;
+            average.computeIfAbsent(ts, ignored -> blank())[index] = value;
+            if (!Double.isNaN(max)) peak.computeIfAbsent(ts, ignored -> blank())[index] = max;
+        }
+
+        void write(ObjectNode out, boolean withPeak) {
+            out.put("id", id).put("name", name).put("address", address);
+            ArrayNode ts = out.putArray("ts");
+            average.keySet().forEach(ts::add);
+            ObjectNode avg = out.putObject("avg");
+            ObjectNode max = withPeak ? out.putObject("max") : null;
+            for (int i = 0; i < METRICS.size(); i++) {
+                String metric = METRICS.get(i);
+                ArrayNode values = avg.putArray(metric);
+                ArrayNode peaks = max == null ? null : max.putArray(metric);
+                for (Long key : average.keySet()) {
+                    add(values, metric, average.get(key)[i]);
+                    if (peaks != null) add(peaks, metric, peak.getOrDefault(key, BLANK)[i]);
+                }
+            }
+        }
+
+        private static void add(ArrayNode values, String metric, double value) {
+            if (Double.isNaN(value)) values.addNull();
+            else if (RATES.contains(metric)) values.add(Math.round(value));
+            else values.add(Math.round(value * 10000) / 10000.0);
+        }
+
+        private static final double[] BLANK = blank();
+
+        private static double[] blank() {
+            double[] values = new double[METRICS.size()];
+            Arrays.fill(values, Double.NaN);
+            return values;
+        }
+    }
+
+    private record NodeRow(String state, String health, long successAt, String message, ObjectNode payload) { }
+    private record ShardRow(long graphId, String graph, int partId, String leaderId, long term, long applied, List<String> members, String state) {
+        String key() { return graphId + "/" + partId; }
+    }
+    private record EventRow(long ts, String nodeId, String level, String event, String message) { }
+    private record Snapshot(long collectedAt, Map<String, NodeRow> nodes, List<ShardRow> shards, List<EventRow> events) {
+        static final Snapshot EMPTY = new Snapshot(0, Map.of(), List.of(), List.of());
+    }
     record NodeView(String role, String state, String health) { }
     private record ShardView(String state) { }
-    private record StoredShard(long graphId, String graph, int partId, LinkedHashSet<String> members, String state) { }
 
     private static final class ShardAcc {
         final long graphId;

@@ -1,4 +1,4 @@
-import type { OpsOverview, QueryResponse, SessionInfo, StudioConfig } from './types';
+import type { OpsOverview, OpsRange, OpsSeries, QueryResponse, SessionInfo, StudioConfig } from './types';
 
 const SESSION_KEY = 'cengyan.studio.session';
 const USER_KEY = 'cengyan.studio.user';
@@ -113,6 +113,22 @@ export class CengyanApi {
     const data = await response.json() as OpsOverview;
     if (!response.ok || data.code !== 'OK') throw new Error(data.message || '集群运维数据读取失败');
     return data;
+  }
+
+  /** 服务器趋势。未托管集群时 Studio 不记录趋势，返回 null。 */
+  async opsSeries(range: OpsRange): Promise<OpsSeries | null> {
+    const response = await fetch(`/api/ops/series?range=${range}`);
+    if (response.status === 404) return null;
+    const data = await response.json() as OpsSeries;
+    if (!response.ok || data.code !== 'OK') throw new Error(data.message || '趋势数据读取失败');
+    return data;
+  }
+
+  async opsShards(): Promise<Array<Record<string, unknown>>> {
+    const response = await fetch('/api/ops/shards');
+    const data = await response.json() as { code: string; message?: string; shards?: Array<Record<string, unknown>> };
+    if (!response.ok || data.code !== 'OK') throw new Error(data.message || '分片拓扑读取失败');
+    return data.shards || [];
   }
 
   async ping(): Promise<QueryResponse> {

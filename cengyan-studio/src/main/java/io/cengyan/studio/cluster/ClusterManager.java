@@ -352,24 +352,38 @@ public final class ClusterManager implements AutoCloseable {
 
     /** 运维总览只读本机监控库，不访问 Storage 或 Compute。 */
     public ObjectNode opsOverview() {
+        if (opsMonitor == null) return emptyOverview(null);
+        try { return opsMonitor.overview(); }
+        catch (RuntimeException ex) { return emptyOverview("监控记录暂不可读：" + (ex.getMessage() == null ? "监控库读取失败" : ex.getMessage())); }
+    }
+
+    /** 服务器趋势曲线，range 为 1h、1d 或 7d。 */
+    public ObjectNode opsSeries(String range) {
         if (opsMonitor == null) {
-            ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK").put("clusterHealth", "UNKNOWN");
-            empty.putArray("computeNodes");
-            empty.putArray("storageNodes");
-            empty.putArray("shards");
-            empty.putArray("events");
+            ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK").put("range", OpsStore.Range.of(range).key());
+            empty.putArray("hosts");
             return empty;
         }
-        try { return opsMonitor.overview(); }
-        catch (RuntimeException ex) {
-            ObjectNode failed = ClusterStore.JSON.createObjectNode().put("code", "OK").put("clusterHealth", "UNKNOWN")
-                    .put("message", "监控记录暂不可读：" + (ex.getMessage() == null ? "监控库读取失败" : ex.getMessage()));
-            failed.putArray("computeNodes");
-            failed.putArray("storageNodes");
-            failed.putArray("shards");
-            failed.putArray("events");
-            return failed;
+        return opsMonitor.series(range);
+    }
+
+    public ObjectNode opsShards() {
+        if (opsMonitor == null) {
+            ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK");
+            empty.putArray("shards");
+            return empty;
         }
+        return opsMonitor.shards();
+    }
+
+    private static ObjectNode emptyOverview(String message) {
+        ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK").put("clusterHealth", "UNKNOWN");
+        if (message != null) empty.put("message", message);
+        empty.putArray("computeNodes");
+        empty.putArray("storageNodes");
+        empty.putObject("shardSummary").put("total", 0).put("healthy", 0).put("degraded", 0).put("unavailable", 0);
+        empty.putArray("events");
+        return empty;
     }
 
     private static Map<String, String> trim(Map<String, String> values) {

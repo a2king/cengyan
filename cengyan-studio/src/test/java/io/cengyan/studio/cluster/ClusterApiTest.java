@@ -99,7 +99,19 @@ class ClusterApiTest {
             assertEquals("UNKNOWN", body.path("clusterHealth").asText());
             assertTrue(body.path("storageNodes").isArray());
             assertTrue(body.path("events").isArray());
+            assertEquals(0, body.path("shardSummary").path("total").asInt());
             assertTrue(Files.exists(home.resolve("data/ops.db")));
+
+            JsonNode series = ClusterStore.JSON.readTree(http.send(HttpRequest.newBuilder(
+                    URI.create("http://127.0.0.1:" + studio.port() + "/api/ops/series?range=7d")).build(), HttpResponse.BodyHandlers.ofString()).body());
+            assertEquals("7d", series.path("range").asText());
+            assertTrue(series.path("hosts").isArray());
+            JsonNode fallback = ClusterStore.JSON.readTree(http.send(HttpRequest.newBuilder(
+                    URI.create("http://127.0.0.1:" + studio.port() + "/api/ops/series?range=bogus")).build(), HttpResponse.BodyHandlers.ofString()).body());
+            assertEquals("1h", fallback.path("range").asText(), "不认识的范围按 1 小时");
+            JsonNode shards = ClusterStore.JSON.readTree(http.send(HttpRequest.newBuilder(
+                    URI.create("http://127.0.0.1:" + studio.port() + "/api/ops/shards")).build(), HttpResponse.BodyHandlers.ofString()).body());
+            assertTrue(shards.path("shards").isArray());
         }
     }
 

@@ -757,6 +757,7 @@ public final class ComputeServer implements AutoCloseable {
             result.put("diskUsableBytes", disk.getUsableSpace());
         } catch (IOException ignored) { }
         hostMetrics.current().putNet(result);
+        HostMetrics.putMemory(result);
         return result;
     }
 

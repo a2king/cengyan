@@ -94,8 +94,35 @@ export interface OpsOverview {
   clientBytesOutTotal?: number;
   computeNodes?: Array<Record<string, unknown>>;
   storageNodes?: Array<Record<string, unknown>>;
+  /** 只有未托管集群时（Compute 汇总）才在这里给分片；托管集群走 /api/ops/shards。 */
   shards?: Array<Record<string, unknown>>;
+  shardSummary?: { total: number; healthy: number; degraded: number; unavailable: number };
+  metadataLeaderId?: string;
   clusterHealth?: string;
   collectedAt?: number;
   events?: Array<{ ts: number; nodeId: string; level: string; event: string; message: string }>;
+}
+
+/** 服务器级指标。比例是 0..1，速率是字节/秒。 */
+export type HostMetric = 'cpu' | 'memory' | 'diskUsed' | 'diskBusy' | 'diskRead' | 'diskWrite' | 'netIn' | 'netOut';
+export type OpsRange = '1h' | '1d' | '7d';
+
+export interface OpsHostSeries {
+  id: string;
+  name: string;
+  address: string;
+  ts: number[];
+  avg: Record<HostMetric, Array<number | null>>;
+  /** 1d、7d 才有：每段内的最大值。 */
+  max?: Record<HostMetric, Array<number | null>>;
+}
+
+export interface OpsSeries {
+  code: string;
+  message?: string;
+  range: OpsRange;
+  stepMs: number;
+  from: number;
+  to: number;
+  hosts: OpsHostSeries[];
 }

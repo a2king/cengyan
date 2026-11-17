@@ -139,4 +139,15 @@ class HostMetricsTest {
         assertEquals(8.0, json.get("netInBytesPerSec").asDouble());
         assertFalse(json.has("netOutBytesPerSec"));
     }
+
+    @Test void memAvailableCountsReclaimablePageCache() {
+        String meminfo = """
+                MemTotal:       32616336 kB
+                MemFree:          412104 kB
+                MemAvailable:   20118284 kB
+                Buffers:           10240 kB
+                """;
+        assertEquals(20118284L * 1024, HostMetrics.memAvailable(meminfo));
+        assertEquals(-1, HostMetrics.memAvailable("MemTotal: 1 kB\nMemFree: 1 kB\n"), "旧内核没有 MemAvailable");
+    }
 }

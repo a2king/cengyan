@@ -51,8 +51,10 @@ public final class StorageServer implements AutoCloseable {
     private final ThreadPoolExecutor metadataRequests;
     /** 导入分块、归并和会话请求。归并会跑很久，不能占用 Metadata 或业务读写的线程。 */
     private final ThreadPoolExecutor importRequests;
-    /** 监控采集。 */
+    /** 分片列表、数据目录大小这类要扫目录的运维请求。 */
     private final ThreadPoolExecutor opsRequests;
+    /** 机器指标。只读计数器，单独一个线程，不排在扫目录的请求后面。 */
+    private final ThreadPoolExecutor metricsRequests;
     private final TokenAuthority authority;
     private final ReplicaController replicaController;
     private DroppedGraphCleanup dropCleanup;
@@ -106,6 +108,7 @@ public final class StorageServer implements AutoCloseable {
         metadataRequests = writePool(Math.max(8, config.admissionThreads()), "storage-metadata-request");
         importRequests = writePool(Math.max(4, Runtime.getRuntime().availableProcessors()), "storage-import-request");
         opsRequests = writePool(2, "storage-ops-request");
+        metricsRequests = writePool(1, "storage-metrics-request");
         transactions = new TransactionEngine(gateway, writeParticipants);
         authority = new TokenAuthority(gateway);
         replicaController = new ReplicaController(gateway);
@@ -184,6 +187,7 @@ public final class StorageServer implements AutoCloseable {
             metadataRequests.shutdownNow();
             importRequests.shutdownNow();
             opsRequests.shutdownNow();
+            metricsRequests.shutdownNow();
             maintenance.shutdownNow();
             joining.shutdownNow();
             if (dropCleanup != null) dropCleanup.close();
@@ -348,6 +352,11 @@ public final class StorageServer implements AutoCloseable {
                     }
                     if (inbound.getMethod().equals("ops.metrics")) {
                         result.complete(response("OK", "", metrics())); return;
+                    }
+                    if (inbound.getMethod().equals("ops.shards")) {
+                        var json = new com.fasterxml.jackson.databind.ObjectMapper().createObjectNode().put("code", "OK");
+                        appendShards(json);
+                        result.complete(response("OK", "", ByteString.copyFromUtf8(json.toString()))); return;
                     }
                     if (inbound.getMethod().startsWith("metadata.maintenance.") || inbound.getMethod().equals("metadata.transferLeader")) {
                         var division = node.server().getDivision(GroupIds.metadata(config.clusterId()));
@@ -727,7 +736,8 @@ public final class StorageServer implements AutoCloseable {
         String method = request.getMethod();
         if (method.equals("tx.execute")) return writers;
         if (method.startsWith("import.")) return importRequests;
-        if (method.equals("ops.metrics") || method.equals("node.storageSize")) return opsRequests;
+        if (method.equals("ops.metrics")) return metricsRequests;
+        if (method.equals("ops.shards") || method.equals("node.storageSize")) return opsRequests;
         if (method.startsWith("kv.") || method.equals("data.status")) return request.getContext().getGraphId() > 0 ? dataRequests : metadataRequests;
         if (method.startsWith("auth.") || method.equals("data.configure") || method.startsWith("metadata.") || method.startsWith("schema.")) return coordinators;
         return admission;
@@ -765,13 +775,15 @@ public final class StorageServer implements AutoCloseable {
             json.put("diskUsableBytes", disk.getUsableSpace());
         } catch (IOException ignored) { }
         hostMetrics.current().putDisk(json);
+        hostMetrics.current().putNet(json);
+        HostMetrics.putMemory(json);
         try {
             var metadata = node.server().getDivision(GroupIds.metadata(config.clusterId()));
             json.put("metadataTerm", metadata.getInfo().getCurrentTerm());
             json.put("metadataAppliedIndex", metadata.getInfo().getLastAppliedIndex());
             if (metadata.getInfo().getLeaderId() != null) json.put("metadataLeaderId", metadata.getInfo().getLeaderId().toString());
         } catch (Exception ignored) { }
-        appendShards(json);
+        // 分片列表要扫 Metadata 目录，改由 ops.shards 单独取。
         return com.google.protobuf.ByteString.copyFromUtf8(json.toString());
     }
 
@@ -1103,6 +1115,7 @@ public final class StorageServer implements AutoCloseable {
         metadataRequests.shutdownNow();
         importRequests.shutdownNow();
         opsRequests.shutdownNow();
+        metricsRequests.shutdownNow();
         admission.shutdownNow();
         try {
             maintenance.awaitTermination(10, TimeUnit.SECONDS);
@@ -1118,6 +1131,7 @@ public final class StorageServer implements AutoCloseable {
             metadataRequests.awaitTermination(10, TimeUnit.SECONDS);
             importRequests.awaitTermination(10, TimeUnit.SECONDS);
             opsRequests.awaitTermination(10, TimeUnit.SECONDS);
+            metricsRequests.awaitTermination(10, TimeUnit.SECONDS);
             admission.awaitTermination(10, TimeUnit.SECONDS);
         } catch (InterruptedException ex) { Thread.currentThread().interrupt(); }
         gateway.close();

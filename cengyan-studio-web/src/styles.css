@@ -100,21 +100,48 @@ button, input, textarea, select { font-family: inherit; }
 .workspace-card .ant-tabs-tabpane,
 .panel-stack { min-width: 0; max-width: 100%; }
 .workspace-card .ant-card-body { padding: 0 24px 24px; }
-.ops-summary-card.workspace-card > .ant-card-body { padding-top: 24px; }
-.ops-summary-card .ant-col { min-width: 0; }
-.ops-summary-card .metric-card { height: 100%; }
-.ops-summary-card .metric-card .ant-statistic-content-value { overflow-wrap: anywhere; }
 .workspace-card .ant-table-wrapper { max-width: 100%; }
 .workspace-card .ant-table-thead > tr > th { white-space: nowrap; }
 .ops-resource-table .ant-table { table-layout: auto; width: 100%; }
 .ops-resource-table .ant-table-content { overflow-x: auto; }
 .ops-resource-table .ant-table-content > table { width: 100% !important; max-width: none !important; }
-.ops-compute-table .ant-table-content > table { min-width: max(100%, 900px) !important; }
-.ops-storage-table .ant-table-content > table { min-width: max(100%, 1040px) !important; }
 .ops-resource-table .ant-table-thead > tr > th,
 .ops-resource-table .ant-table-tbody > tr > td { padding-inline: 8px; white-space: nowrap; }
 .ops-num-col { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .ops-fixed-col { overflow: hidden; text-overflow: ellipsis; }
+.ops-status-card.workspace-card > .ant-card-body { padding: 18px 24px; }
+.ops-status-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px 24px; }
+.ops-stat { min-width: 0; }
+.ops-stat-label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.ops-stat-value { color: var(--ink); font-size: 22px; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ops-stat-value .ant-tag { font-size: 14px; padding: 2px 10px; margin: 0; }
+.ops-stat-text { display: block; overflow: hidden; text-overflow: ellipsis; font-size: 16px; }
+.ops-stat-hint { color: var(--muted); font-size: 12px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ops-trend-card .ant-card-extra { margin-inline-start: 16px; }
+.ops-trend-card.workspace-card > .ant-card-body { padding-top: 16px; }
+.ops-trend-controls { display: flex; align-items: center; gap: 12px; }
+.ops-host-select { width: 240px; }
+.ops-trend-sub { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 12px; }
+.ops-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.ops-legend-item { display: inline-flex; align-items: center; gap: 6px; padding: 2px 6px; color: var(--ink); font-size: 13px; background: none; border: 0; border-radius: 6px; cursor: pointer; }
+.ops-legend-item:hover, .ops-legend-item:focus-visible { background: var(--primary-soft); outline: none; }
+.ops-legend-swatch { width: 16px; height: 3px; border-radius: 2px; }
+/* 8 张小图：上排 4 张占比，下排 4 张速率；窄屏两列。 */
+.ops-trend-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+@media (min-width: 1360px) { .ops-trend-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+.ops-trend-cell { min-width: 0; padding: 10px 10px 4px 12px; border: 1px solid var(--line); border-radius: 10px; }
+.ops-trend-title { color: var(--ink); font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.ops-trend-empty, .ops-chart-pending { display: grid; place-items: center; min-height: 120px; height: 100%; }
+.ops-inline-alert { margin-bottom: 12px; }
+.ops-node-table .ant-table-tbody > tr > td { vertical-align: middle; }
+.ops-server-cell { display: flex; flex-direction: column; min-width: 0; }
+.ops-server-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.ops-server-addr { font-size: 12px; }
+.ops-node-cell { display: inline-flex; align-items: center; gap: 6px; }
+.ops-role-tag { margin-inline-end: 0; }
+.ops-shard-extra { display: flex; align-items: center; gap: 12px; }
+.ops-shard-card.workspace-card > .ant-card-body:empty { display: none; }
+.ops-shard-filter { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; }
 .workspace-card .ant-table-cell .code-pill { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; white-space: nowrap; }
 .table-actions { display: inline-flex; white-space: nowrap; }
 .cell-ellipsis { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
