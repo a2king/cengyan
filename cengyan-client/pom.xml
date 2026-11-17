@@ -55,6 +55,19 @@
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- 端到端导入测试在进程内起一套 Storage 和 Compute。只用于测试，不打进客户端。 -->
+        <dependency>
+            <groupId>io.cengyan</groupId>
+            <artifactId>cengyan-compute</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.cengyan</groupId>
+            <artifactId>cengyan-storage</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

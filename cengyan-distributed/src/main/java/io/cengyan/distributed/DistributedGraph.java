@@ -33,41 +33,91 @@ public final class DistributedGraph {
             return replayTicket(target, ticket, requestId, timeout);
         } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "写请求票据损坏", ex); }
     }
+    /**
+     * 只按 ID 取实体。点先查点目录得到类型，再读这个类型的记录，共两次点读；
+     * 边的 ID 只在边类型内唯一，这里逐个边类型查，返回第一条。知道类型时用带类型的重载。
+     */
     public Entity get(GraphDefinition graph, boolean node, Value id, TransactionEngine.QueryScope scope) {
-        ByteString value = scope.value(storage.get(graph.getId(), EntityCodec.part(node, id, graph), EntityCodec.key(node, id, graph)));
+        if (node) {
+            Entity entry = directory(graph, id, scope);
+            return entry == null ? null : get(graph, true, entry.getType(), id, scope);
+        }
+        for (TypeDefinition type : graph.getTypesList()) {
+            if (type.getNode()) continue;
+            Entity edge = get(graph, false, type.getName(), id, scope);
+            if (edge != null) return edge;
+        }
+        return null;
+    }
+    /** 已知类型，一次点读。图里没有这个类型，或这个类型下没有这个 ID 时返回 null。 */
+    public Entity get(GraphDefinition graph, boolean node, String type, Value id, TransactionEngine.QueryScope scope) {
+        if (EntityCodec.type(graph, node, type) == null) return null;
+        ByteString value = scope.value(storage.get(graph.getId(), EntityCodec.part(node, id, graph), EntityCodec.key(node, type, id, graph)));
         return value == null ? null : EntityCodec.entity(value);
     }
+    /** 点目录里的记录：这个 ID 属于哪个点类型、是否正在删除。ID 不存在时返回 null。 */
+    public Entity directory(GraphDefinition graph, Value id, TransactionEngine.QueryScope scope) {
+        ByteString value = scope.value(storage.get(graph.getId(), EntityCodec.part(true, id, graph), EntityCodec.directoryKey(id, graph)));
+        return value == null ? null : EntityCodec.entity(value);
+    }
+    /** 批量按 ID 取实体，结果保持请求顺序。点每个分片两次批量读：先目录，后数据。 */
     public Map<Value, Entity> getMany(GraphDefinition graph, boolean node, List<Value> ids, TransactionEngine.QueryScope scope) {
+        Map<Value, Entity> result = new LinkedHashMap<>();
+        if (!node) {
+            for (Value id : ids) {
+                Entity edge = get(graph, false, id, scope);
+                if (edge != null) result.put(id, edge);
+            }
+            return result;
+        }
+        Map<Value, Entity> entries = read(graph, true, ids, id -> EntityCodec.directoryKey(id, graph), scope);
+        entries.values().removeIf(entry -> EntityCodec.type(graph, true, entry.getType()) == null);
+        Map<Value, Entity> found = read(graph, true, entries.keySet(), id -> EntityCodec.key(true, entries.get(id).getType(), id, graph), scope);
+        for (Value id : ids) {
+            Entity entity = found.get(id);
+            if (entity != null) result.put(id, entity);
+        }
+        return result;
+    }
+    /** 按分片批量点读。不可见的 ID 不出现在结果里。 */
+    private Map<Value, Entity> read(GraphDefinition graph, boolean node, Collection<Value> ids,
+                                    java.util.function.Function<Value, ByteString> keyOf, TransactionEngine.QueryScope scope) {
         Map<Integer, List<Value>> grouped = new LinkedHashMap<>();
         for (Value id : ids) grouped.computeIfAbsent(EntityCodec.part(node, id, graph), ignored -> new ArrayList<>()).add(id);
         Map<Value, Entity> result = new LinkedHashMap<>();
         for (var partition : grouped.entrySet()) {
-            List<ByteString> keys = partition.getValue().stream().map(id -> EntityCodec.key(node, id, graph)).toList();
+            List<ByteString> keys = partition.getValue().stream().map(keyOf).toList();
             List<ByteString> values = storage.getMany(graph.getId(), partition.getKey(), keys);
             for (int i = 0; i < values.size(); i++) {
                 ByteString visible = scope.value(values.get(i));
-                if (visible != null) {
-                    Entity entity = EntityCodec.entity(visible);
-                    StorageGateway.charge(entity.getSerializedSize() * 3L + 128);
-                    result.put(partition.getValue().get(i), entity);
-                }
+                if (visible == null) continue;
+                Entity entity = EntityCodec.entity(visible);
+                StorageGateway.charge(entity.getSerializedSize() * 3L + 128);
+                result.put(partition.getValue().get(i), entity);
             }
         }
         return result;
     }
+    /** 给了类型就只扫这个类型的键区间；没给类型扫全部点或全部边。图里没有这个类型时返回 null。 */
+    private static ByteString scanPrefix(GraphDefinition graph, boolean node, String type) {
+        if (type == null || type.isBlank()) return EntityCodec.kindPrefix(node, graph);
+        return EntityCodec.type(graph, node, type) == null ? null : EntityCodec.typePrefix(node, type, graph);
+    }
     public List<Entity> scan(GraphDefinition graph, boolean node, String type, TransactionEngine.QueryScope scope) {
+        ByteString prefix = scanPrefix(graph, node, type);
+        if (prefix == null) return List.of();
         List<java.util.function.Supplier<List<Entity>>> scans = new ArrayList<>();
-        ByteString prefix = ByteString.copyFrom(java.nio.ByteBuffer.allocate(9).put(node ? (byte) 16 : (byte) 17).putLong(graph.getGeneration()).array());
         for (int part = 0; part < graph.getPartitions(); part++) {
             int selected = part;
             scans.add(() -> {
             List<Entity> result = new ArrayList<>();
-            storage.stream(graph.getId(), selected, prefix, type, List.of(), page -> {
+            storage.stream(graph.getId(), selected, prefix, "", List.of(), page -> {
                 for (var entry : page.getEntriesList()) {
                     ByteString visible = scope.value(entry.getValue());
                     if (visible != null) {
                         Entity entity = EntityCodec.entity(visible);
-                        if (type == null || type.isBlank() || entity.getType().equals(type)) { StorageGateway.charge(entity.getSerializedSize() * 3L + 128); result.add(entity); }
+                        StorageGateway.charge(entity.getSerializedSize() * 3L + 128);
+                        result.add(entity);
                     }
                 }
             });
@@ -116,19 +166,17 @@ public final class DistributedGraph {
      */
     public void forEachEntity(GraphDefinition graph, boolean node, String type,
                               TransactionEngine.QueryScope scope, java.util.function.Consumer<Entity> consumer) {
-        ByteString prefix = ByteString.copyFrom(java.nio.ByteBuffer.allocate(9)
-                .put(node ? (byte) 16 : (byte) 17).putLong(graph.getGeneration()).array());
+        ByteString prefix = scanPrefix(graph, node, type);
+        if (prefix == null) return;
         for (int part = 0; part < graph.getPartitions(); part++) {
             int selected = part;
-            storage.stream(graph.getId(), selected, prefix, type, List.of(), page -> {
+            storage.stream(graph.getId(), selected, prefix, "", List.of(), page -> {
                 for (var entry : page.getEntriesList()) {
                     ByteString visible = scope.value(entry.getValue());
                     if (visible == null) continue;
                     Entity entity = EntityCodec.entity(visible);
-                    if (type == null || type.isBlank() || entity.getType().equals(type)) {
-                        StorageGateway.charge(entity.getSerializedSize() * 3L + 128);
-                        consumer.accept(entity);
-                    }
+                    StorageGateway.charge(entity.getSerializedSize() * 3L + 128);
+                    consumer.accept(entity);
                 }
             });
         }
@@ -148,7 +196,7 @@ public final class DistributedGraph {
             ByteString owner = scope.value(storage.get(graph.getId(), part, prefix));
             if (owner != null) {
                 try {
-                    Entity entity = get(graph, node, Value.parseFrom(owner), scope);
+                    Entity entity = get(graph, node, type, Value.parseFrom(owner), scope);
                     if (entity != null) result.add(entity);
                 } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "索引实体身份损坏", ex); }
             }
@@ -159,7 +207,7 @@ public final class DistributedGraph {
                 for (var entry : page.getEntriesList()) {
                     ByteString owner = scope.value(entry.getValue());
                     if (owner != null) try {
-                        Entity entity = get(graph, node, Value.parseFrom(owner), scope);
+                        Entity entity = get(graph, node, type, Value.parseFrom(owner), scope);
                         if (entity != null) result.add(entity);
                     } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "索引实体身份损坏", ex); }
                 }
@@ -168,51 +216,58 @@ public final class DistributedGraph {
         }
         return result;
     }
+    /** 指定了边类型就只扫这个类型的邻接前缀；没指定时逐个边类型扫。图里没有这个边类型时没有邻居。 */
+    private static List<String> edgeTypes(GraphDefinition graph, String edgeType) {
+        if (edgeType != null && !edgeType.isBlank()) return EntityCodec.type(graph, false, edgeType) == null ? List.of() : List.of(edgeType);
+        return graph.getTypesList().stream().filter(type -> !type.getNode()).map(TypeDefinition::getName).toList();
+    }
     public List<Entity> neighbors(GraphDefinition graph, Value vertex, boolean out, String edgeType, TransactionEngine.QueryScope scope) {
-        List<Entity> result = new ArrayList<>(); ByteString after = ByteString.EMPTY;
-        String cursor = "";
+        List<Entity> result = new ArrayList<>();
         int part = EntityCodec.part(true, vertex, graph);
-        do {
-            ScanPage page = storage.scan(graph.getId(), part, EntityCodec.adjacencyPrefix(out, vertex, graph), after, 256, cursor);
-            List<Value> edgeIds = new ArrayList<>();
-            for (var entry : page.getEntriesList()) {
-                ByteString visible = scope.value(entry.getValue());
-                if (visible != null) {
-                    Entity hint = EntityCodec.entity(visible);
-                    if (edgeType == null || edgeType.isBlank() || hint.getType().equals(edgeType)) {
-                        edgeIds.add(hint.getId());
-                    }
+        for (String type : edgeTypes(graph, edgeType)) {
+            ByteString prefix = EntityCodec.adjacencyPrefix(out, type, vertex, graph);
+            ByteString after = ByteString.EMPTY;
+            String cursor = "";
+            do {
+                ScanPage page = storage.scan(graph.getId(), part, prefix, after, 256, cursor);
+                List<Value> edgeIds = new ArrayList<>();
+                for (var entry : page.getEntriesList()) {
+                    ByteString visible = scope.value(entry.getValue());
+                    if (visible != null) edgeIds.add(EntityCodec.entity(visible).getId());
                 }
-            }
-            result.addAll(getMany(graph, false, edgeIds, scope).values());
-            if (!page.getMore()) break;
-            after = page.getLastKey();
-            cursor = page.getCursorId();
-        } while (true);
+                result.addAll(read(graph, false, edgeIds, id -> EntityCodec.key(false, type, id, graph), scope).values());
+                if (!page.getMore()) break;
+                after = page.getLastKey();
+                cursor = page.getCursorId();
+            } while (true);
+        }
         return result;
     }
     private List<Entity> deletionPage(GraphDefinition graph, Value vertex, boolean out, int limit) {
         var scope = readScope(graph.getId());
-        ByteString after = ByteString.EMPTY; String cursor = "";
         List<Entity> result = new ArrayList<>();
         int part = EntityCodec.part(true, vertex, graph);
-        try {
-            do {
-                ScanPage page = storage.scan(graph.getId(), part, EntityCodec.adjacencyPrefix(out, vertex, graph), after, limit, cursor);
-                cursor = page.getCursorId();
-                for (var entry : page.getEntriesList()) {
-                    ByteString visible = scope.value(entry.getValue());
-                    if (visible != null) {
-                        Entity hint = EntityCodec.entity(visible);
-                        Entity edge = get(graph, false, hint.getId(), scope);
-                        if (edge != null) result.add(edge);
+        for (String type : edgeTypes(graph, null)) {
+            if (result.size() >= limit) break;
+            ByteString prefix = EntityCodec.adjacencyPrefix(out, type, vertex, graph);
+            ByteString after = ByteString.EMPTY; String cursor = "";
+            try {
+                do {
+                    ScanPage page = storage.scan(graph.getId(), part, prefix, after, limit, cursor);
+                    cursor = page.getCursorId();
+                    for (var entry : page.getEntriesList()) {
+                        ByteString visible = scope.value(entry.getValue());
+                        if (visible != null) {
+                            Entity edge = get(graph, false, type, EntityCodec.entity(visible).getId(), scope);
+                            if (edge != null) result.add(edge);
+                        }
                     }
-                }
-                if (!page.getMore() || result.size() >= limit) break;
-                after = page.getLastKey();
-            } while (true);
-        } finally {
-            if (!cursor.isEmpty()) storage.closeCursor(graph.getId(), part, cursor);
+                    if (!page.getMore() || result.size() >= limit) break;
+                    after = page.getLastKey();
+                } while (true);
+            } finally {
+                if (!cursor.isEmpty()) storage.closeCursor(graph.getId(), part, cursor);
+            }
         }
         return result;
     }
@@ -240,14 +295,20 @@ public final class DistributedGraph {
         // 覆盖按主键点读。版本可见性只点查这些单元格里的事务 id，不扫描全部分片的 __tx/。
         var scope = transactions.new QueryScope(graph.getId());
         Map<ByteString, Entity> expected = new HashMap<>();
-        for (Entity entity : expectedEntities) expected.put(EntityCodec.key(entity.getNode(), entity.getId(), graph), entity);
+        for (Entity entity : expectedEntities) expected.put(EntityCodec.key(entity, graph), entity);
         LinkedHashMap<ByteString, Entity> unique = new LinkedHashMap<>(); long duplicates = 0, skipped = 0;
+        // 本次请求写入的点，按点目录键登记。同一个 ID 不能同时写进两个点类型。
+        Map<ByteString, Entity> nodes = new HashMap<>();
         for (Entity record : input) {
             // 实体代次由服务端确定，客户端不能覆盖已有代次或将旧删除任务套到新实体。
             Entity entity = EntityCodec.validate(record, graph).toBuilder().setIncarnation(requestId).build();
-            ByteString key = EntityCodec.key(entity.getNode(), entity.getId(), graph);
+            ByteString key = EntityCodec.key(entity, graph);
             Entity previous = unique.put(key, entity);
             if (previous != null) { sameStructure(previous, entity); duplicates++; }
+            if (entity.getNode()) {
+                Entity other = nodes.put(EntityCodec.directoryKey(entity.getId(), graph), entity);
+                if (other != null) sameStructure(other, entity);
+            }
         }
         Map<Located, ConditionalMutation> changes = new LinkedHashMap<>();
         Map<Located, ByteString> cells = new HashMap<>(snapshots(graph, unique.values()));
@@ -258,13 +319,13 @@ public final class DistributedGraph {
         for (Entity entity : unique.values()) {
             if (entity.getNode()) continue;
             boolean missing = false;
+            // 端点是否存在、是否正在删除只看点目录，不读点的属性。
             for (Value endpoint : List.of(entity.getSource(), entity.getTarget())) {
-                ByteString endpointKey = EntityCodec.key(true, endpoint, graph);
-                Entity local = unique.get(endpointKey);
+                ByteString endpointKey = EntityCodec.directoryKey(endpoint, graph);
+                Entity local = nodes.get(endpointKey);
                 if (local == null) {
                     Located location = new Located(EntityCodec.part(true, endpoint, graph), endpointKey);
-                    ByteString encoded = cached(graph, cells, location);
-                    ByteString visible = scope.value(encoded);
+                    ByteString visible = scope.value(cached(graph, cells, location));
                     local = visible == null ? null : EntityCodec.entity(visible);
                 }
                 if (local == null) { missing = true; break; }
@@ -276,10 +337,10 @@ public final class DistributedGraph {
             }
             addEntity(graph, entity, scope, changes, expected, cells);
             Entity hint = entity.toBuilder().clearProperties().build();
-            add(graph, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.adjacency(true, entity.getSource(), entity.getId(), graph), hint.toByteString(), false, changes, cells);
-            add(graph, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.adjacency(false, entity.getTarget(), entity.getId(), graph), hint.toByteString(), false, changes, cells);
+            add(graph, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.adjacency(true, entity.getType(), entity.getSource(), entity.getId(), graph), hint.toByteString(), false, changes, cells);
+            add(graph, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.adjacency(false, entity.getType(), entity.getTarget(), entity.getId(), graph), hint.toByteString(), false, changes, cells);
             for (Value endpoint : List.of(entity.getSource(), entity.getTarget())) {
-                Located location = new Located(EntityCodec.part(true, endpoint, graph), EntityCodec.key(true, endpoint, graph));
+                Located location = new Located(EntityCodec.part(true, endpoint, graph), EntityCodec.directoryKey(endpoint, graph));
                 if (!changes.containsKey(location)) {
                     ByteString encoded = cached(graph, cells, location);
                     ByteString visible = scope.value(encoded);
@@ -316,8 +377,11 @@ public final class DistributedGraph {
     }
     private Map<Located, ByteString> snapshots(GraphDefinition graph, Collection<Entity> entities) {
         Map<Integer, List<ByteString>> grouped = new LinkedHashMap<>();
-        for (Entity entity : entities) grouped.computeIfAbsent(EntityCodec.part(entity.getNode(), entity.getId(), graph),
-                ignored -> new ArrayList<>()).add(EntityCodec.key(entity.getNode(), entity.getId(), graph));
+        for (Entity entity : entities) {
+            List<ByteString> keys = grouped.computeIfAbsent(EntityCodec.part(entity.getNode(), entity.getId(), graph), ignored -> new ArrayList<>());
+            keys.add(EntityCodec.key(entity, graph));
+            if (entity.getNode()) keys.add(EntityCodec.directoryKey(entity.getId(), graph));
+        }
         List<java.util.function.Supplier<Map<Located, ByteString>>> reads = new ArrayList<>();
         grouped.forEach((part, keys) -> reads.add(() -> {
             List<ByteString> values = storage.getMany(graph.getId(), part, keys);
@@ -337,8 +401,23 @@ public final class DistributedGraph {
                            Map<Located, ConditionalMutation> changes, Map<ByteString, Entity> expectedEntities,
                            Map<Located, ByteString> snapshots) {
         int entityPart = EntityCodec.part(entity.getNode(), entity.getId(), graph);
-        ByteString entityKey = EntityCodec.key(entity.getNode(), entity.getId(), graph);
+        ByteString entityKey = EntityCodec.key(entity, graph);
         Located locationOfEntity = new Located(entityPart, entityKey);
+        // 点目录保证点的 ID 全图唯一：这个 ID 已经登记给另一个点类型时拒绝写入。
+        Located locationOfDirectory = null;
+        ByteString expectedDirectory = null;
+        Entity registered = null;
+        if (entity.getNode()) {
+            locationOfDirectory = new Located(entityPart, EntityCodec.directoryKey(entity.getId(), graph));
+            expectedDirectory = snapshots.containsKey(locationOfDirectory) ? snapshots.get(locationOfDirectory)
+                    : storage.get(graph.getId(), entityPart, locationOfDirectory.key);
+            ByteString visibleDirectory = scope.value(expectedDirectory);
+            registered = visibleDirectory == null ? null : EntityCodec.entity(visibleDirectory);
+            if (registered != null) {
+                sameStructure(registered, entity);
+                if (registered.getState().equals("DELETING")) throw new ClusterException("NODE_DELETING", "实体正在删除，禁止覆盖");
+            }
+        }
         ByteString expectedEntity = snapshots.containsKey(locationOfEntity) ? snapshots.get(locationOfEntity)
                 : storage.get(graph.getId(), entityPart, entityKey);
         ByteString visibleEntity = scope.value(expectedEntity);
@@ -378,6 +457,13 @@ public final class DistributedGraph {
         var replacement = ConditionalMutation.newBuilder().setKey(entityKey).setExpectedPresent(expectedEntity != null).setValue(entity.toByteString());
         if (expectedEntity != null) replacement.setExpectedCell(expectedEntity);
         changes.put(new Located(entityPart, entityKey), replacement.build());
+        // 新建的点登记进点目录。已有的点只改属性，目录里的类型、状态和代次都没变，不写。
+        if (entity.getNode() && (registered == null || previous == null)) {
+            var entry = ConditionalMutation.newBuilder().setKey(locationOfDirectory.key).setExpectedPresent(expectedDirectory != null)
+                    .setValue(EntityCodec.directoryEntry(entity).toByteString());
+            if (expectedDirectory != null) entry.setExpectedCell(expectedDirectory);
+            changes.put(locationOfDirectory, entry.build());
+        }
     }
 
     public GraphDefinition createUniqueIndex(String requestId, String graphName, IndexDefinition index) {
@@ -662,7 +748,8 @@ public final class DistributedGraph {
             } while (true);
         }
     }
-    public void deleteEdge(String requestId, GraphDefinition graph, Value edgeId, Duration timeout) {
+    /** 边的 ID 只在边类型内唯一，删除时必须给出边类型。 */
+    public void deleteEdge(String requestId, GraphDefinition graph, String type, Value edgeId, Duration timeout) {
         ByteString ticket = storage.get(ticketGraph(graph), ticketPart(graph, requestId), TransactionEngine.text("requests/" + requestId));
         if (ticket != null) {
             try {
@@ -670,17 +757,26 @@ public final class DistributedGraph {
             } catch (com.google.protobuf.InvalidProtocolBufferException ex) { throw new ClusterException("CORRUPT_DATA", "重试票据损坏", ex); }
         }
         var scope = readScope(graph.getId());
-        Entity edge = get(graph, false, edgeId, scope);
+        Entity edge = get(graph, false, type, edgeId, scope);
         if (edge == null) return;
         Map<Located, ConditionalMutation> changes = new LinkedHashMap<>();
-        add(graph, EntityCodec.part(false, edgeId, graph), EntityCodec.key(false, edgeId, graph), ByteString.EMPTY, true, changes);
-        add(graph, EntityCodec.part(true, edge.getSource(), graph), EntityCodec.adjacency(true, edge.getSource(), edgeId, graph), ByteString.EMPTY, true, changes);
-        add(graph, EntityCodec.part(true, edge.getTarget(), graph), EntityCodec.adjacency(false, edge.getTarget(), edgeId, graph), ByteString.EMPTY, true, changes);
+        add(graph, EntityCodec.part(false, edgeId, graph), EntityCodec.key(edge, graph), ByteString.EMPTY, true, changes);
+        add(graph, EntityCodec.part(true, edge.getSource(), graph), EntityCodec.adjacency(true, type, edge.getSource(), edgeId, graph), ByteString.EMPTY, true, changes);
+        add(graph, EntityCodec.part(true, edge.getTarget(), graph), EntityCodec.adjacency(false, type, edge.getTarget(), edgeId, graph), ByteString.EMPTY, true, changes);
         for (IndexDefinition index : graph.getIndexesList()) if (!index.getNode() && index.getTypeName().equals(edge.getType())) {
             ByteString key = EntityCodec.indexEntry(index, edge, graph);
             if (key != null) add(graph, index.getUnique() ? PartitionRouter.partOf(key.toByteArray(), graph.getPartitions()) : EntityCodec.part(false, edgeId, graph), key, ByteString.EMPTY, true, changes);
         }
         commit(requestId, graph, changes, timeout, inputDigest(graph, List.of(edge), false), new BulkResult(1, 0, 0));
+    }
+    /** 点数据和点目录一起标成 DELETING。建边只看点目录，两处必须同时挡住。 */
+    private void markDeleting(String requestId, GraphDefinition graph, Entity node) {
+        Entity deleting = node.toBuilder().setState("DELETING").build();
+        int part = EntityCodec.part(true, node.getId(), graph);
+        Map<Located, ConditionalMutation> changes = new LinkedHashMap<>();
+        add(graph, part, EntityCodec.key(deleting, graph), deleting.toByteString(), false, changes);
+        add(graph, part, EntityCodec.directoryKey(node.getId(), graph), EntityCodec.directoryEntry(deleting).toByteString(), false, changes);
+        commit(requestId, graph, changes, Duration.ofMinutes(5), inputDigest(graph, List.of(deleting), false), new BulkResult(1, 0, 0));
     }
     public void deleteNode(String requestId, GraphDefinition graph, Value vertexId) {
         int part = EntityCodec.part(true, vertexId, graph);
@@ -693,10 +789,7 @@ public final class DistributedGraph {
             // 先落任务再标记节点，崩溃后恢复器可以补齐标记，不能留下无人接管的 DELETING 节点。
             storage.write(graph.getId(), part, StorageGateway.batch("delete.task/" + requestId)
                     .addConditions(StorageGateway.condition(taskKey, null)).addMutations(TransactionEngine.put(taskKey, task.toByteString())).build());
-            Entity deleting = entity.toBuilder().setState("DELETING").build();
-            Map<Located, ConditionalMutation> changes = new LinkedHashMap<>();
-            add(graph, part, EntityCodec.key(true, vertexId, graph), deleting.toByteString(), false, changes);
-            commit(requestId + "_mark", graph, changes, Duration.ofMinutes(5), inputDigest(graph, List.of(deleting), false), new BulkResult(1, 0, 0));
+            markDeleting(requestId + "_mark", graph, entity);
             encoded = task.toByteString();
         }
         try { resumeDelete(DeleteTask.parseFrom(encoded)); }
@@ -722,38 +815,44 @@ public final class DistributedGraph {
                     .addMutations(TransactionEngine.put(key, task.toBuilder().setCompleted(true).build().toByteString())).build());
             return;
         }
-        if (starting != null && !starting.getState().equals("DELETING")) {
-            Entity deleting = starting.toBuilder().setState("DELETING").build();
-            Map<Located, ConditionalMutation> marking = new LinkedHashMap<>();
-            add(graph, part, EntityCodec.key(true, vertex, graph), deleting.toByteString(), false, marking);
-            commit(task.getRequestId() + "_mark", graph, marking, Duration.ofMinutes(5), inputDigest(graph, List.of(deleting), false), new BulkResult(1, 0, 0));
-        }
+        if (starting != null && !starting.getState().equals("DELETING")) markDeleting(task.getRequestId() + "_mark", graph, starting);
         long deleted = task.getEdgesDeleted();
         ByteString taskKey = TransactionEngine.text("__delete/" + task.getRequestId());
         for (;;) {
-        LinkedHashMap<Value, Entity> edges = new LinkedHashMap<>();
-        for (Entity edge : deletionPage(graph, vertex, true, 64)) edges.put(edge.getId(), edge);
-        if (edges.size() < 64) for (Entity edge : deletionPage(graph, vertex, false, 64)) edges.put(edge.getId(), edge);
+        // 边的 ID 只在边类型内唯一，两条不同类型的边可以同号，去重和子请求号都要带上类型。
+        LinkedHashMap<String, Entity> edges = new LinkedHashMap<>();
+        for (Entity edge : deletionPage(graph, vertex, true, 64)) edges.put(edge.getType() + "/" + edge.getId(), edge);
+        if (edges.size() < 64) for (Entity edge : deletionPage(graph, vertex, false, 64)) edges.put(edge.getType() + "/" + edge.getId(), edge);
         if (edges.isEmpty()) break;
         for (Entity edge : edges.values()) {
             String suffix;
-            try { suffix = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(edge.getId().toByteArray())); }
+            try {
+                var digest = java.security.MessageDigest.getInstance("SHA-256");
+                digest.update(edge.getType().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                digest.update((byte) 0);
+                suffix = java.util.HexFormat.of().formatHex(digest.digest(edge.getId().toByteArray()));
+            }
             catch (java.security.NoSuchAlgorithmException ex) { throw new IllegalStateException(ex); }
             String parent = task.getRequestId().length() > 40 ? task.getRequestId().substring(0, 40) : task.getRequestId();
-            deleteEdge(parent + "_" + suffix, graph, edge.getId(), Duration.ofMinutes(5));
+            deleteEdge(parent + "_" + suffix, graph, edge.getType(), edge.getId(), Duration.ofMinutes(5));
             DeleteTask progress = task.toBuilder().setEdgesDeleted(++deleted).build();
             saveDeleteProgress(graph.getId(), part, taskKey, progress);
         }
         }
-        Entity node = get(graph, true, vertex, readScope(graph.getId()));
-        if (node != null) {
+        var scope = readScope(graph.getId());
+        Entity entry = directory(graph, vertex, scope);
+        if (entry != null) {
+            Entity node = get(graph, true, entry.getType(), vertex, scope);
             Map<Located, ConditionalMutation> changes = new LinkedHashMap<>();
-            add(graph, part, EntityCodec.key(true, vertex, graph), ByteString.EMPTY, true, changes);
-            for (IndexDefinition index : graph.getIndexesList()) if (index.getNode() && index.getTypeName().equals(node.getType())) {
-                ByteString key = EntityCodec.indexEntry(index, node, graph);
-                if (key != null) add(graph, index.getUnique() ? PartitionRouter.partOf(key.toByteArray(), graph.getPartitions()) : part, key, ByteString.EMPTY, true, changes);
+            add(graph, part, EntityCodec.directoryKey(vertex, graph), ByteString.EMPTY, true, changes);
+            if (node != null) {
+                add(graph, part, EntityCodec.key(node, graph), ByteString.EMPTY, true, changes);
+                for (IndexDefinition index : graph.getIndexesList()) if (index.getNode() && index.getTypeName().equals(node.getType())) {
+                    ByteString key = EntityCodec.indexEntry(index, node, graph);
+                    if (key != null) add(graph, index.getUnique() ? PartitionRouter.partOf(key.toByteArray(), graph.getPartitions()) : part, key, ByteString.EMPTY, true, changes);
+                }
             }
-            commit(task.getRequestId() + "_finish", graph, changes, Duration.ofMinutes(5), inputDigest(graph, List.of(node), false), new BulkResult(1, 0, 0));
+            commit(task.getRequestId() + "_finish", graph, changes, Duration.ofMinutes(5), inputDigest(graph, List.of(node == null ? entry : node), false), new BulkResult(1, 0, 0));
         }
         saveDeleteProgress(graph.getId(), part, taskKey, task.toBuilder().setCompleted(true).setEdgesDeleted(deleted).build());
     }
@@ -802,8 +901,8 @@ public final class DistributedGraph {
             addEntity(target, entity, scope, changes);
             if (!entity.getNode()) {
                 Entity hint = entity.toBuilder().clearProperties().build();
-                add(target, EntityCodec.part(true, entity.getSource(), target), EntityCodec.adjacency(true, entity.getSource(), entity.getId(), target), hint.toByteString(), false, changes);
-                add(target, EntityCodec.part(true, entity.getTarget(), target), EntityCodec.adjacency(false, entity.getTarget(), entity.getId(), target), hint.toByteString(), false, changes);
+                add(target, EntityCodec.part(true, entity.getSource(), target), EntityCodec.adjacency(true, entity.getType(), entity.getSource(), entity.getId(), target), hint.toByteString(), false, changes);
+                add(target, EntityCodec.part(true, entity.getTarget(), target), EntityCodec.adjacency(false, entity.getType(), entity.getTarget(), entity.getId(), target), hint.toByteString(), false, changes);
             }
         }
         if (changes.isEmpty()) return;
@@ -846,11 +945,11 @@ public final class DistributedGraph {
         Map<Integer, List<ByteString>> grouped = new LinkedHashMap<>();
         for (Entity entity : entities) {
             if (entity.getNode()) continue;
-            remember(graph, cells, grouped, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.key(true, entity.getSource(), graph));
-            remember(graph, cells, grouped, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.key(true, entity.getTarget(), graph));
-            remember(graph, cells, grouped, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.adjacency(true, entity.getSource(), entity.getId(), graph));
-            remember(graph, cells, grouped, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.adjacency(false, entity.getTarget(), entity.getId(), graph));
-            remember(graph, cells, grouped, EntityCodec.part(false, entity.getId(), graph), EntityCodec.key(false, entity.getId(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.directoryKey(entity.getSource(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.directoryKey(entity.getTarget(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(true, entity.getSource(), graph), EntityCodec.adjacency(true, entity.getType(), entity.getSource(), entity.getId(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(true, entity.getTarget(), graph), EntityCodec.adjacency(false, entity.getType(), entity.getTarget(), entity.getId(), graph));
+            remember(graph, cells, grouped, EntityCodec.part(false, entity.getId(), graph), EntityCodec.key(entity, graph));
         }
         if (grouped.isEmpty()) return;
         List<java.util.function.Supplier<Map<Located, ByteString>>> reads = new ArrayList<>();

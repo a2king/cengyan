@@ -543,8 +543,7 @@ public final class ComputeServer implements AutoCloseable {
                     IdType.valueOf(request.path("vertexIdType").asText("INT64")), IdType.valueOf(request.path("edgeIdType").asText("INT64")));
             return ok().put("graphId", definition.getId()).put("rowsAffected", 1);
         }
-        if (op.equals("importPlan") || op.equals("importStage") || op.equals("importCommit") || op.equals("importStatus")
-                || op.equals("importRecover") || op.equals("importHeartbeat") || op.equals("importFinish")) {
+        if (op.startsWith("import")) {
             return new BulkImport(storage, catalog, graph).handle(request);
         }
         if (op.equals("bulkTopology")) return bulkTopology(graphName);

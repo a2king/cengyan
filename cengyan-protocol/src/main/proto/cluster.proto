@@ -76,8 +76,10 @@ message WriteBatch {
   repeated string purge_request_ids = 5;
   uint64 purge_before_ms = 6;
   uint64 controller_epoch = 7;
-  // 行数据在副本本地的 SST 里。日志只记录校验和，重放时按校验和跳过已摄入的文件。
-  ImportDirective import_file = 8;
+  reserved 8;
+  // 批量导入发布。行数据在各副本本地已经归并好的 SST 里，日志只带会话、类型和上传段清单；
+  // 重放时按会话标记跳过已经发布的导入。
+  ImportPublish import_publish = 11;
   // 索引的独立 Column Family。值是逻辑索引键前缀 [32][generation][len][indexId]，
   // Column Family 名称由状态机按 indexId 算出，客户端不能指定任意名称。
   // 创建通过 Raft 复制，副本启动时不会自行创建。
@@ -91,11 +93,23 @@ enum ImportConflict {
   IMPORT_REPLACE = 2;
   IMPORT_ERROR = 3;
 }
-message ImportDirective {
-  bytes checksum = 1;
-  ImportConflict conflict = 2;
-  bool undo = 3;
-  uint64 generation = 4;
+// 一次导入会话在一个分片上的发布：一个点类型或一个边类型的全部上传段一次性生效。
+message ImportPublish {
+  string session_id = 1;
+  bool node = 2;
+  uint32 type_id = 3;
+  string type_name = 4;
+  uint64 generation = 5;
+  ImportConflict conflict = 6;
+  // 全部上传段的 SHA-256，按上传顺序。同一个主键出现在多个段里时，按这个顺序决定保留哪一条。
+  repeated bytes runs = 7;
+}
+// 让副本在后台把上传段归并成互不重叠的 SST。不读写分片库，不经过 Raft。
+message ImportPrepare { uint64 graph_id = 1; uint32 part_id = 2; ImportPublish publish = 3; }
+// 归并结果。code 不是 OK 时没有产出文件，发布会返回同样的错误。
+message ImportPrepared {
+  string code = 1; string message = 2;
+  uint64 rows = 3; uint64 primaries = 4; uint64 duplicates = 5; uint64 bytes = 6;
 }
 message ImportChunk {
   bytes checksum = 1;
@@ -106,7 +120,8 @@ message ImportChunk {
   uint64 graph_id = 6;
   uint32 part_id = 7;
 }
-message ImportHeartbeat { string session_id = 1; }
+// abort 只在结束导入时有意义：客户端在发布之前就放弃了，副本可以连归并结果一起删掉。
+message ImportHeartbeat { string session_id = 1; bool abort = 2; }
 message ReadKey {
   bytes key = 1;
   bool scan = 2;
@@ -138,7 +153,8 @@ message PropertyEquals { string property = 1; Value expected = 2; }
 message KeyValue { bytes key = 1; bytes value = 2; }
 message ScanPage { repeated KeyValue entries = 1; bytes last_key = 2; bool more = 3; string cursor_id = 4; }
 message StoredValue { bool found = 1; bytes value = 2; }
-message BatchResult { string code = 1; string message = 2; uint64 affected = 3; }
+// skipped / replaced 只有批量导入发布会填：被跳过的主键数、覆盖掉的已有主键数。
+message BatchResult { string code = 1; string message = 2; uint64 affected = 3; uint64 skipped = 4; uint64 replaced = 5; }
 message IdempotencyRecord { bytes digest = 1; BatchResult result = 2; uint64 expires_at_ms = 3; }
 message DataGroupSpec { uint64 graph_id = 1; uint32 part_id = 2; repeated Node members = 3; repeated Node learners = 4; string control_task_id = 5; string data_mode = 6; }
 // Rebuild-only data replicas. Metadata holds decisions/identities, never the data command body.

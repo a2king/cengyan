@@ -137,6 +137,7 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
                 number(p, "transaction_recovery_interval_ms", 60_000));
         io.cengyan.distributed.TransactionEngine.setPlanMaxBytes(Math.toIntExact(number(p, "transaction_plan_max_bytes",
                 io.cengyan.distributed.TransactionEngine.DEFAULT_PLAN_MAX_BYTES)));
+        io.cengyan.raft.RocksTuning.install(tuning(p));
         Properties operations = new Properties();
         String dataMode = p.getProperty("data_storage_mode", "raft").trim();
         if (dataMode.equals("rebuild") || dataMode.equals("replicated")) throw new IOException("rebuild 数据模式已移除。请改为 data_storage_mode=raft，清空数据目录后重新建图导入");
@@ -153,6 +154,20 @@ public record StorageConfig(String clusterId, String nodeId, InetSocketAddress r
             try (var output = Files.newBufferedWriter(config.directory.resolve("operations.properties"))) { operations.store(output, "Cengyan background limits"); }
         }
         return config;
+    }
+
+    /** RocksDB 共享资源。没有写出的项按本机内存和核数取值；压实写入限速没有写出时不限速。 */
+    private static io.cengyan.raft.RocksTuning tuning(Properties p) {
+        long memory = Runtime.getRuntime().maxMemory() * 4;
+        if (java.lang.management.ManagementFactory.getOperatingSystemMXBean() instanceof com.sun.management.OperatingSystemMXBean os) {
+            memory = os.getTotalMemorySize();
+        }
+        var auto = io.cengyan.raft.RocksTuning.forMachine(memory, Runtime.getRuntime().availableProcessors(), 0);
+        return new io.cengyan.raft.RocksTuning(number(p, "rocksdb_block_cache_bytes", auto.blockCacheBytes()),
+                number(p, "rocksdb_write_buffer_bytes", auto.writeBufferBytes()),
+                Math.toIntExact(number(p, "rocksdb_background_jobs", auto.backgroundJobs())),
+                Math.toIntExact(number(p, "rocksdb_subcompactions", auto.subcompactions())),
+                number(p, "rocksdb_rate_limit_bytes_per_second", 0));
     }
 
     private static String required(Properties p, String key) {

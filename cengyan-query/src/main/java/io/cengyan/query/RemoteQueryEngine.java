@@ -319,12 +319,12 @@ public final class RemoteQueryEngine {
             LinkedHashMap<String, Entity> deletions = new LinkedHashMap<>();
             LinkedHashMap<String, Entity> expected = new LinkedHashMap<>();
             for (var row : rows) {
-                row.values().forEach(entity -> { if (!scalarValues.containsKey(entity)) expected.put(entity.getNode() + "/" + entity.getId(), entity); });
+                row.values().forEach(entity -> { if (!scalarValues.containsKey(entity)) expected.put(identity(entity), entity); });
                 slots(eval, row);
                 for (Stmt.Assign assignment : mutate.assignments()) {
                     Entity entity = row.get(assignment.variable());
                     if (entity == null || assignment.field().equals("id")) throw new ClusterException("INVALID_ARGUMENT", "不能修改 ID 或未绑定实体");
-                    String key = entity.getNode() + "/" + entity.getId();
+                    String key = identity(entity);
                     changes.put(key, changes.getOrDefault(key, entity).toBuilder().putProperties(assignment.field(), EntityCodec.value(eval.eval(assignment.value()))).build());
                 }
                 for (Stmt.Assign replacement : mutate.replacements()) {
@@ -334,19 +334,19 @@ public final class RemoteQueryEngine {
                     if (!(value instanceof Map<?, ?> properties)) throw new ClusterException("TYPE_MISMATCH", "完整属性替换必须使用属性 Map");
                     var changed = entity.toBuilder().clearProperties();
                     properties.forEach((key, property) -> changed.putProperties(String.valueOf(key), EntityCodec.value(property)));
-                    changes.put(entity.getNode() + "/" + entity.getId(), changed.build());
+                    changes.put(identity(entity), changed.build());
                 }
                 for (String removal : mutate.removals()) {
                     int dot = removal.indexOf('.');
                     if (dot < 1) throw new ClusterException("UNSUPPORTED", "REMOVE 仅支持实体属性");
                     Entity entity = row.get(removal.substring(0, dot));
                     if (entity == null) throw new ClusterException("INVALID_ARGUMENT", "REMOVE 未绑定实体");
-                    String key = entity.getNode() + "/" + entity.getId();
+                    String key = identity(entity);
                     changes.put(key, changes.getOrDefault(key, entity).toBuilder().removeProperties(removal.substring(dot + 1)).build());
                 }
                 for (String variable : mutate.deletes()) {
                     Entity entity = row.get(variable);
-                    if (entity != null) deletions.put(entity.getNode() + "/" + entity.getId(), entity);
+                    if (entity != null) deletions.put(identity(entity), entity);
                 }
             }
             if (!changes.isEmpty() && !deletions.isEmpty()) throw new ClusterException("UNSUPPORTED", "第一版同一请求不能混合属性更新与级联删除");
@@ -362,7 +362,7 @@ public final class RemoteQueryEngine {
                 for (var assignment : set.assignments()) {
                     Entity entity = row.get(assignment.variable());
                     if (entity == null || assignment.field().equals("id")) throw new ClusterException("INVALID_ARGUMENT", "不能修改实体 ID 或未绑定实体");
-                    String key = entity.getNode() + "/" + entity.getId();
+                    String key = identity(entity);
                     expected.putIfAbsent(key, entity);
                     Entity old = updates.getOrDefault(key, entity);
                     updates.put(key, old.toBuilder().putProperties(assignment.field(), EntityCodec.value(eval.eval(assignment.value()))).build());
@@ -375,7 +375,7 @@ public final class RemoteQueryEngine {
             LinkedHashMap<String, Entity> entities = new LinkedHashMap<>();
             for (var row : rows) for (String variable : delete.variables()) {
                 Entity entity = row.get(variable);
-                if (entity != null) entities.put(entity.getNode() + "/" + entity.getId(), entity);
+                if (entity != null) entities.put(identity(entity), entity);
             }
             return freezeWritePlan(requestId, graphName, List.of(), new ArrayList<>(entities.values()), new ArrayList<>(entities.values()));
         }
@@ -403,7 +403,7 @@ public final class RemoteQueryEngine {
             for (Entity entity : plan.getDeletesList()) {
                 String sub = requestId.substring(0, Math.min(105, requestId.length())) + "_d" + sequence++;
                 if (entity.getNode()) data.deleteNode(sub, graph, entity.getId());
-                else data.deleteEdge(sub, graph, entity.getId(), Duration.ofMinutes(5));
+                else data.deleteEdge(sub, graph, entity.getType(), entity.getId(), Duration.ofMinutes(5));
             }
             var key = TransactionEngine.text("gql/plan/" + requestId);
             try { storage.write(0, 0, StorageGateway.batch("gql.complete/" + requestId).addConditions(StorageGateway.condition(key, plan.toByteString()))
@@ -564,7 +564,7 @@ public final class RemoteQueryEngine {
         List<Entity> starts;
         if (sourceId == null) starts = data.scan(graph, true, source.typeName(), queryScope);
         else {
-            Entity entity = data.get(graph, true, EntityCodec.value(sourceId), queryScope);
+            Entity entity = node(graph, source.typeName(), EntityCodec.value(sourceId), queryScope);
             starts = entity == null ? List.of() : List.of(entity);
         }
         int min = rel.edge().minHop() == null ? 1 : rel.edge().minHop();
@@ -631,9 +631,9 @@ public final class RemoteQueryEngine {
         List<Entity> candidates = new ArrayList<>();
         if (pattern.direction() != Stmt.EdgePat.Direction.IN) candidates.addAll(data.neighbors(graph, current.getId(), true, pattern.typeName(), queryScope));
         if (pattern.direction() != Stmt.EdgePat.Direction.OUT) candidates.addAll(data.neighbors(graph, current.getId(), false, pattern.typeName(), queryScope));
-        Set<Value> seen = new HashSet<>();
+        Set<String> seen = new HashSet<>();
         for (Entity edge : candidates) {
-            if (!seen.add(edge.getId()) || mode.equalsIgnoreCase("TRAIL") && edges.stream().anyMatch(existing -> existing.getId().equals(edge.getId()))) continue;
+            if (!seen.add(identity(edge)) || mode.equalsIgnoreCase("TRAIL") && edges.stream().anyMatch(existing -> identity(existing).equals(identity(edge)))) continue;
             Value id = edge.getSource().equals(current.getId()) ? edge.getTarget() : edge.getSource();
             boolean repeated = vertices.stream().anyMatch(vertex -> vertex.getId().equals(id));
             if (repeated && mode.equalsIgnoreCase("ACYCLIC")) continue;
@@ -680,7 +680,7 @@ public final class RemoteQueryEngine {
         Object id = property(source.properties(), "id", eval);
         List<Entity> starts;
         if (id != null) {
-            Entity found = data.get(graph, true, EntityCodec.value(id), scope);
+            Entity found = node(graph, source.typeName(), EntityCodec.value(id), scope);
             starts = found == null ? List.of() : List.of(found);
         } else {
             Map<String, Value> filters = new HashMap<>();
@@ -707,11 +707,11 @@ public final class RemoteQueryEngine {
             List<Entity> edges = new ArrayList<>();
             if (edge.direction() != Stmt.EdgePat.Direction.IN) edges.addAll(data.neighbors(graph, node.getId(), true, edge.typeName(), scope));
             if (edge.direction() != Stmt.EdgePat.Direction.OUT) edges.addAll(data.neighbors(graph, node.getId(), false, edge.typeName(), scope));
-            Set<Value> seen = new HashSet<>();
+            Set<String> seen = new HashSet<>();
             for (Entity relation : edges) {
-                if (!seen.add(relation.getId())) continue;
+                if (!seen.add(identity(relation))) continue;
                 Value otherId = relation.getSource().equals(node.getId()) ? relation.getTarget() : relation.getSource();
-                Entity other = data.get(graph, true, otherId, scope);
+                Entity other = node(graph, target.typeName(), otherId, scope);
                 if (other == null) continue;
                 var joined = new LinkedHashMap<>(row);
                 if (edge.variable() != null) joined.put(edge.variable(), relation);
@@ -732,7 +732,7 @@ public final class RemoteQueryEngine {
 
     private void expand(GraphDefinition graph, Entity start, Entity current, Map<String, Entity> initial, Stmt.EdgePat edge,
                          Stmt.NodePat target, Expr where, ExprEval eval, TransactionEngine.QueryScope scope,
-                         BooleanSupplier canceled, int hop, int min, int max, Set<Value> usedEdges, Set<Value> visited, String mode, List<Map<String, Entity>> result) {
+                         BooleanSupplier canceled, int hop, int min, int max, Set<String> usedEdges, Set<Value> visited, String mode, List<Map<String, Entity>> result) {
         check(canceled);
         if (result.size() > 100000) throw new ClusterException("PATH_LIMIT", "路径展开结果超过安全上限");
         if (hop >= min) {
@@ -747,10 +747,10 @@ public final class RemoteQueryEngine {
         List<Entity> edges = new ArrayList<>();
         if (edge.direction() != Stmt.EdgePat.Direction.IN) edges.addAll(data.neighbors(graph, current.getId(), true, edge.typeName(), scope));
         if (edge.direction() != Stmt.EdgePat.Direction.OUT) edges.addAll(data.neighbors(graph, current.getId(), false, edge.typeName(), scope));
-        Set<Value> seen = new HashSet<>();
+        Set<String> seen = new HashSet<>();
         for (Entity relation : edges) {
-            if (!seen.add(relation.getId())) continue;
-            if (mode.equalsIgnoreCase("TRAIL") && usedEdges.contains(relation.getId())) continue;
+            if (!seen.add(identity(relation))) continue;
+            if (mode.equalsIgnoreCase("TRAIL") && usedEdges.contains(identity(relation))) continue;
             Value next = relation.getSource().equals(current.getId()) ? relation.getTarget() : relation.getSource();
             boolean repeated = visited.contains(next);
             boolean closeStart = mode.equalsIgnoreCase("SIMPLE") && next.equals(start.getId());
@@ -766,9 +766,9 @@ public final class RemoteQueryEngine {
                 if (!eval.sameValue(value, eval.eval(property.value()))) valid = false;
             }
             if (valid) {
-                boolean newEdge = usedEdges.add(relation.getId()), newVertex = visited.add(next);
+                boolean newEdge = usedEdges.add(identity(relation)), newVertex = visited.add(next);
                 expand(graph, start, other, bound, edge, target, where, eval, scope, canceled, hop + 1, min, closeStart ? hop + 1 : max, usedEdges, visited, mode, result);
-                if (newEdge) usedEdges.remove(relation.getId());
+                if (newEdge) usedEdges.remove(identity(relation));
                 if (newVertex) visited.remove(next);
             }
         }
@@ -836,6 +836,14 @@ public final class RemoteQueryEngine {
         var entity = Entity.newBuilder().setNode(true).setType(pattern.typeName()).setId(EntityCodec.value(id));
         for (var prop : pattern.properties()) if (!prop.name().equals("id")) entity.putProperties(prop.name(), EntityCodec.value(eval.eval(prop.value())));
         entities.add(entity.build());
+    }
+    /** 点的 ID 全图唯一；边的 ID 只在边类型内唯一，边的身份要带上类型。 */
+    private static String identity(Entity entity) {
+        return entity.getNode() ? "true/" + entity.getId() : "false/" + entity.getType() + "/" + entity.getId();
+    }
+    /** 模式里写了标签就直接读这个类型的记录，一次点读；没写标签先查点目录。 */
+    private Entity node(GraphDefinition graph, String typeName, Value id, TransactionEngine.QueryScope scope) {
+        return typeName == null || typeName.isBlank() ? data.get(graph, true, id, scope) : data.get(graph, true, typeName, id, scope);
     }
     private static Object property(List<Stmt.Prop> properties, String field, ExprEval eval) {
         for (var prop : properties) if (prop.name().equals(field)) return eval.eval(prop.value());

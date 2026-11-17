@@ -47,6 +47,12 @@ public final class StorageServer implements AutoCloseable {
     private final ThreadPoolExecutor writeParticipants;
     private final ThreadPoolExecutor dataRequests;
     private final ThreadPoolExecutor replicaRequests;
+    /** Metadata 的读写只是把请求交给 Raft，很快返回。单独一个池，不排在导入、监控这类慢请求后面。 */
+    private final ThreadPoolExecutor metadataRequests;
+    /** 导入分块、归并和会话请求。归并会跑很久，不能占用 Metadata 或业务读写的线程。 */
+    private final ThreadPoolExecutor importRequests;
+    /** 监控采集。 */
+    private final ThreadPoolExecutor opsRequests;
     private final TokenAuthority authority;
     private final ReplicaController replicaController;
     private DroppedGraphCleanup dropCleanup;
@@ -97,6 +103,9 @@ public final class StorageServer implements AutoCloseable {
         writeParticipants = writePool(config.writeThreads(), "storage-write-participant");
         dataRequests = writePool(config.writeThreads(), "storage-data-request");
         replicaRequests = writePool(config.writeThreads(), "storage-replica-request");
+        metadataRequests = writePool(Math.max(8, config.admissionThreads()), "storage-metadata-request");
+        importRequests = writePool(Math.max(4, Runtime.getRuntime().availableProcessors()), "storage-import-request");
+        opsRequests = writePool(2, "storage-ops-request");
         transactions = new TransactionEngine(gateway, writeParticipants);
         authority = new TokenAuthority(gateway);
         replicaController = new ReplicaController(gateway);
@@ -172,6 +181,9 @@ public final class StorageServer implements AutoCloseable {
             writeParticipants.shutdownNow();
             dataRequests.shutdownNow();
             replicaRequests.shutdownNow();
+            metadataRequests.shutdownNow();
+            importRequests.shutdownNow();
+            opsRequests.shutdownNow();
             maintenance.shutdownNow();
             joining.shutdownNow();
             if (dropCleanup != null) dropCleanup.close();
@@ -261,13 +273,13 @@ public final class StorageServer implements AutoCloseable {
             CompletableFuture<RpcResponse> pending = new CompletableFuture<>();
             String method = request.getMethod();
             com.google.protobuf.ByteString body = request.getBody();
-            maintenance.execute(() -> {
+            (method.equals("import.finish") ? importRequests : maintenance).execute(() -> {
                 try {
                     if (method.equals("maintenance.flush")) {
                         for (io.cengyan.raft.RocksStateMachine machine : node.importMachines()) machine.flushForRestart();
                     } else {
                         var beat = io.cengyan.protocol.proto.ClusterProtocol.ImportHeartbeat.parseFrom(body);
-                        for (io.cengyan.raft.RocksStateMachine machine : node.importMachines()) machine.finishImport(beat.getSessionId());
+                        for (io.cengyan.raft.RocksStateMachine machine : node.importMachines()) machine.finishImport(beat.getSessionId(), beat.getAbort());
                     }
                     pending.complete(response("OK", "", com.google.protobuf.ByteString.EMPTY));
                 } catch (Exception ex) {
@@ -287,10 +299,7 @@ public final class StorageServer implements AutoCloseable {
         }
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout);
         try {
-            (inbound.getMethod().equals("tx.execute") ? writers
-                    : inbound.getContext().getGraphId() > 0 && (inbound.getMethod().startsWith("kv.") || inbound.getMethod().equals("data.status") || inbound.getMethod().equals("import.stage") || inbound.getMethod().equals("import.heartbeat")) ? dataRequests
-                    : inbound.getMethod().startsWith("auth.") || inbound.getMethod().equals("data.configure")
-                    || inbound.getMethod().startsWith("metadata.") || inbound.getMethod().startsWith("schema.") ? coordinators : admission).execute(() -> {
+            pool(inbound).execute(() -> {
                 if (result.isCancelled()) return;
                 if (checkedLease != null) {
                     try {
@@ -480,25 +489,32 @@ public final class StorageServer implements AutoCloseable {
                         result.complete(response("OK", "", ByteString.EMPTY));
                         return;
                     }
+                    if (inbound.getMethod().equals("import.prepare")) {
+                        var prepare = io.cengyan.protocol.proto.ClusterProtocol.ImportPrepare.parseFrom(inbound.getBody());
+                        var division = node.server().getDivision(GroupIds.data(config.clusterId(), prepare.getGraphId(), prepare.getPartId()));
+                        if (!(division.getStateMachine() instanceof RocksStateMachine machine)) {
+                            result.complete(response("GROUP_UNAVAILABLE", "分片状态机不能归并导入文件", ByteString.EMPTY)); return;
+                        }
+                        var prepared = machine.prepareImport(prepare.getPublish());
+                        result.complete(response("OK", "", prepared.toByteString()));
+                        return;
+                    }
                     if (inbound.getMethod().equals("import.status")) {
                         var body = new com.fasterxml.jackson.databind.ObjectMapper().readTree(inbound.getBody().toByteArray());
                         long graphId = body.path("graphId").asLong(inbound.getContext().getGraphId());
                         int partId = body.path("part").asInt(inbound.getContext().getPartId());
-                        String checksumText = body.path("checksum").asText();
-                        if (checksumText.length() != 64) throw new ClusterException("INVALID_ARGUMENT", "导入校验和必须是 64 位十六进制");
-                        byte[] checksum = new byte[32];
-                        for (int i = 0; i < checksum.length; i++) checksum[i] = (byte) Integer.parseInt(checksumText.substring(i * 2, i * 2 + 2), 16);
                         var division = node.server().getDivision(GroupIds.data(config.clusterId(), graphId, partId));
                         if (!(division.getStateMachine() instanceof RocksStateMachine machine)) {
                             result.complete(response("GROUP_UNAVAILABLE", "分片状态机不可用", ByteString.EMPTY)); return;
                         }
-                        var status = machine.importStatus(checksum);
-                        var output = new com.fasterxml.jackson.databind.ObjectMapper().createObjectNode()
+                        var status = machine.importStatus(body.path("sessionId").asText());
+                        var json = new com.fasterxml.jackson.databind.ObjectMapper();
+                        var output = json.createObjectNode()
                                 .put("code", "OK").put("nodeId", config.nodeId()).put("graphId", graphId).put("part", partId)
-                                .put("readyBytes", status.readyBytes()).put("partialBytes", status.partialBytes())
-                                .put("ready", status.ready()).put("applied", status.applied()).put("owner", status.owner() == null ? "" : status.owner());
-                        if (status.result() != null) output.set("result", new com.fasterxml.jackson.databind.ObjectMapper().valueToTree(status.result()));
-                        result.complete(response("OK", "", ByteString.copyFrom(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsBytes(output))));
+                                .put("runs", status.runs()).put("mergedRuns", status.mergedRuns()).put("coveredRuns", status.coveredRuns())
+                                .put("partials", status.partials()).put("bytes", status.bytes()).put("partialBytes", status.partialBytes());
+                        output.set("prepared", json.valueToTree(status.prepared()));
+                        result.complete(response("OK", "", ByteString.copyFrom(json.writeValueAsBytes(output))));
                         return;
                     }
                     if (inbound.getMethod().equals("data.status")) {
@@ -687,7 +703,10 @@ public final class StorageServer implements AutoCloseable {
                 } catch (IllegalArgumentException | com.google.protobuf.InvalidProtocolBufferException ex) {
                     result.complete(response("INVALID_ARGUMENT", "Storage 请求参数无效：" + ex.getMessage(), ByteString.EMPTY));
                 } catch (IOException ex) {
-                    result.complete(response("GROUP_UNAVAILABLE", "分片未就绪或不属于本节点", ByteString.EMPTY));
+                    // 导入的暂存、归并失败原因各不相同（缺上传段、磁盘满、校验和不对），原样返回给客户端。
+                    if (inbound.getMethod().startsWith("import.")) {
+                        result.complete(response("FAILED", ex.getMessage() == null ? ex.toString() : ex.getMessage(), ByteString.EMPTY));
+                    } else result.complete(response("GROUP_UNAVAILABLE", "分片未就绪或不属于本节点", ByteString.EMPTY));
                 } catch (RuntimeException ex) {
                     result.complete(response("FAILED", "Storage 请求失败，提交状态可能未知", ByteString.EMPTY));
                 } catch (Exception ex) {
@@ -698,6 +717,20 @@ public final class StorageServer implements AutoCloseable {
             result.complete(response("BUSY", "Storage 准入队列已满，尚未提交", ByteString.EMPTY));
         }
         return result;
+    }
+
+    /**
+     * 每类请求用自己的线程池，慢请求只会排在同类后面。导入心跳和监控采集曾经和 Metadata 读写共用准入池，
+     * 一旦它们等分片锁，认证和路由查询就跟着超时。
+     */
+    private ThreadPoolExecutor pool(RpcRequest request) {
+        String method = request.getMethod();
+        if (method.equals("tx.execute")) return writers;
+        if (method.startsWith("import.")) return importRequests;
+        if (method.equals("ops.metrics") || method.equals("node.storageSize")) return opsRequests;
+        if (method.startsWith("kv.") || method.equals("data.status")) return request.getContext().getGraphId() > 0 ? dataRequests : metadataRequests;
+        if (method.startsWith("auth.") || method.equals("data.configure") || method.startsWith("metadata.") || method.startsWith("schema.")) return coordinators;
+        return admission;
     }
 
     private com.google.protobuf.ByteString metrics() {
@@ -1067,6 +1100,9 @@ public final class StorageServer implements AutoCloseable {
         writeParticipants.shutdownNow();
         dataRequests.shutdownNow();
         replicaRequests.shutdownNow();
+        metadataRequests.shutdownNow();
+        importRequests.shutdownNow();
+        opsRequests.shutdownNow();
         admission.shutdownNow();
         try {
             maintenance.awaitTermination(10, TimeUnit.SECONDS);
@@ -1079,6 +1115,9 @@ public final class StorageServer implements AutoCloseable {
             writeParticipants.awaitTermination(10, TimeUnit.SECONDS);
             dataRequests.awaitTermination(10, TimeUnit.SECONDS);
             replicaRequests.awaitTermination(10, TimeUnit.SECONDS);
+            metadataRequests.awaitTermination(10, TimeUnit.SECONDS);
+            importRequests.awaitTermination(10, TimeUnit.SECONDS);
+            opsRequests.awaitTermination(10, TimeUnit.SECONDS);
             admission.awaitTermination(10, TimeUnit.SECONDS);
         } catch (InterruptedException ex) { Thread.currentThread().interrupt(); }
         gateway.close();
