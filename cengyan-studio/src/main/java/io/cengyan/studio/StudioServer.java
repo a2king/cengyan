@@ -11,6 +11,8 @@ import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
+import io.cengyan.studio.cluster.ClusterError;
+import io.cengyan.studio.cluster.StudioAuth;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -36,9 +38,16 @@ public final class StudioServer implements AutoCloseable {
     private final int tableMaxNodes;
     private final ComputeOpsClient computeOps;
     private final io.cengyan.studio.cluster.ClusterManager cluster;
+    private final StudioAuth auth;
+    /** 数据库这样回答登录时说明数据库在正常工作，不走 root 本地兜底。 */
+    private static final Set<String> DB_ANSWERED = Set.of("OK", "UNAUTHENTICATED", "FORBIDDEN", "INVALID_ARGUMENT", "SYNTAX");
+    /** 控制台转发的管理命令：运维、节点维护、副本，以及用户管理（权限由 Compute 判断）。 */
+    static final Set<String> ADMIN_COMMANDS = Set.of("stats", "storage", "showMembers", "addReplica", "showNodes",
+            "drainStorage", "removeStorage", "drainCompute", "removeCompute",
+            "listUsers", "createUser", "setRole", "setPassword", "dropUser");
 
     private StudioServer(DbClient db, HttpServer http, ExecutorService workers, int port, int graphMaxNodes, int tableMaxNodes,
-                          ComputeOpsClient computeOps, io.cengyan.studio.cluster.ClusterManager cluster) {
+                          ComputeOpsClient computeOps, io.cengyan.studio.cluster.ClusterManager cluster, StudioAuth auth) {
         this.db = db;
         this.http = http;
         this.workers = workers;
@@ -47,6 +56,7 @@ public final class StudioServer implements AutoCloseable {
         this.tableMaxNodes = tableMaxNodes;
         this.computeOps = computeOps;
         this.cluster = cluster;
+        this.auth = auth;
     }
 
     public static void main(String[] args) throws Exception {
@@ -75,14 +85,17 @@ public final class StudioServer implements AutoCloseable {
         HttpServer http = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
         http.setExecutor(workers);
+        StudioAuth auth = new StudioAuth(cluster, config.home().isBlank() ? null : java.nio.file.Path.of(config.home()).resolve("data"),
+                token -> MAPPER.readTree(db.exchange(MAPPER.createObjectNode().put("op", "session").put("session", token), 3000)));
         StudioServer server = new StudioServer(db, http, workers, http.getAddress().getPort(), config.graphMaxNodes(), config.tableMaxNodes(),
-                new ComputeOpsClient(config.computeHost(), config.computePort(), config.computeUser(), config.computePassword()), cluster);
-        if (cluster != null) new io.cengyan.studio.cluster.ClusterApi(cluster,
-                new io.cengyan.studio.cluster.AdminAuth(java.nio.file.Path.of(config.home()).resolve("data"))).register(http);
+                new ComputeOpsClient(config.computeHost(), config.computePort(), config.computeUser(), config.computePassword()), cluster, auth);
+        if (cluster != null) new io.cengyan.studio.cluster.ClusterApi(cluster, auth).register(http);
         http.createContext("/api/ping", server::ping);
         http.createContext("/api/session", server::session);
         http.createContext("/api/config", server::config);
         http.createContext("/api/login", server::login);
+        http.createContext("/api/logout", server::logout);
+        http.createContext("/api/password", server::password);
         http.createContext("/api/query", server::query);
         http.createContext("/api/queries", server::queries);
         http.createContext("/api/cancel", server::cancel);
@@ -139,10 +152,48 @@ public final class StudioServer implements AutoCloseable {
         if (body == null) {
             return;
         }
+        String token = session(exchange, body);
+        if (auth.isLocal(token)) {
+            // root 本地会话由 Studio 自己回答；过期时与数据库一样返回 UNAUTHENTICATED，前端回到登录页。
+            try {
+                auth.resolve(token);
+                send(exchange, 200, localSession(token));
+            } catch (ClusterError ex) {
+                send(exchange, 200, error("UNAUTHENTICATED", ex.getMessage()));
+            }
+            return;
+        }
         ObjectNode request = MAPPER.createObjectNode();
         request.put("op", "session");
-        request.put("session", session(exchange, body));
+        request.put("session", token);
         forward(exchange, request, 3000);
+    }
+
+    private static ObjectNode localSession(String token) {
+        ObjectNode response = MAPPER.createObjectNode().put("code", "OK").put("session", token)
+                .put("user", StudioAuth.ROOT).put("role", "admin").put("local", true)
+                .put("message", "数据库不可用，当前为 root 本地登录，只能使用集群管理和运维监控");
+        response.set("columns", MAPPER.valueToTree(java.util.List.of("user", "role")));
+        response.set("rows", MAPPER.valueToTree(java.util.List.of(java.util.List.of(StudioAuth.ROOT, "admin"))));
+        return response;
+    }
+
+    /** 运维监控：任何已登录的会话（含 root 本地会话）。失败时已写回响应，返回 false。 */
+    private boolean requireSession(HttpExchange exchange) {
+        try {
+            auth.resolve(exchange.getRequestHeaders().getFirst("X-Cengyan-Session"));
+            return true;
+        } catch (ClusterError ex) {
+            send(exchange, switch (ex.code()) { case "UNAUTHORIZED" -> 401; case "DB_UNAVAILABLE" -> 503; default -> 400; }, error(ex.code(), ex.getMessage()));
+            return false;
+        }
+    }
+
+    /** 本地会话不能访问数据库接口。失败时已写回响应，返回 true。 */
+    private boolean rejectLocal(HttpExchange exchange, String token) {
+        if (!auth.isLocal(token)) return false;
+        send(exchange, 409, error("LOCAL_SESSION", "数据库不可用，当前为 root 本地登录，只能使用集群管理和运维监控；数据库恢复后请重新登录"));
+        return true;
     }
 
     private void opsOverview(HttpExchange exchange) {
@@ -150,6 +201,7 @@ public final class StudioServer implements AutoCloseable {
             send(exchange, 405, error("SYNTAX", "只接受 GET"));
             return;
         }
+        if (!requireSession(exchange)) return;
         try {
             JsonNode response = cluster != null ? cluster.opsOverview() : computeOps.overview(5000);
             int status = "OK".equals(response.path("code").asText()) ? 200 : 502;
@@ -165,6 +217,7 @@ public final class StudioServer implements AutoCloseable {
             send(exchange, 405, error("SYNTAX", "只接受 GET"));
             return;
         }
+        if (!requireSession(exchange)) return;
         if (cluster == null) {
             send(exchange, 404, error("OPS_UNAVAILABLE", "没有托管集群，不记录趋势"));
             return;
@@ -186,6 +239,7 @@ public final class StudioServer implements AutoCloseable {
             send(exchange, 405, error("SYNTAX", "只接受 GET"));
             return;
         }
+        if (!requireSession(exchange)) return;
         if (cluster == null) {
             send(exchange, 404, error("OPS_UNAVAILABLE", "没有托管集群"));
             return;
@@ -198,12 +252,80 @@ public final class StudioServer implements AutoCloseable {
         if (body == null) {
             return;
         }
+        String user = text(body, "user"), password = text(body, "password");
         ObjectNode request = MAPPER.createObjectNode();
         request.put("op", "login");
         request.put("session", text(body, "session"));
-        request.put("user", text(body, "user"));
-        request.put("password", text(body, "password"));
-        forward(exchange, request, 10000);
+        request.put("user", user);
+        request.put("password", password);
+        JsonNode reply = null;
+        String failure = "";
+        try {
+            reply = MAPPER.readTree(db.exchange(request, 10000));
+        } catch (IOException ex) {
+            failure = ex.getMessage();
+        }
+        String code = reply == null ? "UNAVAILABLE" : reply.path("code").asText();
+        if (reply != null && code.equals("OK")) {
+            // root 刚被数据库验证：Studio 保存的 root 密码不同时同步（例如在命令行改过）。
+            if (StudioAuth.ROOT.equals(user)) {
+                try { auth.rootVerified(password); } catch (IOException | RuntimeException ignored) { /* 同步失败不影响登录 */ }
+            }
+            send(exchange, 200, reply);
+            return;
+        }
+        // 数据库能回答（包括密码错误）时直接返回，不走兜底，避免绕过数据库里已经改掉的密码。
+        boolean dbDown = reply == null || !DB_ANSWERED.contains(code);
+        if (dbDown && auth.managed() && auth.initialized() && StudioAuth.ROOT.equals(user)) {
+            try {
+                send(exchange, 200, localSession(auth.loginLocal(user, password)));
+            } catch (ClusterError ex) {
+                send(exchange, 200, error(ex.code().equals("UNAUTHORIZED") ? "UNAUTHENTICATED" : ex.code(), ex.getMessage()));
+            }
+            return;
+        }
+        if (reply == null) send(exchange, 502, error("UNAVAILABLE", "连不上图数据库：" + failure));
+        else send(exchange, 200, reply);
+    }
+
+    private void logout(HttpExchange exchange) {
+        JsonNode body = read(exchange);
+        if (body == null) {
+            return;
+        }
+        String token = session(exchange, body);
+        auth.logout(token);
+        if (!auth.isLocal(token) && !token.isBlank()) {
+            try { db.exchange(MAPPER.createObjectNode().put("op", "logout").put("session", token), 3000); }
+            catch (IOException ignored) { /* 令牌无状态，退出只是让浏览器丢弃它 */ }
+        }
+        send(exchange, 200, MAPPER.createObjectNode().put("code", "OK"));
+    }
+
+    /** 修改自己的密码。root 改成功后同步 Studio 保存的 root 密码。 */
+    private void password(HttpExchange exchange) {
+        JsonNode body = read(exchange);
+        if (body == null) {
+            return;
+        }
+        String token = session(exchange, body), current = text(body, "current"), next = text(body, "password");
+        try {
+            StudioAuth.Principal principal = auth.resolve(token);
+            if (principal.local()) {
+                auth.changeLocal(current, next);
+                send(exchange, 200, MAPPER.createObjectNode().put("code", "OK"));
+                return;
+            }
+            ObjectNode request = MAPPER.createObjectNode().put("op", "admin").put("session", token).put("command", "changePassword")
+                    .put("current", current).put("password", next).put("timeoutMs", 15000);
+            JsonNode reply = MAPPER.readTree(db.exchange(request, 15000));
+            if ("OK".equals(reply.path("code").asText()) && StudioAuth.ROOT.equals(principal.user())) auth.rootVerified(next);
+            send(exchange, 200, reply);
+        } catch (ClusterError ex) {
+            send(exchange, 200, error(ex.code(), ex.getMessage()));
+        } catch (IOException ex) {
+            send(exchange, 502, error("UNAVAILABLE", "连不上图数据库：" + ex.getMessage()));
+        }
     }
 
     private void query(HttpExchange exchange) {
@@ -216,9 +338,13 @@ public final class StudioServer implements AutoCloseable {
             send(exchange, 400, error("SYNTAX", "语句不能为空"));
             return;
         }
+        String token = session(exchange, body);
+        if (rejectLocal(exchange, token)) {
+            return;
+        }
         ObjectNode request = MAPPER.createObjectNode();
         request.put("op", "execute");
-        request.put("session", session(exchange, body));
+        request.put("session", token);
         request.put("query", query);
         request.put("graph", text(body, "graph"));
         request.set("params", body.has("params") && body.get("params").isObject()
@@ -237,9 +363,13 @@ public final class StudioServer implements AutoCloseable {
         if (body == null) {
             return;
         }
+        String token = session(exchange, body);
+        if (rejectLocal(exchange, token)) {
+            return;
+        }
         ObjectNode request = MAPPER.createObjectNode();
         request.put("op", "queries");
-        request.put("session", session(exchange, body));
+        request.put("session", token);
         forward(exchange, request, 10000);
     }
 
@@ -253,9 +383,13 @@ public final class StudioServer implements AutoCloseable {
             send(exchange, 400, error("SYNTAX", "缺少 queryId"));
             return;
         }
+        String token = session(exchange, body);
+        if (rejectLocal(exchange, token)) {
+            return;
+        }
         ObjectNode request = MAPPER.createObjectNode();
         request.put("op", "cancel");
-        request.put("session", session(exchange, body));
+        request.put("session", token);
         request.put("queryId", queryId);
         forward(exchange, request, 10000);
     }
@@ -266,18 +400,24 @@ public final class StudioServer implements AutoCloseable {
             return;
         }
         String command = text(body, "command");
-        if (!Set.of("stats", "storage", "showMembers", "addReplica", "showNodes",
-                "drainStorage", "removeStorage", "drainCompute", "removeCompute").contains(command)) {
-            send(exchange, 400, error("SYNTAX", "控制台只转发 stats、storage、节点维护和索引/副本管理命令"));
+        if (!ADMIN_COMMANDS.contains(command)) {
+            send(exchange, 400, error("SYNTAX", "控制台只转发 stats、storage、节点维护、副本管理和用户管理命令"));
+            return;
+        }
+        String token = session(exchange, body);
+        if (rejectLocal(exchange, token)) {
             return;
         }
         ObjectNode request = MAPPER.createObjectNode();
         request.put("op", "admin");
-        request.put("session", session(exchange, body));
+        request.put("session", token);
         request.put("command", command);
         request.put("index", text(body, "index"));
         request.put("graph", text(body, "graph"));
         request.put("address", text(body, "address"));
+        for (String field : new String[] {"user", "password", "role"}) {
+            if (body.hasNonNull(field)) request.put(field, text(body, field));
+        }
         if (body.hasNonNull("nodeId")) request.put("nodeId", body.path("nodeId").asText());
         JsonNode replicas = body.get("replicas");
         if (replicas != null && replicas.isNumber()) {
@@ -296,6 +436,17 @@ public final class StudioServer implements AutoCloseable {
             return;
         }
         request.put("timeoutMs", timeoutMs);
+        if (command.equals("setPassword") && StudioAuth.ROOT.equals(text(body, "user"))) {
+            // 只有 root 自己能改 root 的密码（Compute 判断）；成功后同步 Studio 保存的 root 密码。
+            try {
+                JsonNode reply = MAPPER.readTree(db.exchange(request, timeoutMs));
+                if ("OK".equals(reply.path("code").asText())) auth.rootVerified(text(body, "password"));
+                send(exchange, 200, reply);
+            } catch (IOException ex) {
+                send(exchange, 502, error("UNAVAILABLE", "连不上图数据库：" + ex.getMessage()));
+            }
+            return;
+        }
         forward(exchange, request, timeoutMs);
     }
 
@@ -306,7 +457,7 @@ public final class StudioServer implements AutoCloseable {
         }
         String path = exchange.getRequestURI().getPath();
         boolean appRoute = switch (path) {
-            case "/", "/index.html", "/graph", "/gql", "/running", "/ops", "/cluster" -> true;
+            case "/", "/index.html", "/graph", "/gql", "/running", "/ops", "/cluster", "/users" -> true;
             default -> false;
         };
         String resource = appRoute ? "studio/index.html" : switch (path) {

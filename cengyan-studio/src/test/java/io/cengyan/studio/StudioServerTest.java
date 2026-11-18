@@ -157,7 +157,7 @@ class StudioServerTest {
     @Test
     void admin只转发白名单() throws Exception {
         try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", 1))) {
-            for (String command : new String[] {"createUser", "dropUser", "compact", "flush", "setRole", "addStorage", "addCompute", "rebuildIndex"}) {
+            for (String command : new String[] {"compact", "flush", "addStorage", "addCompute", "rebuildIndex", "maintenanceEnter", "forceDropGraph"}) {
                 HttpResponse<String> response = post(studio.port(), "/api/admin",
                         "{\"command\":\"" + command + "\"}", "s1");
                 assertEquals(400, response.statusCode(), command);
@@ -165,6 +165,51 @@ class StudioServerTest {
                 assertEquals("SYNTAX", body.get("code").asText());
                 assertTrue(body.get("message").asText().contains("stats"));
             }
+        }
+    }
+
+    @Test
+    void 用户管理命令转发用户名密码和角色() throws Exception {
+        try (FakeDb db = new FakeDb(request -> "{\"code\":\"OK\"}");
+             StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", db.port()))) {
+            for (String command : new String[] {"listUsers", "createUser", "setRole", "setPassword", "dropUser"}) {
+                HttpResponse<String> response = post(studio.port(), "/api/admin",
+                        "{\"command\":\"" + command + "\",\"user\":\"alice\",\"password\":\"alice-secret\",\"role\":\"write\"}", "s1");
+                assertEquals(200, response.statusCode(), command);
+            }
+            JsonNode created = db.seen.get(1);
+            assertEquals("createUser", created.path("command").asText());
+            assertEquals("alice", created.path("user").asText());
+            assertEquals("alice-secret", created.path("password").asText());
+            assertEquals("write", created.path("role").asText());
+            assertEquals("s1", created.path("session").asText());
+        }
+    }
+
+    @Test
+    void 改自己的密码转发changePassword() throws Exception {
+        try (FakeDb db = new FakeDb(request -> request.path("op").asText().equals("session")
+                ? "{\"code\":\"OK\",\"user\":\"alice\",\"role\":\"write\"}" : "{\"code\":\"OK\"}");
+             StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", db.port()))) {
+            HttpResponse<String> response = post(studio.port(), "/api/password", "{\"current\":\"old-secret\",\"password\":\"new-secret\"}", "s1");
+            assertEquals("OK", MAPPER.readTree(response.body()).path("code").asText(), response.body());
+            JsonNode sent = db.seen.get(db.seen.size() - 1);
+            assertEquals("changePassword", sent.path("command").asText());
+            assertEquals("old-secret", sent.path("current").asText());
+            assertEquals("new-secret", sent.path("password").asText());
+        }
+    }
+
+    @Test
+    void 非托管模式数据库不可用时不兜底() throws Exception {
+        int closed;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            closed = socket.getLocalPort();
+        }
+        try (StudioServer studio = StudioServer.start(new StudioConfig(0, "127.0.0.1", closed))) {
+            HttpResponse<String> response = post(studio.port(), "/api/login", "{\"user\":\"root\",\"password\":\"cengyan\"}", "");
+            assertEquals(502, response.statusCode());
+            assertEquals("UNAVAILABLE", MAPPER.readTree(response.body()).get("code").asText());
         }
     }
 
@@ -358,7 +403,7 @@ class StudioServerTest {
             assertTrue(js.contains("function canWrite("));
             assertTrue(js.contains("用户权限"));
             assertTrue(js.contains("输入 ") && js.contains(" 确认"));
-            assertFalse(js.contains("createUser"));
+            assertTrue(js.contains("listUsers"), "用户管理页已打包");
             assertFalse(js.contains("CREATE ALIAS"));
         }
     }

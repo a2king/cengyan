@@ -1,9 +1,18 @@
-export type Role = 'read' | 'write' | string;
+export type Role = 'read' | 'write' | 'admin' | string;
 
 export interface SessionInfo {
   session: string;
   user: string;
   role: Role;
+  /** 数据库不可用时 root 在 Studio 本地兜底登录：只能用集群管理和运维监控。 */
+  local?: boolean;
+}
+
+export interface UserRow {
+  user: string;
+  role: Role;
+  /** 只用来标出旧版本 dropUser 留下的停用用户。 */
+  enabled: boolean;
 }
 
 export interface QueryResponse {
@@ -16,6 +25,10 @@ export interface QueryResponse {
   queryId?: string;
   collectedAt?: number;
   elapsedMs?: number;
+  /** root 本地会话（登录、会话检查的响应）。 */
+  local?: boolean;
+  user?: string;
+  role?: string;
 }
 
 export interface StudioConfig {

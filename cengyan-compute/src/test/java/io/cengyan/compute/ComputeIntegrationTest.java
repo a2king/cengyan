@@ -134,6 +134,7 @@ class ComputeIntegrationTest {
             assertEquals("FORBIDDEN", forbidden.path("code").asText(), forbidden.toString());
             ok(call(writer, reader, request(token, "admin").put("command", "setRole").put("user", "reader").put("role", "write")));
             assertEquals("UNAUTHENTICATED", call(writer, reader, query(readerToken, "SHOW GRAPHS")).path("code").asText());
+            userManagement(writer, reader, token);
             ok(call(writer, reader, request(token, "createGraph").put("name", "LargeBulk").put("partitions", 32)
                     .put("vertexIdType", "STRING").put("edgeIdType", "STRING")));
             ok(call(writer, reader, query(token, "CREATE NODE TYPE N ID STRING(64) (body STRING NULL)").put("graph", "LargeBulk")));
@@ -147,6 +148,73 @@ class ComputeIntegrationTest {
             ok(call(writer, reader, large));
             try (var files = java.nio.file.Files.list(home.resolve("compute/requests"))) { assertFalse(files.findAny().isPresent()); }
         }
+    }
+    /** docs/user-permissions.md 第 3、4 节：DDL 只给 admin、用户管理规则、真删除、改自己的密码。 */
+    private static void userManagement(BufferedWriter writer, BufferedReader reader, String root) throws Exception {
+        JsonNode session = call(writer, reader, request(root, "session"));
+        ok(session); assertEquals("admin", session.path("role").asText());
+        assertEquals("INVALID_ARGUMENT", call(writer, reader, createUser(root, "shortpw", "1234567", "read")).path("code").asText());
+        ok(call(writer, reader, createUser(root, "author", "author-secret", "write")));
+        ok(call(writer, reader, createUser(root, "manager", "manager-secret", "admin")));
+        assertEquals("USER_EXISTS", call(writer, reader, createUser(root, "author", "author-secret", "write")).path("code").asText());
+        String author = login(writer, reader, "author", "author-secret");
+        String manager = login(writer, reader, "manager", "manager-secret");
+
+        // write：能改数据，不能执行任何 DDL、不能管理用户；语法错误不再报成权限问题。
+        ok(call(writer, reader, query(author, "INSERT (n:Company {id:'by-author', name:'w'})")));
+        for (String ddl : new String[] {"CREATE NODE TYPE Other ID STRING(64) ()", "CREATE INDEX by_author ON NODE TYPE Company (name)",
+                "DROP INDEX by_name", "CREATE ALIAS co FOR GRAPH Company", "DROP GRAPH Company"}) {
+            assertEquals("FORBIDDEN", call(writer, reader, query(author, ddl)).path("code").asText(), ddl);
+        }
+        assertEquals("FORBIDDEN", call(writer, reader, request(author, "createGraph").put("name", "ByAuthor")).path("code").asText());
+        assertEquals("FORBIDDEN", call(writer, reader, request(author, "admin").put("command", "listUsers")).path("code").asText());
+        assertEquals("SYNTAX", call(writer, reader, query(author, "MATCH (a RETURN")).path("code").asText());
+        ok(call(writer, reader, request(author, "queries")));
+
+        // 普通 admin：能执行 DDL、管理 read/write 用户；不能创建/提升/操作 admin，不能动 root。
+        ok(call(writer, reader, query(manager, "CREATE REL TYPE managed ()")));
+        ok(call(writer, reader, query(manager, "DROP REL TYPE managed")));
+        ok(call(writer, reader, createUser(manager, "viewer", "viewer-secret", "read")));
+        ok(call(writer, reader, request(manager, "admin").put("command", "setRole").put("user", "viewer").put("role", "write")));
+        ok(call(writer, reader, request(manager, "admin").put("command", "setPassword").put("user", "viewer").put("password", "viewer-secret2")));
+        assertEquals("FORBIDDEN", call(writer, reader, createUser(manager, "boss", "boss-secret", "admin")).path("code").asText());
+        assertEquals("FORBIDDEN", call(writer, reader, request(manager, "admin").put("command", "setRole").put("user", "viewer").put("role", "admin")).path("code").asText());
+        assertEquals("FORBIDDEN", call(writer, reader, request(manager, "admin").put("command", "setPassword").put("user", "root").put("password", "hijacked-pw")).path("code").asText());
+        assertEquals("FORBIDDEN", call(writer, reader, request(manager, "admin").put("command", "dropUser").put("user", "manager")).path("code").asText());
+        JsonNode users = call(writer, reader, request(manager, "admin").put("command", "listUsers"));
+        ok(users);
+        Map<String, String> roles = new HashMap<>();
+        for (JsonNode row : users.path("rows")) roles.put(row.get(0).asText(), row.get(1).asText());
+        assertEquals("admin", roles.get("root"));
+        assertEquals("write", roles.get("viewer"));
+        assertFalse(users.toString().contains("digest"));
+
+        // root 的硬规则。
+        assertEquals("FORBIDDEN", call(writer, reader, request(root, "admin").put("command", "dropUser").put("user", "root")).path("code").asText());
+        assertEquals("FORBIDDEN", call(writer, reader, request(root, "admin").put("command", "setRole").put("user", "root").put("role", "read")).path("code").asText());
+
+        // 真删除：旧令牌失效；同名重建后旧令牌仍然无效。
+        String viewer = login(writer, reader, "viewer", "viewer-secret2");
+        ok(call(writer, reader, request(manager, "admin").put("command", "dropUser").put("user", "viewer")));
+        assertEquals("UNAUTHENTICATED", call(writer, reader, query(viewer, "SHOW GRAPHS")).path("code").asText());
+        ok(call(writer, reader, createUser(manager, "viewer", "viewer-secret2", "write")));
+        assertEquals("UNAUTHENTICATED", call(writer, reader, query(viewer, "SHOW GRAPHS")).path("code").asText());
+        ok(call(writer, reader, query(login(writer, reader, "viewer", "viewer-secret2"), "SHOW GRAPHS")));
+
+        // 改自己的密码：校验原密码。
+        ObjectNode change = request(author, "admin").put("command", "changePassword").put("current", "wrong-password").put("password", "author-secret2");
+        assertEquals("UNAUTHENTICATED", call(writer, reader, change).path("code").asText());
+        ok(call(writer, reader, request(author, "admin").put("command", "changePassword").put("current", "author-secret").put("password", "author-secret2")));
+        login(writer, reader, "author", "author-secret2");
+        ok(call(writer, reader, request(root, "admin").put("command", "dropUser").put("user", "manager")));
+    }
+    private static ObjectNode createUser(String token, String user, String password, String role) {
+        return request(token, "admin").put("command", "createUser").put("user", user).put("password", password).put("role", role);
+    }
+    private static String login(BufferedWriter writer, BufferedReader reader, String user, String password) throws Exception {
+        JsonNode login = call(writer, reader, JSON.createObjectNode().put("op", "login").put("user", user).put("password", password));
+        ok(login);
+        return login.path("token").asText();
     }
     private static InetSocketAddress address(int port) { return new InetSocketAddress("127.0.0.1", port); }
     private static ObjectNode request(String token, String op) { return JSON.createObjectNode().put("op", op).put("token", token).put("graph", "Company").put("requestId", UUID.randomUUID().toString()); }

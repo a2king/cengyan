@@ -54,10 +54,13 @@ import {
   Server,
   Table2,
   Trash2,
+  UserCog,
   Workflow,
 } from 'lucide-react';
 import { CengyanApi, escapeIdent, graphFromRows, rowsAsObjects, storage } from './api';
 import { ClusterApi } from './clusterApi';
+import type { SetupStatus } from './clusterApi';
+import { ChangePasswordModal, PASSWORD_RULES, ROLE_TEXT, UsersPage } from './UsersPage';
 import { ClusterConsole } from './cluster/ClusterConsole';
 import { QueryGraph } from './QueryGraph';
 import { OpsDashboard } from './ops/OpsDashboard';
@@ -102,9 +105,14 @@ const COMPATIBILITY_MARKER = [
   CONFIRM_INPUT_SUFFIX,
 ].join('; ');
 
-function canWrite(role: string) { return role === 'write'; }
+/** 角色线性三级 read < write < admin（docs/user-permissions.md）。 */
+const ROLE_LEVEL: Record<string, number> = { read: 1, write: 2, admin: 3 };
+/** 能改数据（write 及以上）。 */
+function canWrite(role: string) { return (ROLE_LEVEL[role] ?? 0) >= ROLE_LEVEL.write; }
+/** 管理员：DDL、用户管理、集群管理。 */
+function isAdmin(role: string) { return role === 'admin'; }
 
-type NavKey = 'graph' | 'gql' | 'running' | 'ops' | 'cluster';
+type NavKey = 'graph' | 'gql' | 'running' | 'ops' | 'cluster' | 'users';
 
 const NAV_ROUTES: Record<NavKey, string> = {
   graph: '/graph',
@@ -112,7 +120,10 @@ const NAV_ROUTES: Record<NavKey, string> = {
   running: '/running',
   ops: '/ops',
   cluster: '/cluster',
+  users: '/users',
 };
+/** root 本地会话（数据库不可用）只能使用的页面。 */
+const LOCAL_NAVS: NavKey[] = ['cluster', 'ops'];
 
 function normalizePath(pathname: string) {
   const path = pathname.replace(/\/+$/, '');
@@ -165,14 +176,18 @@ export function App() {
     setOpsRefreshing(refreshing);
   }, []);
   const [clusterManaged, setClusterManaged] = useState(false);
-  const [standaloneCluster, setStandaloneCluster] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
   const clusterApiRef = useRef<ClusterApi | undefined>(undefined);
-  if (!clusterApiRef.current) clusterApiRef.current = new ClusterApi();
+  if (!clusterApiRef.current) {
+    clusterApiRef.current = new ClusterApi(() => apiRef.current?.token() || '');
+    clusterApiRef.current.onUnauthorized = () => handleLogout();
+  }
   const clusterApi = clusterApiRef.current;
   const [messageApi, contextHolder] = message.useMessage();
   const [notificationApi, notificationContextHolder] = notification.useNotification();
 
   function handleLogout() {
+    void apiRef.current?.logout();
     apiRef.current?.setGraph('');
     storage.clearSession();
     setSession(null);
@@ -182,6 +197,7 @@ export function App() {
 
   const refreshSpaces = useCallback(async () => {
     if (!session) return;
+    if (session.local) { setInitialized(true); return; }
     setLoadingSpaces(true);
     setBootError('');
     const load = async () => {
@@ -230,7 +246,7 @@ export function App() {
       if (selected && mentionsMissingGraph(error, selected)) releaseMissingGraph();
       if (listed && mentionsMissingGraph(error, selected)) return;
       setBootError(messageText);
-      if (messageText.includes('FORBIDDEN') || messageText.includes('请先登录')) {
+      if (messageText.includes('UNAUTHENTICATED') || messageText.includes('请先登录')) {
         handleLogout();
       }
     } finally {
@@ -296,10 +312,12 @@ export function App() {
     api.setGraph('');
     setCurrentGraph('');
     setGraphView('spaces');
-    const next = navFromPath(window.location.pathname) ?? 'graph';
+    let next = navFromPath(window.location.pathname) ?? 'graph';
+    if (info.local && !LOCAL_NAVS.includes(next)) next = clusterManaged ? 'cluster' : 'ops';
     setActiveNav(next);
     rememberNav(next, true);
-    messageApi.success('已连接到图数据库');
+    if (info.local) messageApi.warning('数据库不可用，已用 root 本地登录：只能使用集群管理和运维监控');
+    else messageApi.success('已连接到图数据库');
   };
 
   const selectGraph = async (name: string, openWorkspace = false) => {
@@ -331,7 +349,9 @@ export function App() {
     });
   };
 
-  const menuItems: MenuProps['items'] = [
+  const admin = Boolean(session && isAdmin(session.role));
+  const local = Boolean(session?.local);
+  const allMenuItems: MenuProps['items'] = [
     {
       key: 'graph',
       icon: <Workflow size={18} />,
@@ -342,49 +362,42 @@ export function App() {
       icon: <Code2 size={18} />,
       label: <span className="menu-label"><span>GQL</span><small>查询工作台</small></span>,
     },
-     ...(session && canWrite(session.role) ? [{
+    {
       key: 'running',
       icon: <Activity size={18} />,
-       label: <span className="menu-label"><span>运行查询</span><small>正在执行的语句</small></span>,
-     }, {
+      label: <span className="menu-label"><span>运行查询</span><small>{admin ? '所有人正在执行的语句' : '我正在执行的语句'}</small></span>,
+    }, {
       key: 'ops',
       icon: <Server size={18} />,
       label: <span className="menu-label"><span>集群运维</span><small>实时资源与拓扑</small></span>,
-    }] : []),
-    ...(clusterManaged ? [{
+    },
+    ...(clusterManaged && admin ? [{
       key: 'cluster',
       icon: <FolderKanban size={18} />,
       label: <span className="menu-label"><span>集群管理</span><small>服务器、节点与配置</small></span>,
     }] : []),
+    ...(admin && !local ? [{
+      key: 'users',
+      icon: <UserCog size={18} />,
+      label: <span className="menu-label"><span>用户管理</span><small>账号与角色</small></span>,
+    }] : []),
   ];
-
-  if (!session && standaloneCluster) {
-    return (
-      <ConfigProvider theme={themeConfig}>
-        <AntApp>
-          <Layout className="studio-layout cluster-standalone">
-            <Header className="studio-header">
-              <div className="brand-block"><div className="brand-mark"><Layers3 size={21} strokeWidth={2.2} /></div><div><div className="brand-name">层岩 <span>Studio</span></div><div className="brand-caption">集群管理</div></div></div>
-              <Button onClick={() => setStandaloneCluster(false)}>返回数据库登录</Button>
-            </Header>
-            <Content className="studio-content"><ClusterConsole api={clusterApi} /></Content>
-          </Layout>
-        </AntApp>
-      </ConfigProvider>
-    );
-  }
+  const menuItems = local ? allMenuItems.filter((item) => LOCAL_NAVS.includes(item?.key as NavKey)) : allMenuItems;
+  const visible = new Set(menuItems.map((item) => item?.key as NavKey));
 
   if (!session) {
     return (
       <ConfigProvider theme={themeConfig}>
         <AntApp>
-          <LoginPage api={api} onLogin={handleLogin} onCluster={clusterManaged ? () => setStandaloneCluster(true) : undefined} />
+          <LoginPage api={api} clusterApi={clusterApi} clusterManaged={clusterManaged} onLogin={handleLogin} />
         </AntApp>
       </ConfigProvider>
     );
   }
 
   const writable = canWrite(session.role);
+  // 没有权限的页面（例如直接打开 /users）回到可用的第一个页面。
+  const shownNav: NavKey = visible.has(activeNav) ? activeNav : (menuItems[0]?.key as NavKey) ?? 'graph';
 
   if (!initialized && loadingSpaces) {
     return (
@@ -412,7 +425,7 @@ export function App() {
             <div className="workspace-label">工作区</div>
             <Menu
               mode="inline"
-              selectedKeys={[activeNav]}
+              selectedKeys={[shownNav]}
               items={menuItems}
               onClick={({ key }) => {
                 const next = key as NavKey;
@@ -425,7 +438,8 @@ export function App() {
             <div className="sider-foot">
               <div className="user-card">
                 <Avatar size={34} icon={<CircleUserRound size={18} />} />
-                <div className="user-card-copy"><Text strong>{session.user}</Text><Text type="secondary">{writable ? '读写角色' : '只读角色'}</Text></div>
+                <div className="user-card-copy"><Text strong>{session.user}</Text><Text type="secondary">{local ? '管理员 · 本地登录' : `${ROLE_TEXT[session.role]?.text || session.role}角色`}</Text></div>
+                <Tooltip title="修改密码"><Button type="text" icon={<KeyRound size={16} />} onClick={() => setPasswordOpen(true)} aria-label="修改密码" /></Tooltip>
                 <Button type="text" icon={<LogOut size={16} />} onClick={handleLogout} aria-label={`${PERMISSION_LABEL} · 退出登录`} />
               </div>
             </div>
@@ -433,43 +447,48 @@ export function App() {
           <Layout>
             <Header className="studio-header">
               <div className="header-title">
-                  <Title level={3}>{activeNav === 'graph' ? (graphView === 'workspace' ? '图空间详情' : '图空间') : activeNav === 'running' ? '正在执行' : activeNav === 'ops' ? '集群运维' : activeNav === 'cluster' ? '集群管理' : '查询工作台'}</Title>
+                  <Title level={3}>{shownNav === 'graph' ? (graphView === 'workspace' ? '图空间详情' : '图空间') : shownNav === 'running' ? '正在执行' : shownNav === 'ops' ? '集群运维' : shownNav === 'cluster' ? '集群管理' : shownNav === 'users' ? '用户管理' : '查询工作台'}</Title>
               </div>
               <div className="header-actions">
-                {activeNav === 'gql' && (
+                {shownNav === 'gql' && (
                   <GraphSelector spaces={spaces} value={currentGraph} onChange={(name) => void selectGraph(name)} />
                 )}
-                {activeNav === 'graph' && graphView === 'workspace' && (
+                {shownNav === 'graph' && graphView === 'workspace' && (
                   <GraphSelector spaces={spaces} value={currentGraph} onChange={(name) => void selectGraph(name, true)} />
                 )}
-                {activeNav === 'graph' && graphView === 'spaces' && writable && (
+                {shownNav === 'graph' && graphView === 'spaces' && admin && (
                   <Button type="primary" icon={<Plus size={16} />} onClick={() => setCreateGraphOpen(true)}>新建空间</Button>
                 )}
-                {activeNav === 'ops' && (
+                {shownNav === 'ops' && (
                   <Button icon={<RefreshCw size={15} />} loading={opsRefreshing} onClick={() => opsRefresh.current()}>刷新</Button>
                 )}
               </div>
             </Header>
             <Content className="studio-content">
+              {local && <Alert className="page-alert" type="warning" showIcon message="数据库不可用，当前为 root 本地登录"
+                description="只能使用集群管理和运维监控。数据库恢复后请退出并重新登录，才能使用图空间、GQL 和用户管理。" />}
               {bootError && <Alert className="page-alert" type="error" showIcon message={bootError} closable onClose={() => setBootError('')} />}
-              {activeNav === 'graph' && (
+              {shownNav === 'graph' && (
                 graphView === 'spaces' ? (
-                   <SpaceOverview api={api} spaces={spaces} currentGraph={currentGraph} canWrite={writable} onRefresh={refreshSpaces} onOpen={(name) => void selectGraph(name, true)} openCreate={createGraphOpen} onCreateChange={setCreateGraphOpen} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
+                   <SpaceOverview api={api} spaces={spaces} currentGraph={currentGraph} canWrite={admin} onRefresh={refreshSpaces} onOpen={(name) => void selectGraph(name, true)} openCreate={createGraphOpen} onCreateChange={setCreateGraphOpen} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
                 ) : (
-                   <GraphWorkspace api={api} graph={currentGraph} aliases={spaces.find((space) => space.name === currentGraph)?.aliases || []} idType={spaces.find((space) => space.name === currentGraph)?.idType} idLength={spaces.find((space) => space.name === currentGraph)?.idLength} tab={graphTab} setTab={setGraphTab} canWrite={writable} onChanged={refreshSpaces} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
+                   <GraphWorkspace api={api} graph={currentGraph} aliases={spaces.find((space) => space.name === currentGraph)?.aliases || []} idType={spaces.find((space) => space.name === currentGraph)?.idType} idLength={spaces.find((space) => space.name === currentGraph)?.idLength} tab={graphTab} setTab={setGraphTab} canWrite={admin} onChanged={refreshSpaces} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
                 )
               )}
               {gqlMounted && (
-                <div hidden={activeNav !== 'gql'}>
-                    <GqlPage api={api} graph={currentGraph} canWrite={writable} active={activeNav === 'gql'} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} onGraphChanged={switchGraphFromEditor} onInflight={setInflightQuery} />
+                <div hidden={shownNav !== 'gql'}>
+                    <GqlPage api={api} graph={currentGraph} canWrite={writable} active={shownNav === 'gql'} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} onGraphChanged={switchGraphFromEditor} onInflight={setInflightQuery} />
                 </div>
               )}
-              {activeNav === 'running' && writable && <RunningQueries api={api} inflight={inflightQuery} />}
-              {activeNav === 'ops' && writable && <OpsDashboard api={api} bindRefresh={bindOpsRefresh} />}
-              {activeNav === 'cluster' && clusterManaged && <ClusterConsole api={clusterApi} />}
+              {shownNav === 'running' && <RunningQueries api={api} inflight={inflightQuery} />}
+              {shownNav === 'ops' && <OpsDashboard api={api} bindRefresh={bindOpsRefresh} />}
+              {shownNav === 'cluster' && <ClusterConsole api={clusterApi} />}
+              {shownNav === 'users' && <UsersPage api={api} me={session.user} />}
             </Content>
           </Layout>
         </Layout>
+        <ChangePasswordModal api={api} open={passwordOpen} onClose={() => setPasswordOpen(false)}
+          onChanged={() => { setPasswordOpen(false); messageApi.success('密码已修改，请用新密码重新登录'); handleLogout(); }} />
       </AntApp>
     </ConfigProvider>
   );
@@ -493,11 +512,33 @@ const themeConfig = {
   },
 };
 
-function LoginPage({ api, onLogin, onCluster }: { api: CengyanApi; onLogin: (info: SessionInfo) => Promise<void>; onCluster?: () => void }) {
+function LoginPage({ api, clusterApi, clusterManaged, onLogin }: { api: CengyanApi; clusterApi: ClusterApi; clusterManaged: boolean; onLogin: (info: SessionInfo) => Promise<void> }) {
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [pinging, setPinging] = useState(false);
+  // 托管模式首次部署：还没有 root 密码时先设置（替代原来单独的 Studio 管理员密码）。
+  const [setup, setSetup] = useState<SetupStatus | null>(null);
+  useEffect(() => {
+    if (!clusterManaged) return;
+    void clusterApi.status().then(setSetup).catch(() => setSetup(null));
+  }, [clusterApi, clusterManaged]);
+  const needsSetup = clusterManaged && setup !== null && !setup.initialized;
+
+  const initialize = async (values: { password: string; legacyPassword?: string }) => {
+    setLoading(true);
+    setError('');
+    try {
+      const created = await clusterApi.setup(values.password, values.legacyPassword || '');
+      const info: SessionInfo = { session: created.session, user: created.user, role: created.role, local: true };
+      api.adopt(info);
+      await onLogin(info);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '设置失败');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const login = async (values: { user: string; password: string }) => {
     setLoading(true);
@@ -522,8 +563,22 @@ function LoginPage({ api, onLogin, onCluster }: { api: CengyanApi; onLogin: (inf
           <Paragraph type="secondary">用清晰的空间视图管理 schema，用 GQL 直接探索数据。轻量、明亮，专注于每一次查询。</Paragraph>
           <div className="login-points"><span><Check size={15} /> 点与边类型</span><span><Check size={15} /> 索引与统计</span><span><Check size={15} /> 表格与关系图</span></div>
         </div>
-        <Card className="login-card" bordered={false}>
-          <div className="login-card-head"><div className="soft-icon"><KeyRound size={19} /></div><div><Title level={3}>登录到 Studio</Title><Text type="secondary">使用图数据库账号连接</Text></div></div>
+        {needsSetup ? <Card className="login-card" bordered={false}>
+          <div className="login-card-head"><div className="soft-icon"><KeyRound size={19} /></div><div><Title level={3}>设置 root 密码</Title><Text type="secondary">首次部署。root 是内置管理员，用来添加服务器和节点、管理用户；第一个计算节点启动时用它初始化数据库 root 账号。</Text></div></div>
+          <Form layout="vertical" onFinish={(values) => void initialize(values)}>
+            {setup?.legacy && <Form.Item name="legacyPassword" label="旧 Studio 管理员密码" extra="这台 Studio 由旧版本升级而来，请先输入原来的管理员密码确认身份。" rules={[{ required: true, message: '请输入旧管理员密码' }]}>
+              <Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="current-password" />
+            </Form.Item>}
+            <Form.Item name="password" label="root 密码" rules={PASSWORD_RULES}><Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="new-password" autoFocus /></Form.Item>
+            <Form.Item name="confirm" label="确认密码" dependencies={['password']} rules={[{ required: true, message: '请再次输入' },
+              ({ getFieldValue }) => ({ validator: (_, value) => value === getFieldValue('password') ? Promise.resolve() : Promise.reject(new Error('两次输入不一致')) })]}>
+              <Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="new-password" />
+            </Form.Item>
+            <Alert className={error ? 'login-status' : 'login-status is-empty'} type="error" showIcon icon={<AlertCircle size={16} />} message={error || ' '} />
+            <Button type="primary" htmlType="submit" size="large" block loading={loading}>设置并进入集群管理</Button>
+          </Form>
+        </Card> : <Card className="login-card" bordered={false}>
+          <div className="login-card-head"><div className="soft-icon"><KeyRound size={19} /></div><div><Title level={3}>登录到 Studio</Title><Text type="secondary">使用图数据库账号连接{clusterManaged ? '；数据库不可用时 root 仍可登录进入集群管理' : ''}</Text></div></div>
           <Form form={form} layout="vertical" initialValues={{ user: 'root', password: 'cengyan' }} onFinish={(values) => void login(values)}>
             <Form.Item name="user" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}><Input size="large" prefix={<CircleUserRound size={17} />} autoComplete="username" /></Form.Item>
             <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}><Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="current-password" /></Form.Item>
@@ -536,9 +591,8 @@ function LoginPage({ api, onLogin, onCluster }: { api: CengyanApi; onLogin: (inf
             />
             <Button type="primary" htmlType="submit" size="large" block loading={loading}>登录</Button>
             <Button className="login-check" type="text" block loading={pinging} onClick={async () => { setPinging(true); setError(''); try { await api.ping(); setError('连接正常，可以登录'); } catch (reason) { setError(reason instanceof Error ? reason.message : '连接失败'); } finally { setPinging(false); } }}>检查连接</Button>
-            {onCluster && <Button className="login-cluster" block icon={<FolderKanban size={16} />} onClick={onCluster}>集群管理：添加服务器和节点</Button>}
           </Form>
-        </Card>
+        </Card>}
       </div>
     </div>
   );

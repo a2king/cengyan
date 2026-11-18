@@ -12,16 +12,18 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
- * {@code /api/cluster/*}：服务器、节点、配置、任务管理。除管理员初始化和登录外都需要请求头
- * {@code X-Cengyan-Admin} 携带管理员令牌。令牌放在请求头而不是 Cookie，跨站请求无法自动携带。
+ * {@code /api/cluster/*}：服务器、节点、配置、任务管理。除初始化状态和首次设置 root 密码外，都需要 admin 角色的会话：
+ * 请求头 {@code X-Cengyan-Session} 携带数据库会话或 root 本地会话（见 {@link StudioAuth}）。
+ * 令牌放在请求头而不是 Cookie，跨站请求无法自动携带。
  */
 public final class ClusterApi {
     private static final int MAX_BODY = 1024 * 1024;
-    private static final Set<String> PUBLIC = Set.of("admin/status", "admin/setup", "admin/login");
+    private static final Set<String> PUBLIC = Set.of("admin/status", "admin/setup");
+    public static final String SESSION_HEADER = "X-Cengyan-Session";
     private final ClusterManager manager;
-    private final AdminAuth auth;
+    private final StudioAuth auth;
 
-    public ClusterApi(ClusterManager manager, AdminAuth auth) {
+    public ClusterApi(ClusterManager manager, StudioAuth auth) {
         this.manager = manager;
         this.auth = auth;
     }
@@ -32,8 +34,7 @@ public final class ClusterApi {
         String path = exchange.getRequestURI().getPath().substring("/api/cluster/".length()).replaceAll("/+$", "");
         String method = exchange.getRequestMethod();
         try {
-            if (!PUBLIC.contains(path) && !auth.valid(exchange.getRequestHeaders().getFirst("X-Cengyan-Admin")))
-                throw new ClusterError("UNAUTHORIZED", "请先登录 Studio 管理员");
+            if (!PUBLIC.contains(path)) TaskRunner.OPERATOR.set(auth.requireAdmin(exchange.getRequestHeaders().getFirst(SESSION_HEADER)).operator());
             JsonNode body = method.equals("POST") ? read(exchange) : ClusterStore.JSON.createObjectNode();
             Map<String, String> query = query(exchange);
             Object result = route(method, path, body, query, exchange);
@@ -52,17 +53,18 @@ public final class ClusterApi {
         } catch (RuntimeException ex) {
             java.util.logging.Logger.getLogger(ClusterApi.class.getName()).log(java.util.logging.Level.WARNING, "集群管理请求失败：" + path, ex);
             send(exchange, 500, ClusterStore.JSON.createObjectNode().put("code", "INTERNAL").put("message", TaskRunner.message(ex)));
+        } finally {
+            TaskRunner.OPERATOR.remove();
         }
     }
 
     private Object route(String method, String path, JsonNode b, Map<String, String> q, HttpExchange exchange) throws IOException {
         String key = method + " " + path;
         return switch (key) {
-            case "GET admin/status" -> ClusterStore.JSON.createObjectNode().put("initialized", auth.initialized());
-            case "POST admin/setup" -> ClusterStore.JSON.createObjectNode().put("token", auth.setup(text(b, "password")));
-            case "POST admin/login" -> ClusterStore.JSON.createObjectNode().put("token", auth.login(text(b, "password")));
-            case "POST admin/logout" -> { auth.logout(exchange.getRequestHeaders().getFirst("X-Cengyan-Admin")); yield null; }
-            case "POST admin/password" -> { auth.change(text(b, "current"), text(b, "password")); yield null; }
+            // 初始化：首次部署设置数据库 root 密码（旧版本设置过管理员密码时需要先输入它），设置后以 root 本地登录。
+            case "GET admin/status" -> ClusterStore.JSON.createObjectNode().put("initialized", auth.initialized()).put("legacy", auth.legacyPending());
+            case "POST admin/setup" -> ClusterStore.JSON.createObjectNode().put("session", auth.setup(text(b, "password"), text(b, "legacyPassword")))
+                    .put("user", StudioAuth.ROOT).put("role", "admin").put("local", true);
             case "GET overview" -> manager.overview();
             case "GET runtime" -> manager.runtime();
             case "GET catalog" -> Map.of("STORAGE", manager.catalog().entries(Role.STORAGE), "COMPUTE", manager.catalog().entries(Role.COMPUTE));
@@ -78,14 +80,17 @@ public final class ClusterApi {
             }
             case "GET nodes/logs" -> Map.of("text", manager.logs(q.getOrDefault("id", ""), parse(q.get("lines"), 300)));
             case "POST restart" -> manager.restart(strings(b.path("nodes")));
-            case "POST upgrade" -> manager.upgrade();
+            case "POST upgrade" -> manager.upgrade(text(b, "release"), strings(b.path("roles")), strings(b.path("nodes")));
+            case "POST upgrade/preview" -> manager.upgradePreview(text(b, "release"), strings(b.path("roles")), strings(b.path("nodes")));
+            case "GET packages" -> manager.packagesView();
+            case "POST packages/scan" -> manager.scanPackages();
+            case "POST packages/remove" -> { manager.removePackage(text(b, "id")); yield null; }
             case "GET config" -> config();
             case "POST config" -> manager.saveConfig(ClusterStore.JSON.convertValue(b.path("roleDefaults"), new TypeReference<Map<Role, Map<String, String>>>() { }),
                     ClusterStore.JSON.convertValue(b.path("nodeOverrides"), new TypeReference<Map<String, Map<String, String>>>() { }), text(b, "note"));
             case "GET config/history" -> manager.history();
             case "GET config/diff" -> manager.diff(parse(q.get("from"), 0), parse(q.get("to"), manager.state().config().version()));
             case "POST config/rollback" -> manager.rollback(b.path("version").asInt());
-            case "POST root-password" -> { manager.setRootPassword(text(b, "password")); yield null; }
             case "GET tasks" -> manager.tasks().list(parse(q.get("limit"), 20));
             case "GET tasks/detail" -> manager.tasks().get(q.getOrDefault("id", ""));
             case "POST tasks/action" -> manager.act(text(b, "id"), text(b, "action"), text(b, "password"), b.path("exitMaintenance").asBoolean());
@@ -107,6 +112,8 @@ public final class ClusterApi {
     private static int status(String code) {
         return switch (code) {
             case "UNAUTHORIZED", "LOCKED" -> 401;
+            case "FORBIDDEN" -> 403;
+            case "DB_UNAVAILABLE" -> 503;
             case "NOT_FOUND" -> 404;
             case "BUSY", "CONFLICT", "INVALID_STATE", "ALREADY_INITIALIZED", "PORT_IN_USE", "NOT_EMPTY", "LAST_NODE", "NOTHING_TO_DO" -> 409;
             case "REMOTE_FAILED", "SSH_UNREACHABLE", "SSH_AUTH_FAILED", "HOST_KEY_CHANGED", "UNAVAILABLE", "GROUP_UNAVAILABLE" -> 502;

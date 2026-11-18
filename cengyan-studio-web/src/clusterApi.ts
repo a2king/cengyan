@@ -1,4 +1,4 @@
-// 集群管理接口 /api/cluster/*。管理员令牌放在 sessionStorage，随请求头 X-Cengyan-Admin 发送。
+// 集群管理接口 /api/cluster/*。和图数据库共用一个会话令牌（请求头 X-Cengyan-Session），需要 admin 角色。
 export type Role = 'STORAGE' | 'COMPUTE';
 export type ServerStatus = 'PROVISIONING' | 'READY' | 'FAILED';
 export type NodeStatus = 'INSTALLING' | 'RUNNING' | 'FAILED' | 'REMOVING';
@@ -15,6 +15,7 @@ export interface NodeRow {
 }
 export interface StepView { title: string; state: StepState; startedAt: number; endedAt: number; log: string[] }
 export interface TaskView {
+  /** params.operator：发起人，root 本地登录记为 root(local)。 */
   id: string; type: string; title: string; params: Record<string, string>; state: TaskState; current: number;
   error: string; createdAt: number; updatedAt: number; steps: StepView[];
 }
@@ -40,40 +41,51 @@ export interface ConfigVersion {
 export interface ConfigState { current: ConfigVersion; effective: Record<string, Record<string, string>> }
 export interface Change { scope: string; key: string; before: string; after: string }
 export interface Suggestion { id: string; raftPort: number; rpcPort: number; clientPort: number; dataDir: string }
+export interface PackageRow {
+  id: string; version: string; importedAt: number; source: string; files: Record<string, string>; latest: boolean; usedBy: string[];
+}
+export interface ScanResult { file: string; ok: boolean; message: string; release: string }
+export interface PackagesView { inbox: string; scannedAt: number; scan: ScanResult[]; packages: PackageRow[] }
+/** release 为空时用最新导入的程序包；roles、nodes 为空表示不限。 */
+export interface UpgradeRequest { release?: string; roles?: Role[]; nodes?: string[] }
+export interface UpgradeNode { id: string; role: Role; from: string }
+export interface UpgradePreview { release: string; version: string; storage: boolean; targets: UpgradeNode[]; unchanged: UpgradeNode[] }
 
 export class ClusterError extends Error {
   constructor(readonly code: string, message: string, readonly details: Record<string, string> = {}) { super(message); }
 }
 
-const TOKEN_KEY = 'cengyan.studio.admin';
+export interface SetupStatus { initialized: boolean; legacy: boolean }
 
 export class ClusterApi {
   onUnauthorized: () => void = () => { };
 
-  get token() { return sessionStorage.getItem(TOKEN_KEY) || ''; }
-  set token(value: string) { if (value) sessionStorage.setItem(TOKEN_KEY, value); else sessionStorage.removeItem(TOKEN_KEY); }
+  /** @param token 当前会话令牌（与图数据库共用） */
+  constructor(private readonly token: () => string = () => '') { }
 
   private async call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
+    const token = this.token();
     const response = await fetch(`/api/cluster/${path}`, {
       method,
-      headers: { 'Content-Type': 'application/json', ...(this.token ? { 'X-Cengyan-Admin': this.token } : {}) },
+      headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Cengyan-Session': token } : {}) },
       body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
     });
     let data: Record<string, unknown>;
     try { data = await response.json() as Record<string, unknown>; }
     catch { throw new ClusterError('INVALID_RESPONSE', `Studio 返回了无效响应（HTTP ${response.status}）`); }
-    if (response.status === 401 && !path.startsWith('admin/')) { this.token = ''; this.onUnauthorized(); }
+    if (response.status === 401 && !path.startsWith('admin/')) this.onUnauthorized();
     if (!response.ok || data.code !== 'OK') {
       throw new ClusterError(String(data.code || 'FAILED'), String(data.message || '请求失败'), (data.details as Record<string, string>) || {});
     }
     return ('data' in data ? data.data : data) as T;
   }
 
-  status() { return this.call<{ initialized: boolean }>('GET', 'admin/status'); }
-  async setup(password: string) { this.token = (await this.call<{ token: string }>('POST', 'admin/setup', { password })).token; }
-  async login(password: string) { this.token = (await this.call<{ token: string }>('POST', 'admin/login', { password })).token; }
-  async logout() { try { await this.call('POST', 'admin/logout'); } finally { this.token = ''; } }
-  changePassword(current: string, password: string) { return this.call('POST', 'admin/password', { current, password }); }
+  /** 托管模式下是否已设置数据库 root 密码；legacy 表示旧版本设置过 Studio 管理员密码，初始化前要先输入它。 */
+  status() { return this.call<SetupStatus>('GET', 'admin/status'); }
+  /** 首次部署设置 root 密码，返回 root 本地会话。 */
+  setup(password: string, legacyPassword = '') {
+    return this.call<{ session: string; user: string; role: string; local: boolean }>('POST', 'admin/setup', { password, legacyPassword });
+  }
 
   overview() { return this.call<Overview>('GET', 'overview'); }
   runtime() { return this.call<Runtime>('GET', 'runtime'); }
@@ -89,7 +101,11 @@ export class ClusterApi {
   removeNode(id: string, deleteData: boolean, confirm: string) { return this.call<TaskView>('POST', 'nodes/remove', { id, deleteData, confirm }); }
   logs(id: string, lines = 300) { return this.call<{ text: string }>('GET', `nodes/logs?id=${encodeURIComponent(id)}&lines=${lines}`); }
   restart(nodes: string[]) { return this.call<TaskView>('POST', 'restart', { nodes }); }
-  upgrade() { return this.call<TaskView>('POST', 'upgrade'); }
+  upgrade(request: UpgradeRequest = {}) { return this.call<TaskView>('POST', 'upgrade', request); }
+  previewUpgrade(request: UpgradeRequest = {}) { return this.call<UpgradePreview>('POST', 'upgrade/preview', request); }
+  packages() { return this.call<PackagesView>('GET', 'packages'); }
+  scanPackages() { return this.call<PackagesView>('POST', 'packages/scan'); }
+  removePackage(id: string) { return this.call('POST', 'packages/remove', { id }); }
 
   config() { return this.call<ConfigState>('GET', 'config'); }
   saveConfig(roleDefaults: ConfigVersion['roleDefaults'], nodeOverrides: ConfigVersion['nodeOverrides'], note: string) {
@@ -98,7 +114,6 @@ export class ClusterApi {
   history() { return this.call<ConfigVersion[]>('GET', 'config/history'); }
   diff(from: number, to: number) { return this.call<Change[]>('GET', `config/diff?from=${from}&to=${to}`); }
   rollback(version: number) { return this.call<ConfigVersion>('POST', 'config/rollback', { version }); }
-  setRootPassword(password: string) { return this.call('POST', 'root-password', { password }); }
 
   tasks(limit = 20) { return this.call<TaskView[]>('GET', `tasks?limit=${limit}`); }
   task(id: string) { return this.call<TaskView>('GET', `tasks/detail?id=${encodeURIComponent(id)}`); }

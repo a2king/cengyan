@@ -100,6 +100,10 @@ final class Console {
                         node.put("role", part(parts, 2));
                     }
                     case "dropUser" -> node.put("user", part(parts, 1));
+                    case "changePassword" -> {
+                        node.put("current", part(parts, 1));
+                        node.put("password", part(parts, 2));
+                    }
                     case "addStorage", "addCompute", "setPartCount", "rebuildIndex" ->
                             throw new IllegalArgumentException("旧单机管理命令已移除；新增节点请使用角色配置启动并自动 Join，分片数建图后固定");
                     case "drainStorage", "removeStorage", "drainCompute", "removeCompute" -> node.put("nodeId", part(parts, 1));

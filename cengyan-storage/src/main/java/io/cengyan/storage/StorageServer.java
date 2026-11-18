@@ -597,10 +597,14 @@ public final class StorageServer implements AutoCloseable {
                             }
                             case "auth.create" -> { authority.create(inbound.getContext().getRequestId(), body.path("user").asText(), body.path("password").asText(), body.path("role").asText()); result.complete(response("OK", "", ByteString.EMPTY)); }
                             case "auth.update" -> {
+                                // 停用/启用已去掉；旧版 Compute 的 dropUser 会带 enabled，明确拒绝，不静默忽略。
+                                if (body.has("enabled")) throw new ClusterException("UNSUPPORTED", "不再支持停用用户，请升级 Compute 后使用删除");
                                 authority.update(inbound.getContext().getRequestId(), body.path("user").asText(), body.has("password") ? body.path("password").asText() : null,
-                                        body.has("role") ? body.path("role").asText() : null, body.has("enabled") ? body.path("enabled").asBoolean() : null);
+                                        body.has("role") ? body.path("role").asText() : null);
                                 result.complete(response("OK", "", ByteString.EMPTY));
                             }
+                            case "auth.delete" -> { authority.delete(inbound.getContext().getRequestId(), body.path("user").asText()); result.complete(response("OK", "", ByteString.EMPTY)); }
+                            case "auth.list" -> result.complete(response("OK", "", ByteString.copyFrom(json.writeValueAsBytes(authority.list()))));
                             default -> result.complete(response("UNSUPPORTED", "未知认证方法", ByteString.EMPTY));
                         }
                         return;

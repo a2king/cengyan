@@ -96,8 +96,9 @@ final class ClusterPlans {
                     save(server(id).withJdk(sha));
                 }),
                 step("同步程序包", c -> {
-                    try (RemoteShell shell = m.shell(id)) { Remote.syncRelease(shell, m.bundle); }
-                    save(server(id).withRelease(m.bundle.releaseId()));
+                    Packages.Package pkg = m.packages.latest();
+                    try (RemoteShell shell = m.shell(id)) { Remote.syncRelease(shell, m.packages, pkg); }
+                    save(server(id).withRelease(pkg.id()));
                 }),
                 step("完成", c -> save(server(id).with(ServerStatus.READY, "就绪"))));
         return new Plan("添加服务器 " + host, steps, c -> {
@@ -116,6 +117,16 @@ final class ClusterPlans {
     }
 
     // ---- node.add ----
+    /** 新节点的程序包在第一次用到时选定并记进任务参数，重试和 Studio 重启后保持不变。 */
+    private String release(Context c, NodeSpec n) throws IOException {
+        String release = c.param("release");
+        if (release.isEmpty()) {
+            release = m.releaseFor(n.role());
+            c.remember("release", release);
+        }
+        return release;
+    }
+
     private Plan nodeAdd(String id) {
         return new Plan("添加节点 " + id, List.of(
                 step("检查端口和数据目录", c -> {
@@ -127,12 +138,13 @@ final class ClusterPlans {
                 }),
                 step("同步程序包", c -> {
                     NodeSpec n = node(id);
-                    try (RemoteShell shell = m.shell(n.serverId())) { Remote.syncRelease(shell, m.bundle); }
-                    save(server(n.serverId()).withRelease(m.bundle.releaseId()));
+                    Packages.Package pkg = m.packages.require(release(c, n));
+                    try (RemoteShell shell = m.shell(n.serverId())) { Remote.syncRelease(shell, m.packages, pkg); }
+                    save(server(n.serverId()).withRelease(pkg.id()));
                 }),
                 step("写入配置和 systemd 服务", c -> {
                     NodeSpec n = node(id);
-                    ConfigRenderer.Rendered rendered = m.renderer.render(m.state(), n, m.bundle.releaseId());
+                    ConfigRenderer.Rendered rendered = m.renderer.render(m.state(), n, release(c, n));
                     try (RemoteShell shell = m.shell(n.serverId())) { Remote.writeNode(shell, n, rendered); }
                     c.remember("hash", rendered.hash());
                     c.log(n.role() == Role.STORAGE ? "metadata_members=" + ConfigRenderer.storageMembers(m.state(), n)
@@ -155,8 +167,7 @@ final class ClusterPlans {
                     }
                 }),
                 step("更新其他节点的成员列表", c -> {
-                    String release = m.bundle.releaseId();
-                    save(node(id).joinedAs(true).deployed(release, c.param("hash")).with(NodeStatus.RUNNING, "运行中"));
+                    save(node(id).joinedAs(true).deployed(release(c, node(id)), c.param("hash")).with(NodeStatus.RUNNING, "运行中"));
                     rewriteMembers(c);
                 })),
                 c -> m.state().node(id).ifPresent(n -> {
@@ -264,12 +275,16 @@ final class ClusterPlans {
         List<NodeSpec> storage = new ArrayList<>(), compute = new ArrayList<>();
         for (String id : ids) { NodeSpec n = node(id); (n.role() == Role.STORAGE ? storage : compute).add(n); }
         List<Step> steps = new ArrayList<>();
-        if (!release.isEmpty()) steps.add(step("同步新程序包到所有服务器", c -> {
-            for (Server s : m.state().servers()) {
+        if (!release.isEmpty()) steps.add(step("同步新程序包到要升级的节点所在服务器", c -> {
+            Packages.Package pkg = m.packages.require(release);
+            Set<String> servers = new TreeSet<>();
+            for (String id : ids) servers.add(node(id).serverId());
+            for (String serverId : servers) {
+                Server s = server(serverId);
                 if (s.status() != ServerStatus.READY) continue;
                 c.log("同步到 " + s.host());
-                try (RemoteShell shell = m.shell(s.id())) { Remote.syncRelease(shell, m.bundle); }
-                save(server(s.id()).withRelease(m.bundle.releaseId()));
+                try (RemoteShell shell = m.shell(s.id())) { Remote.syncRelease(shell, m.packages, pkg); }
+                save(server(s.id()).withRelease(pkg.id()));
             }
         }));
         if (!storage.isEmpty()) {
@@ -344,10 +359,11 @@ final class ClusterPlans {
     /** 下发配置文件和 node.env，不重启。release 为空时保持节点当前版本。 */
     private void push(Context c, String id, String release) throws IOException {
         NodeSpec n = node(id);
-        String target = !release.isEmpty() ? release : n.releaseId().isEmpty() ? m.bundle.releaseId() : n.releaseId();
+        String target = !release.isEmpty() ? release : n.releaseId().isEmpty() ? m.releaseFor(n.role()) : n.releaseId();
         ConfigRenderer.Rendered rendered = m.renderer.render(m.state(), n, target);
+        Optional<Packages.Package> pkg = m.packages.get(target);
         try (RemoteShell shell = m.shell(n.serverId())) {
-            if (target.equals(m.bundle.releaseId())) Remote.syncRelease(shell, m.bundle);
+            if (pkg.isPresent()) Remote.syncRelease(shell, m.packages, pkg.get());
             Remote.writeNode(shell, n, rendered);
         }
         c.remember("hash." + id, rendered.hash());
