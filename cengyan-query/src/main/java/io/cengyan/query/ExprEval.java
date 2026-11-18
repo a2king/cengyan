@@ -178,23 +178,27 @@ final class ExprEval {
             case "id" -> {
                 requireArgs(call, 1);
                 Slot slot = slotOf(args.get(0));
-                if (slot.edge) {
+                Map<?, ?> body = entityBody(slot);
+                if (slot.edge || (body != null && body.containsKey("src"))) {
                     throw new CengyanException(ErrorCode.TYPE_MISMATCH, "边没有 id");
                 }
-                yield slot.externalId;
+                yield body != null ? body.get("id") : slot.externalId;
             }
             case "labels" -> {
                 requireArgs(call, 1);
-                String typeName = slotOf(args.get(0)).typeName;
-                yield typeName == null || typeName.isBlank() ? List.of() : List.of(typeName);
+                Slot slot = slotOf(args.get(0));
+                Object typeName = entityBody(slot) != null ? entityBody(slot).get("type") : slot.typeName;
+                yield typeName == null || String.valueOf(typeName).isBlank() ? List.of() : List.of(String.valueOf(typeName));
             }
             case "type" -> {
                 requireArgs(call, 1);
-                yield slotOf(args.get(0)).typeName;
+                Slot slot = slotOf(args.get(0));
+                yield entityBody(slot) != null ? entityBody(slot).get("type") : slot.typeName;
             }
             case "properties" -> {
                 requireArgs(call, 1);
                 Slot slot = slotOf(args.get(0));
+                if (entityBody(slot) != null && entityBody(slot).get("properties") instanceof Map<?, ?> properties) yield properties;
                 yield slot.props == null ? Map.of() : slot.props;
             }
             case "startnode" -> nodeEnd(call, true);
@@ -256,6 +260,15 @@ final class ExprEval {
         } finally {
             slots = previous;
         }
+    }
+
+    /**
+     * 分布式执行把点和边都当作 {id, type, properties[, src, dst]} 形式的值传进来（{@link Slot#scalar}），
+     * 这时 id()、type()、labels()、properties() 要从这个值里取，不能把整个值当成 ID。
+     */
+    private static Map<?, ?> entityBody(Slot slot) {
+        return slot.externalId instanceof Map<?, ?> body && body.containsKey("id") && body.containsKey("type")
+                && body.get("properties") instanceof Map<?, ?> ? body : null;
     }
 
     private Slot slotOf(Expr expr) {

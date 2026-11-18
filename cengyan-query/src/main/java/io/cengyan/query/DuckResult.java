@@ -111,23 +111,59 @@ final class DuckResult {
             }
             List<Object> row = new ArrayList<>();
             for (String kind : kinds) {
-                row.add("sum".equals(kind) || "avg".equals(kind) || "min".equals(kind) || "max".equals(kind) ? null : 0L);
+                row.add("star".equals(kind) || "count".equals(kind) || "count_distinct".equals(kind) ? 0L
+                        : "collect_list".equals(kind) ? List.of() : null);
             }
             return List.of(row);
         }
-        boolean[] integral = new boolean[kinds.length];
-        Kind[] columns = new Kind[kinds.length];
+        // 节点、边、路径、列表这类值放不进 DuckDB 的标量列：分组列写规范文本并带上组内最小行号，
+        // collect_list 列写行号，读回后再换成原值，保证结构不丢、列表按输入顺序排列。
+        boolean[] complex = new boolean[kinds.length];
+        boolean complexGroup = false;
+        boolean anyComplex = false;
         for (int i = 0; i < kinds.length; i++) {
-            integral[i] = !"sum".equals(kinds[i]) || integralSum(rows, i);
-            columns[i] = "star".equals(kinds[i]) ? Kind.LONG : kind(rows, i, false);
+            complex[i] = ("group".equals(kinds[i]) || "collect_list".equals(kinds[i])) && hasComplex(rows, i);
+            anyComplex |= complex[i];
+            complexGroup |= complex[i] && "group".equals(kinds[i]);
         }
+        String[] effective = kinds;
+        List<List<Object>> source = rows;
+        if (anyComplex) {
+            effective = Arrays.copyOf(kinds, kinds.length + (complexGroup ? 1 : 0));
+            if (complexGroup) {
+                effective[kinds.length] = "min";
+            }
+            source = new ArrayList<>(rows.size());
+            for (int r = 0; r < rows.size(); r++) {
+                List<Object> row = rows.get(r);
+                List<Object> copy = new ArrayList<>(effective.length);
+                for (int i = 0; i < kinds.length; i++) {
+                    Object value = row.get(i);
+                    if (complex[i] && value != null) {
+                        value = "group".equals(kinds[i]) ? canonical(value) : (Object) (long) r;
+                    }
+                    copy.add(value);
+                }
+                if (complexGroup) {
+                    copy.add((long) r);
+                }
+                source.add(copy);
+            }
+        }
+        boolean[] integral = new boolean[effective.length];
+        Kind[] columns = new Kind[effective.length];
+        for (int i = 0; i < effective.length; i++) {
+            integral[i] = !"sum".equals(effective[i]) || integralSum(source, i);
+            columns[i] = "star".equals(effective[i]) ? Kind.LONG : kind(source, i, false);
+        }
+        List<List<Object>> result;
         try (Held held = open(settings.forCurrentQuery())) {
             try {
                 createAggregate(held.connection, columns);
-                insertAggregate(held.connection, rows, columns, cancel);
-                String sql = aggregateSql(kinds);
+                insertAggregate(held.connection, source, columns, cancel);
+                String sql = aggregateSql(effective);
                 log.debug("DuckDB SQL aggregate rows={} sql={}", rows.size(), sql);
-                return readAggregate(held.connection, sql, kinds, integral, cancel);
+                result = readAggregate(held.connection, sql, effective, integral, cancel);
             } finally {
                 if (settings.beforeClose() != null) {
                     settings.beforeClose().accept(settings.tempDirectory());
@@ -136,6 +172,46 @@ final class DuckResult {
         } catch (SQLException ex) {
             throw canceledOr(ex, cancel, "聚合失败：" + ex.getMessage());
         }
+        return anyComplex ? restore(result, rows, kinds, complex) : result;
+    }
+
+    private static boolean hasComplex(List<List<Object>> rows, int column) {
+        for (List<Object> row : rows) {
+            if (row.get(column) instanceof Map<?, ?> || row.get(column) instanceof List<?>) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<List<Object>> restore(
+            List<List<Object>> aggregated, List<List<Object>> rows, String[] kinds, boolean[] complex) {
+        List<List<Object>> restored = new ArrayList<>(aggregated.size());
+        for (List<Object> row : aggregated) {
+            List<Object> out = new ArrayList<>(kinds.length);
+            for (int i = 0; i < kinds.length; i++) {
+                Object value = row.get(i);
+                if (complex[i] && value != null) {
+                    if ("group".equals(kinds[i])) {
+                        value = rows.get(((Number) row.get(kinds.length)).intValue()).get(i);
+                    } else {
+                        List<Long> indexes = new ArrayList<>();
+                        for (Object index : (List<?>) value) {
+                            indexes.add(index == null ? null : ((Number) index).longValue());
+                        }
+                        indexes.sort(Comparator.nullsLast(Comparator.naturalOrder()));
+                        List<Object> items = new ArrayList<>(indexes.size());
+                        for (Long index : indexes) {
+                            items.add(index == null ? null : rows.get(index.intValue()).get(i));
+                        }
+                        value = items;
+                    }
+                }
+                out.add(value);
+            }
+            restored.add(out);
+        }
+        return restored;
     }
 
     private static Held open(DuckSettings settings) throws SQLException {

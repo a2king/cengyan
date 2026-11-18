@@ -574,7 +574,9 @@ final class GqlReader {
         if (clauses.size() != 1 || !(clauses.get(0) instanceof Stmt.Clause.Match match)) {
             return null;
         }
-        if (match.optional() || match.search() != null || match.mode() != null || match.patterns().size() != 1) {
+        // 带路径变量的 MATCH 要走路径搜索才能绑定路径，不能降成单跳快速路径。
+        if (match.optional() || match.pathVariable() != null || match.search() != null || match.mode() != null
+                || match.patterns().size() != 1) {
             return null;
         }
         if (tail.star() || !tail.groupBy().isEmpty()) {
@@ -1085,7 +1087,8 @@ final class GqlReader {
             expect(Kind.RP, "IN 缺少右括号");
             return new Expr.In(left, List.copyOf(options), negated);
         }
-        return new Expr.Member(left, expr(), negated);
+        // 右边和比较运算的右边同一优先级：x IN $list AND y 里的 AND 不属于列表。
+        return new Expr.Member(left, add(), negated);
     }
 
     private Expr add() {

@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -35,6 +36,34 @@ class DuckResultTest {
         assertEquals(chunk + "2999", ordered.get(0).get(0));
         assertEquals(chunk + "0", ordered.get(ordered.size() - 1).get(0));
         assertTrue(largest.get() > 8L * 1024 * 1024, "临时文件只有 " + largest.get() + " 字节");
+    }
+
+    @Test
+    void 聚合时节点和列表保持原样() throws Exception {
+        Path dir = Files.createTempDirectory("cengyan-agg-");
+        DuckSettings settings = new DuckSettings("64MB", dir, path -> { });
+        Map<String, Object> a = Map.of("id", "a", "properties", Map.of("name", "甲"));
+        Map<String, Object> b = Map.of("id", "b", "properties", Map.of("name", "乙"));
+        List<List<Object>> rows = List.of(
+                List.of(a, List.of(1L, 2L), 1L),
+                List.of(b, List.of(3L), 2L),
+                List.of(a, List.of(4L), 3L));
+        List<List<Object>> out = new ArrayList<>(DuckResult.aggregate(
+                rows, new String[] {"group", "collect_list", "sum"}, settings));
+        out.sort(java.util.Comparator.comparing(row -> String.valueOf(((Map<?, ?>) row.get(0)).get("id"))));
+        assertEquals(2, out.size());
+        assertEquals(a, out.get(0).get(0));
+        assertEquals(List.of(List.of(1L, 2L), List.of(4L)), out.get(0).get(1));
+        assertEquals(4L, out.get(0).get(2));
+        assertEquals(b, out.get(1).get(0));
+        assertEquals(List.of(List.of(3L)), out.get(1).get(1));
+    }
+
+    @Test
+    void 空输入的列表聚合返回空列表() throws Exception {
+        DuckSettings settings = new DuckSettings("64MB", Files.createTempDirectory("cengyan-agg-"), path -> { });
+        assertEquals(List.of(java.util.Arrays.asList(0L, List.of(), null)),
+                DuckResult.aggregate(List.of(), new String[] {"star", "collect_list", "sum"}, settings));
     }
 
     private static long largest(Path dir) {

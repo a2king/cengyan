@@ -70,11 +70,13 @@ def canonical_id(value, id_type: str) -> bytes:
     if kind == "INT64":
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError("整数 ID 必须是 int")
+        if not -(1 << 63) <= value < (1 << 63):
+            raise ValueError("整数 ID 超出 INT64 范围")
         return b"\x01" + struct.pack(">q", value)
     raise ValueError("未知 ID 类型：" + id_type)
 
 
 def part_of(value, id_type: str, partitions: int) -> int:
-    if not 1 <= partitions <= 65535:
+    if isinstance(partitions, bool) or not isinstance(partitions, int) or not 1 <= partitions <= 65535:
         raise ValueError("分片数无效")
     return xxhash64(canonical_id(value, id_type)) % partitions

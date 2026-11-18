@@ -4,9 +4,13 @@ import json
 import unittest
 from pathlib import Path
 
-spec = importlib.util.spec_from_file_location('spark_compute_client', Path(__file__).parents[2] / 'dev-scripts/cengyan.py')
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+# 被测的是 monorepo 里发给 Spark executor 的独立脚本，不是 SDK 本身；单独检出 SDK 时跳过。
+SCRIPT = Path(__file__).parents[2] / 'dev-scripts/cengyan.py'
+module = None
+if SCRIPT.exists():
+    spec = importlib.util.spec_from_file_location('spark_compute_client', SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
 
 
 class WireSocket:
@@ -24,6 +28,7 @@ class WireSocket:
         return (json.dumps({'code': self.code}) + '\n').encode()
 
 
+@unittest.skipUnless(module is not None, '需要 monorepo 中的 dev-scripts/cengyan.py')
 class SparkClientTest(unittest.TestCase):
     def client(self):
         client = module.Client('localhost', 19669, 'root', 'not-a-real-password', 30000)

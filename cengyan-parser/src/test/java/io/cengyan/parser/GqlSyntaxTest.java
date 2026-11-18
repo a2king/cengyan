@@ -97,8 +97,13 @@ class GqlSyntaxTest {
                 Gql.tree("MATCH (a {id:1})-[:holder|works]->(b) RETURN b.id"));
         assertEquals("(match (node p:org id=100) (return p))",
                 Gql.tree("MATCH (p:org {id: 100}) RETURN p"));
-        assertEquals("(match p = (node a id=1) (edge OUT:holder{1,3}) (node b) (return p) (limit 20))",
-                Gql.tree("MATCH p = (a {id:1})-[:holder]->{1,3}(b) RETURN p LIMIT 20"));
+        // 路径变量必须留在通用查询里，交给路径搜索绑定；降成单跳 Match 会在执行时报"未知变量 p"。
+        Stmt.Select path = assertInstanceOf(Stmt.Select.class,
+                Gql.parse("MATCH p = (a {id:1})-[:holder]->{1,3}(b) RETURN p LIMIT 20"));
+        assertEquals("p", assertInstanceOf(Stmt.Clause.Match.class, path.clauses().get(0)).pathVariable());
+        assertInstanceOf(Stmt.Select.class, Gql.parse("MATCH p = (a {id:1})-[:holder]->(b) RETURN p"));
+        Stmt.Select member = assertInstanceOf(Stmt.Select.class, Gql.parse("MATCH p = (a)-[:holder]->(b) WHERE a.id IN $ids AND b.x = 1 RETURN p"));
+        assertInstanceOf(Expr.Binary.class, assertInstanceOf(Stmt.Clause.Match.class, member.clauses().get(0)).where(), "AND 不能被并进 IN 的列表");
         ParseException duplicated = assertThrows(ParseException.class,
                 () -> Gql.parse("MATCH (a {id:1})-[:holder|:holder]->(b) RETURN a"));
         assertTrue(duplicated.getMessage().contains("边类型重复"));

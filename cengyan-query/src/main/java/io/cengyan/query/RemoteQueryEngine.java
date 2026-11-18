@@ -10,6 +10,9 @@ import java.util.function.BooleanSupplier;
 
 /** Compute 端查询协调器：实体访问只经过 Storage，不使用本地 Catalog/RocksDB。 */
 public final class RemoteQueryEngine {
+    /** RETURN 里的聚合函数，和 DuckResult 支持的聚合保持一致。 */
+    static final Set<String> AGGREGATES = Set.of("count", "sum", "avg", "min", "max", "collect_list",
+            "stddev_samp", "stddev_pop", "percentile_cont", "percentile_disc");
     private final DistributedCatalog catalog;
     private final DistributedGraph data;
     private final DuckSettings duck;
@@ -19,6 +22,32 @@ public final class RemoteQueryEngine {
     private final IdentityHashMap<Entity, Object> scalarValues = new IdentityHashMap<>();
     private List<Map<String, Entity>> incoming;
     private RemoteCancellation cancellation;
+    /**
+     * 本次查询读过的点和邻接边。路径展开会反复经过同一批点，不缓存的话每经过一次就重新读一次存储，
+     * 读到的字节都记进查询内存额度，几跳之后就会误报"查询中间数据超过内存额度"。一个引擎只执行一条语句，缓存不会读到自己的写入。
+     */
+    private record NodeKey(String type, Value id) { }
+    private record AdjacencyKey(Value vertex, boolean out, String type) { }
+    /** 存储读取的接缝。默认读分布式存储；测试换成内存图。 */
+    interface Reads {
+        /** type 为空字符串时按点目录查，不限类型。 */
+        Entity node(GraphDefinition graph, String type, Value id, TransactionEngine.QueryScope scope);
+        List<Entity> neighbors(GraphDefinition graph, Value vertex, boolean out, String edgeType, TransactionEngine.QueryScope scope);
+        List<Entity> scan(GraphDefinition graph, String type, Map<String, Value> filters, TransactionEngine.QueryScope scope);
+    }
+    Reads reads = new Reads() {
+        @Override public Entity node(GraphDefinition graph, String type, Value id, TransactionEngine.QueryScope scope) {
+            return type.isEmpty() ? data.get(graph, true, id, scope) : data.get(graph, true, type, id, scope);
+        }
+        @Override public List<Entity> neighbors(GraphDefinition graph, Value vertex, boolean out, String edgeType, TransactionEngine.QueryScope scope) {
+            return data.neighbors(graph, vertex, out, edgeType, scope);
+        }
+        @Override public List<Entity> scan(GraphDefinition graph, String type, Map<String, Value> filters, TransactionEngine.QueryScope scope) {
+            return filters.isEmpty() ? data.scan(graph, true, type, scope) : data.lookup(graph, true, type, filters, scope);
+        }
+    };
+    private final Map<NodeKey, Optional<Entity>> nodeCache = new HashMap<>();
+    private final Map<AdjacencyKey, List<Entity>> adjacencyCache = new HashMap<>();
     public RemoteQueryEngine(StorageGateway storage, Path temporaryDirectory, String memory, String disk, int threads) {
         this.storage = storage;
         catalog = new DistributedCatalog(storage); data = new DistributedGraph(storage);
@@ -63,7 +92,7 @@ public final class RemoteQueryEngine {
         }
         ExprEval eval = new ExprEval(params, false);
         if (statement instanceof Stmt.Select select && select.clauses().isEmpty() && (graphName == null || graphName.isBlank())) {
-            return project(List.of(Map.of()), select.tail().items(), select.tail().orderBy(), select.tail().distinct(), select.tail().skip(), select.tail().limit(), eval, canceled);
+            return project(List.of(Map.of()), select.tail().items(), select.tail().orderBy(), select.tail().distinct(), select.tail().postFilter(), select.tail().skip(), select.tail().limit(), eval, canceled);
         }
         if (statement instanceof Stmt.CreateGraph create) {
             IdType idType = create.idType() != null && create.idType().equalsIgnoreCase("STRING") ? IdType.STRING : IdType.INT64;
@@ -90,7 +119,7 @@ public final class RemoteQueryEngine {
         // Data-reading children of composite queries still establish/share their normal transaction view.
         if (statement instanceof Stmt.Use) return QueryResult.changed(0);
         if (statement instanceof Stmt.Select select && select.clauses().isEmpty() && incoming == null) {
-            return project(List.of(Map.of()), select.tail().items(), select.tail().orderBy(), select.tail().distinct(), select.tail().skip(), select.tail().limit(), eval, canceled);
+            return project(List.of(Map.of()), select.tail().items(), select.tail().orderBy(), select.tail().distinct(), select.tail().postFilter(), select.tail().skip(), select.tail().limit(), eval, canceled);
         }
         if (!(statement instanceof Stmt.Show || statement instanceof Stmt.Describe
                 || statement instanceof Stmt.Explain || statement instanceof Stmt.ExplainQuery
@@ -286,7 +315,7 @@ public final class RemoteQueryEngine {
         if (statement instanceof Stmt.Match match) {
             var scope = queryScope;
             List<Map<String, Entity>> bindings = bindings(graph, match.source(), match.edge(), match.target(), match.where(), eval, scope, canceled);
-            return project(bindings, match.items(), match.orderBy(), match.distinct(), match.skip(), match.limit(), eval, canceled);
+            return project(bindings, match.items(), match.orderBy(), match.distinct(), null, match.skip(), match.limit(), eval, canceled);
         }
         if (statement instanceof Stmt.Select select) {
             List<Map<String, Entity>> rows = clauses(graph, select.clauses(), params, canceled);
@@ -295,23 +324,12 @@ public final class RemoteQueryEngine {
                 Set<String> variables = new TreeSet<>(); rows.forEach(row -> variables.addAll(row.keySet()));
                 items = variables.stream().map(name -> new Stmt.Item(new Expr.Variable(name), name, name)).toList();
             }
-            QueryResult projected = project(rows, items, select.tail().orderBy(), select.tail().distinct(), select.tail().skip(), select.tail().limit(), eval, canceled);
-            if (select.tail().postFilter() != null) {
-                List<List<Object>> kept = new ArrayList<>();
-                for (var row : projected.rows()) {
-                    var values = new HashMap<String, ExprEval.Slot>();
-                    for (int i = 0; i < projected.columns().size(); i++) values.put(projected.columns().get(i), ExprEval.Slot.scalar(row.get(i)));
-                    eval.slots(values); if (eval.isTrue(select.tail().postFilter())) kept.add(row);
-                }
-                projected = new QueryResult(projected.columns(), kept, projected.rowsAffected());
-            }
-            if (!select.tail().groupBy().isEmpty()) {
-                // 投影中非聚合项已经作为分组键；显式 GROUP BY 不允许悄悄忽略额外表达式。
-                Set<Expr> projectedGroups = new HashSet<>();
-                for (var item : items) if (!(item.expr() instanceof Expr.Call call && Set.of("count", "sum", "avg", "min", "max").contains(call.name().toLowerCase(Locale.ROOT)))) projectedGroups.add(item.expr());
-                if (!projectedGroups.equals(new HashSet<>(select.tail().groupBy()))) throw new ClusterException("UNSUPPORTED", "显式 GROUP BY 必须与非聚合返回项一致");
-            }
-            return projected;
+            // 投影中非聚合项已经作为分组键；显式 GROUP BY 不允许悄悄忽略额外表达式。先检查，避免白算一遍。
+            if (!select.tail().groupBy().isEmpty() && !groupsMatch(items, select.tail().groupBy()))
+                throw new ClusterException("UNSUPPORTED", "GROUP BY 里的每一项都要出现在 RETURN 中（可以写返回项、别名，或用变量 n 代替 id(n)）");
+            // GROUP BY 后的 FILTER 在 SKIP/LIMIT 之前生效，否则会先截断再过滤，漏掉满足条件的行。
+            return project(rows, items, select.tail().orderBy(), select.tail().distinct(), select.tail().postFilter(),
+                    select.tail().skip(), select.tail().limit(), eval, canceled);
         }
         if (statement instanceof Stmt.Mutate mutate) {
             List<Map<String, Entity>> rows = clauses(graph, mutate.clauses(), params, canceled);
@@ -458,7 +476,7 @@ public final class RemoteQueryEngine {
                         for (var seed : matched) {
                             if (match.pathVariable() != null || match.search() != null && !match.search().isBlank()) {
                                 combined.addAll(pathPattern(graph, pattern.elements(), seed, match, params, canceled));
-                            } else combined.addAll(pattern(graph, pattern.elements(), seed, params, canceled, match.mode()));
+                            } else combined.addAll(pattern(graph, pattern.elements(), seed, params, canceled, match.mode(), match.where()));
                         }
                         matched = combined;
                     }
@@ -523,14 +541,14 @@ public final class RemoteQueryEngine {
     }
 
     private List<Map<String, Entity>> pattern(GraphDefinition graph, List<Stmt.Element> elements, Map<String, Entity> input,
-                                             Map<String, Object> params, BooleanSupplier canceled, String mode) {
+                                             Map<String, Object> params, BooleanSupplier canceled, String mode, Expr hint) {
         if (elements.isEmpty() || !(elements.getFirst() instanceof Stmt.Element.Node first)) throw new ClusterException("UNSUPPORTED", "远程模式必须以节点开始");
         var eval = new ExprEval(params, false);
         Stmt.NodePat source = constrain(first.node(), input);
         var scope = queryScope;
         if (elements.size() == 1) {
             List<Map<String, Entity>> result = new ArrayList<>();
-            for (var found : bindings(graph, source, null, null, null, eval, scope, canceled, mode)) {
+            for (var found : bindings(graph, source, null, null, null, hint, eval, scope, canceled, mode)) {
                 var merged = mergeBindings(input, found);
                 if (merged != null) result.add(merged);
             }
@@ -542,7 +560,7 @@ public final class RemoteQueryEngine {
                     || !(elements.get(position + 2) instanceof Stmt.Element.Node b)) throw new ClusterException("UNSUPPORTED", "远程分组路径模式尚未接入");
             var next = new ArrayList<Map<String, Entity>>();
             for (var row : rows) {
-                for (var found : bindings(graph, constrain(a.node(), row), e.edge(), constrain(b.node(), row), null, eval, scope, canceled, mode)) {
+                for (var found : bindings(graph, constrain(a.node(), row), e.edge(), constrain(b.node(), row), null, hint, eval, scope, canceled, mode)) {
                     var merged = mergeBindings(row, found);
                     if (merged != null) next.add(merged);
                 }
@@ -560,12 +578,12 @@ public final class RemoteQueryEngine {
         }
         ExprEval eval = new ExprEval(params, false);
         Stmt.NodePat source = constrain(from.node(), input), target = constrain(to.node(), input);
-        Object sourceId = property(source.properties(), "id", eval);
-        List<Entity> starts;
-        if (sourceId == null) starts = data.scan(graph, true, source.typeName(), queryScope);
-        else {
-            Entity entity = node(graph, source.typeName(), EntityCodec.value(sourceId), queryScope);
-            starts = entity == null ? List.of() : List.of(entity);
+        List<Entity> starts = starts(graph, source, match.where(), eval, queryScope);
+        List<Object> targetIds = idCandidates(target, match.where(), eval);
+        Set<Value> ends = null;
+        if (targetIds != null) {
+            ends = new HashSet<>();
+            for (Object id : targetIds) ends.add(EntityCodec.value(id));
         }
         int min = rel.edge().minHop() == null ? 1 : rel.edge().minHop();
         int max = rel.edge().maxHop() == null ? 1 : rel.edge().maxHop();
@@ -575,10 +593,15 @@ public final class RemoteQueryEngine {
             var bound = new LinkedHashMap<>(input);
             if (source.variable() != null) bound.put(source.variable(), start);
             if (!matches(source, start, eval, bound)) continue;
-            List<PathFound> paths = new ArrayList<>();
-            List<Entity> vertices = new ArrayList<>(); vertices.add(start);
-            walkPaths(graph, rel.edge(), target, bound, eval, canceled, match.mode() == null ? "WALK" : match.mode(),
-                    min, max, vertices, new ArrayList<>(), paths, match.where(), match.pathVariable());
+            List<PathFound> paths;
+            if (match.search() != null && match.search().contains("SHORTEST") && min == 1) {
+                paths = shortestPaths(graph, rel.edge(), target, bound, eval, canceled, start, max, ends, match.where(), match.pathVariable());
+            } else {
+                paths = new ArrayList<>();
+                List<Entity> vertices = new ArrayList<>(); vertices.add(start);
+                walkPaths(graph, rel.edge(), target, bound, eval, canceled, match.mode() == null ? "WALK" : match.mode(),
+                        min, max, vertices, new ArrayList<>(), paths, match.where(), match.pathVariable());
+            }
             paths.sort(Comparator.comparingInt(path -> path.edges().size()));
             Map<Value, List<PathFound>> byEnd = new LinkedHashMap<>();
             for (PathFound path : paths) byEnd.computeIfAbsent(path.vertices().getLast().getId(), ignored -> new ArrayList<>()).add(path);
@@ -600,6 +623,179 @@ public final class RemoteQueryEngine {
         return output;
     }
     private record PathFound(List<Entity> vertices, List<Entity> edges) { }
+    /** 终点满足节点模式、整条路径满足 WHERE。先查终点，不满足时不必拼路径。 */
+    private boolean acceptPath(Stmt.NodePat target, Stmt.EdgePat pattern, Map<String, Entity> initial, ExprEval eval, Expr where,
+                               String pathVariable, List<Entity> vertices, List<Entity> edges) {
+        Entity end = vertices.getLast();
+        var row = new LinkedHashMap<>(initial);
+        if (target.variable() != null) row.put(target.variable(), end);
+        if (!matches(target, end, eval, row)) return false;
+        if (where == null) return true;
+        if (pattern.variable() != null) row.put(pattern.variable(), scalar(edges.stream().map(this::entityBody).toList()));
+        if (pathVariable != null) row.put(pathVariable, scalar(pathBody(new PathFound(vertices, edges))));
+        slots(eval, row);
+        return eval.isTrue(where);
+    }
+
+    /**
+     * 最短路：按层广度优先，每个点只展开一次，记下所有最短前驱，最后从前驱回溯出每个终点的全部最短路径。
+     * 不会像枚举所有路径那样随跳数指数增长。最短路径不会重复经过点，TRAIL/ACYCLIC/SIMPLE 自然满足。
+     * @param ends 已知的终点 ID；全部找到后这一层结束就停
+     */
+    private List<PathFound> shortestPaths(GraphDefinition graph, Stmt.EdgePat pattern, Stmt.NodePat target, Map<String, Entity> initial,
+                                          ExprEval eval, BooleanSupplier canceled, Entity start, int max, Set<Value> ends,
+                                          Expr where, String pathVariable) {
+        record Step(Entity edge, Value from) { }
+        Map<Value, Integer> depth = new HashMap<>();
+        Map<Value, Entity> vertices = new HashMap<>();
+        Map<Value, List<Step>> previous = new HashMap<>();
+        List<Value> order = new ArrayList<>();
+        depth.put(start.getId(), 0);
+        vertices.put(start.getId(), start);
+        List<Value> frontier = List.of(start.getId());
+        for (int hop = 1; hop <= max && !frontier.isEmpty(); hop++) {
+            List<Value> next = new ArrayList<>();
+            for (Value current : frontier) {
+                check(canceled);
+                for (Entity edge : adjacent(graph, current, pattern.direction(), pattern.typeName(), queryScope)) {
+                    if (!edgeMatches(pattern, edge, eval)) continue;
+                    Value other = edge.getSource().equals(current) ? edge.getTarget() : edge.getSource();
+                    Integer seen = depth.get(other);
+                    if (seen != null && seen < hop) continue;
+                    if (seen == null) {
+                        Entity vertex = node(graph, null, other, queryScope);
+                        if (vertex == null) continue;
+                        depth.put(other, hop);
+                        vertices.put(other, vertex);
+                        next.add(other);
+                        order.add(other);
+                    }
+                    previous.computeIfAbsent(other, ignored -> new ArrayList<>()).add(new Step(edge, current));
+                }
+            }
+            QueryMemory.current().observeRows(depth.size(), 4);
+            frontier = next;
+            if (ends != null && depth.keySet().containsAll(ends)) break;
+        }
+        List<PathFound> found = new ArrayList<>();
+        for (Value end : order) {
+            if (ends != null && !ends.contains(end)) continue;
+            var probe = new LinkedHashMap<>(initial);
+            if (target.variable() != null) probe.put(target.variable(), vertices.get(end));
+            if (!matches(target, vertices.get(end), eval, probe)) continue;
+            // 从终点沿最短前驱回溯，每条完整路径都是一条最短路。
+            Deque<List<Step>> stack = new ArrayDeque<>();
+            stack.push(List.of());
+            while (!stack.isEmpty()) {
+                check(canceled);
+                List<Step> partial = stack.pop();
+                Value at = partial.isEmpty() ? end : partial.getLast().from();
+                if (at.equals(start.getId())) {
+                    List<Entity> pathVertices = new ArrayList<>(), pathEdges = new ArrayList<>();
+                    pathVertices.add(start);
+                    for (int i = partial.size() - 1; i >= 0; i--) {
+                        pathEdges.add(partial.get(i).edge());
+                        pathVertices.add(vertices.get(i == 0 ? end : partial.get(i - 1).from()));
+                    }
+                    if (acceptPath(target, pattern, initial, eval, where, pathVariable, pathVertices, pathEdges))
+                        found.add(new PathFound(pathVertices, pathEdges));
+                    if (found.size() >= 100000) throw new ClusterException("PATH_LIMIT_EXCEEDED", "路径数量超过安全上限");
+                    continue;
+                }
+                for (Step step : previous.getOrDefault(at, List.of())) {
+                    List<Step> longer = new ArrayList<>(partial);
+                    longer.add(step);
+                    stack.push(longer);
+                }
+            }
+        }
+        return found;
+    }
+
+    private boolean edgeMatches(Stmt.EdgePat pattern, Entity edge, ExprEval eval) {
+        for (var property : pattern.properties()) {
+            Object actual = property.name().equals("id") ? EntityCodec.object(edge.getId()) : EntityCodec.object(edge.getPropertiesOrDefault(property.name(), Value.getDefaultInstance()));
+            if (!eval.sameValue(actual, eval.eval(property.value()))) return false;
+        }
+        return true;
+    }
+
+    /**
+     * 起点或终点的 ID 候选：节点模式里的 {id: ...}，以及 WHERE 里 AND 连接的 id(v) = c、v.id = c、id(v) IN [...]、v.id IN $list。
+     * 有多个来源时取交集。拿不到时返回 null，表示只能扫描。
+     */
+    static List<Object> idCandidates(Stmt.NodePat node, Expr where, ExprEval eval) {
+        List<Object> result = null;
+        Object own = property(node.properties(), "id", eval);
+        if (own != null) result = new ArrayList<>(List.of(own));
+        List<Object> fromWhere = node.variable() == null ? null : idsFromWhere(where, node.variable(), eval);
+        if (fromWhere == null) return result;
+        if (result == null) return fromWhere;
+        List<Object> both = new ArrayList<>();
+        for (Object value : result) if (fromWhere.stream().anyMatch(other -> eval.sameValue(value, other))) both.add(value);
+        return both;
+    }
+
+    private static List<Object> idsFromWhere(Expr where, String variable, ExprEval eval) {
+        if (where instanceof Expr.Binary binary && binary.op().equals("AND")) {
+            List<Object> left = idsFromWhere(binary.left(), variable, eval), right = idsFromWhere(binary.right(), variable, eval);
+            if (left == null) return right;
+            if (right == null) return left;
+            List<Object> both = new ArrayList<>();
+            for (Object value : left) if (right.stream().anyMatch(other -> eval.sameValue(value, other))) both.add(value);
+            return both;
+        }
+        if (where instanceof Expr.Binary binary && binary.op().equals("=")) {
+            Expr constant = isId(binary.left(), variable) ? binary.right() : isId(binary.right(), variable) ? binary.left() : null;
+            if (constant == null || !constant(constant)) return null;
+            Object value = eval.eval(constant);
+            return value == null ? List.of() : List.of(value);
+        }
+        if (where instanceof Expr.In in && !in.negated() && isId(in.value(), variable)) {
+            List<Object> values = new ArrayList<>();
+            for (Expr option : in.options()) {
+                if (!constant(option)) return null;
+                Object value = eval.eval(option);
+                if (value != null) values.add(value);
+            }
+            return values;
+        }
+        if (where instanceof Expr.Member member && !member.negated() && isId(member.value(), variable) && constant(member.collection())) {
+            Object values = eval.eval(member.collection());
+            if (values instanceof List<?> list) return list.stream().filter(Objects::nonNull).map(Object.class::cast).toList();
+        }
+        return null;
+    }
+
+    private static boolean isId(Expr expr, String variable) {
+        if (expr instanceof Expr.Prop prop) return variable.equals(prop.variable()) && prop.field().equals("id");
+        return expr instanceof Expr.Call call && call.name().equalsIgnoreCase("id") && call.args().size() == 1
+                && call.args().getFirst() instanceof Expr.Variable ref && ref.name().equals(variable);
+    }
+
+    private static boolean constant(Expr expr) {
+        if (expr instanceof Expr.ListLit list) return list.items().stream().allMatch(RemoteQueryEngine::constant);
+        return expr instanceof Expr.Literal || expr instanceof Expr.Param;
+    }
+
+    /** 按 ID 候选逐个点读；没有候选时才扫描。 */
+    private List<Entity> starts(GraphDefinition graph, Stmt.NodePat source, Expr where, ExprEval eval, TransactionEngine.QueryScope scope) {
+        List<Object> ids = idCandidates(source, where, eval);
+        if (ids == null) {
+            Map<String, Value> filters = new HashMap<>();
+            for (var prop : source.properties()) filters.put(prop.name(), EntityCodec.value(eval.eval(prop.value())));
+            return reads.scan(graph, source.typeName(), filters, scope);
+        }
+        List<Entity> found = new ArrayList<>();
+        Set<Value> seen = new HashSet<>();
+        for (Object id : ids) {
+            Value value = EntityCodec.value(id);
+            if (!seen.add(value)) continue;
+            Entity entity = node(graph, source.typeName(), value, scope);
+            if (entity != null) found.add(entity);
+        }
+        return found;
+    }
     private Map<String, Object> pathBody(PathFound path) {
         return Map.of("nodes", path.vertices().stream().map(this::entityBody).toList(), "edges", path.edges().stream().map(this::entityBody).toList(), "length", (long) path.edges().size());
     }
@@ -617,28 +813,18 @@ public final class RemoteQueryEngine {
         if (found.size() >= 100000) throw new ClusterException("PATH_LIMIT_EXCEEDED", "路径数量超过安全上限");
         Entity current = vertices.getLast();
         if (edges.size() >= min) {
-            var row = new LinkedHashMap<>(initial);
-            if (target.variable() != null) row.put(target.variable(), current);
-            if (pattern.variable() != null) row.put(pattern.variable(), scalar(edges.stream().map(this::entityBody).toList()));
-            if (pathVariable != null) row.put(pathVariable, scalar(pathBody(new PathFound(vertices, edges))));
-            if (matches(target, current, eval, row)) {
-                slots(eval, row);
-                if (where == null || eval.isTrue(where)) found.add(new PathFound(List.copyOf(vertices), List.copyOf(edges)));
-            }
+            if (acceptPath(target, pattern, initial, eval, where, pathVariable, vertices, edges))
+                found.add(new PathFound(List.copyOf(vertices), List.copyOf(edges)));
         }
         if (edges.size() == max) return;
         if (mode.equalsIgnoreCase("SIMPLE") && vertices.size() > 1 && current.getId().equals(vertices.getFirst().getId())) return;
-        List<Entity> candidates = new ArrayList<>();
-        if (pattern.direction() != Stmt.EdgePat.Direction.IN) candidates.addAll(data.neighbors(graph, current.getId(), true, pattern.typeName(), queryScope));
-        if (pattern.direction() != Stmt.EdgePat.Direction.OUT) candidates.addAll(data.neighbors(graph, current.getId(), false, pattern.typeName(), queryScope));
-        Set<String> seen = new HashSet<>();
-        for (Entity edge : candidates) {
-            if (!seen.add(identity(edge)) || mode.equalsIgnoreCase("TRAIL") && edges.stream().anyMatch(existing -> identity(existing).equals(identity(edge)))) continue;
+        for (Entity edge : adjacent(graph, current.getId(), pattern.direction(), pattern.typeName(), queryScope)) {
+            if (mode.equalsIgnoreCase("TRAIL") && edges.stream().anyMatch(existing -> identity(existing).equals(identity(edge)))) continue;
             Value id = edge.getSource().equals(current.getId()) ? edge.getTarget() : edge.getSource();
             boolean repeated = vertices.stream().anyMatch(vertex -> vertex.getId().equals(id));
             if (repeated && mode.equalsIgnoreCase("ACYCLIC")) continue;
             if (repeated && mode.equalsIgnoreCase("SIMPLE") && !id.equals(vertices.getFirst().getId())) continue;
-            Entity next = data.get(graph, true, id, queryScope);
+            Entity next = node(graph, null, id, queryScope);
             if (next == null) continue;
             var row = new LinkedHashMap<>(initial);
             if (pattern.variable() != null) row.put(pattern.variable(), edge);
@@ -676,17 +862,13 @@ public final class RemoteQueryEngine {
     }
     private List<Map<String, Entity>> bindings(GraphDefinition graph, Stmt.NodePat source, Stmt.EdgePat edge, Stmt.NodePat target,
                                                 Expr where, ExprEval eval, TransactionEngine.QueryScope scope, BooleanSupplier canceled, String mode) {
+        return bindings(graph, source, edge, target, where, where, eval, scope, canceled, mode);
+    }
+    /** @param hint 只用来取起点 ID 候选的条件，例如 MATCH 子句的 WHERE；不在这里过滤 */
+    private List<Map<String, Entity>> bindings(GraphDefinition graph, Stmt.NodePat source, Stmt.EdgePat edge, Stmt.NodePat target,
+                                                Expr where, Expr hint, ExprEval eval, TransactionEngine.QueryScope scope, BooleanSupplier canceled, String mode) {
         List<Map<String, Entity>> result = new ArrayList<>();
-        Object id = property(source.properties(), "id", eval);
-        List<Entity> starts;
-        if (id != null) {
-            Entity found = node(graph, source.typeName(), EntityCodec.value(id), scope);
-            starts = found == null ? List.of() : List.of(found);
-        } else {
-            Map<String, Value> filters = new HashMap<>();
-            for (var prop : source.properties()) filters.put(prop.name(), EntityCodec.value(eval.eval(prop.value())));
-            starts = filters.isEmpty() ? data.scan(graph, true, source.typeName(), scope) : data.lookup(graph, true, source.typeName(), filters, scope);
-        }
+        List<Entity> starts = starts(graph, source, hint, eval, scope);
         for (Entity node : starts) {
             check(canceled);
             Map<String, Entity> row = new LinkedHashMap<>();
@@ -704,12 +886,7 @@ public final class RemoteQueryEngine {
                 expand(graph, node, node, row, edge, target, where, eval, scope, canceled, 0, min, max, new HashSet<>(), visited, mode == null ? "WALK" : mode, result);
                 continue;
             }
-            List<Entity> edges = new ArrayList<>();
-            if (edge.direction() != Stmt.EdgePat.Direction.IN) edges.addAll(data.neighbors(graph, node.getId(), true, edge.typeName(), scope));
-            if (edge.direction() != Stmt.EdgePat.Direction.OUT) edges.addAll(data.neighbors(graph, node.getId(), false, edge.typeName(), scope));
-            Set<String> seen = new HashSet<>();
-            for (Entity relation : edges) {
-                if (!seen.add(identity(relation))) continue;
+            for (Entity relation : adjacent(graph, node.getId(), edge.direction(), edge.typeName(), scope)) {
                 Value otherId = relation.getSource().equals(node.getId()) ? relation.getTarget() : relation.getSource();
                 Entity other = node(graph, target.typeName(), otherId, scope);
                 if (other == null) continue;
@@ -744,18 +921,13 @@ public final class RemoteQueryEngine {
             }
         }
         if (hop == max) return;
-        List<Entity> edges = new ArrayList<>();
-        if (edge.direction() != Stmt.EdgePat.Direction.IN) edges.addAll(data.neighbors(graph, current.getId(), true, edge.typeName(), scope));
-        if (edge.direction() != Stmt.EdgePat.Direction.OUT) edges.addAll(data.neighbors(graph, current.getId(), false, edge.typeName(), scope));
-        Set<String> seen = new HashSet<>();
-        for (Entity relation : edges) {
-            if (!seen.add(identity(relation))) continue;
+        for (Entity relation : adjacent(graph, current.getId(), edge.direction(), edge.typeName(), scope)) {
             if (mode.equalsIgnoreCase("TRAIL") && usedEdges.contains(identity(relation))) continue;
             Value next = relation.getSource().equals(current.getId()) ? relation.getTarget() : relation.getSource();
             boolean repeated = visited.contains(next);
             boolean closeStart = mode.equalsIgnoreCase("SIMPLE") && next.equals(start.getId());
             if (repeated && (mode.equalsIgnoreCase("ACYCLIC") || mode.equalsIgnoreCase("SIMPLE")) && !closeStart) continue;
-            Entity other = data.get(graph, true, next, scope);
+            Entity other = node(graph, null, next, scope);
             if (other == null) continue;
             var bound = new LinkedHashMap<>(initial);
             if (edge.variable() != null) bound.put(edge.variable(), relation);
@@ -774,9 +946,34 @@ public final class RemoteQueryEngine {
         }
     }
 
+    static boolean isAggregate(Expr expr) {
+        return expr instanceof Expr.Call call && AGGREGATES.contains(call.name().toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * 非聚合返回项都是分组键。GROUP BY 里的每一项都要对应一个返回项（返回项本身、它的别名，或者用变量 n 代替 id(n)），
+     * 否则会按没返回的值分组、结果看不出分组依据。返回了但没写进 GROUP BY 的值照样参与分组，和以前的单机引擎一致。
+     */
+    static boolean groupsMatch(List<Stmt.Item> items, List<Expr> groupBy) {
+        for (Expr group : groupBy) {
+            boolean found = false;
+            for (var item : items) if (!isAggregate(item.expr()) && sameGroup(item, group)) { found = true; break; }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    private static boolean sameGroup(Stmt.Item item, Expr group) {
+        if (item.expr().equals(group)) return true;
+        if (!(group instanceof Expr.Variable variable)) return false;
+        if (variable.name().equals(item.alias())) return true;
+        return item.expr() instanceof Expr.Call call && call.name().equalsIgnoreCase("id")
+                && call.args().size() == 1 && call.args().getFirst().equals(variable);
+    }
+
     private QueryResult project(List<Map<String, Entity>> bindings, List<Stmt.Item> items, List<Stmt.Sort> sorts, boolean distinct,
-                                Expr skip, Expr limit, ExprEval eval, BooleanSupplier canceled) {
-        boolean aggregate = items.stream().anyMatch(item -> item.expr() instanceof Expr.Call c && Set.of("count", "sum", "avg", "min", "max").contains(c.name().toLowerCase(Locale.ROOT)));
+                                Expr postFilter, Expr skip, Expr limit, ExprEval eval, BooleanSupplier canceled) {
+        boolean aggregate = items.stream().anyMatch(item -> isAggregate(item.expr()));
         List<List<Object>> rows = new ArrayList<>(), keys = new ArrayList<>();
         String[] kinds = new String[items.size()];
         for (var row : bindings) {
@@ -784,7 +981,7 @@ public final class RemoteQueryEngine {
             List<Object> projected = new ArrayList<>();
             for (int i = 0; i < items.size(); i++) {
                 Expr expression = items.get(i).expr();
-                if (aggregate && expression instanceof Expr.Call call && Set.of("count", "sum", "avg", "min", "max").contains(call.name().toLowerCase(Locale.ROOT))) {
+                if (aggregate && isAggregate(expression) && expression instanceof Expr.Call call) {
                     boolean star = call.args().isEmpty() || call.args().getFirst() instanceof Expr.Variable v && v.name().equals("*");
                     kinds[i] = star ? "star" : call.name().toLowerCase(Locale.ROOT);
                     projected.add(star ? 1L : eval.eval(call.args().getFirst()));
@@ -806,7 +1003,7 @@ public final class RemoteQueryEngine {
         if (aggregate) {
             for (int i = 0; i < kinds.length; i++) if (kinds[i] == null) {
                 Expr expression = items.get(i).expr();
-                kinds[i] = expression instanceof Expr.Call c ? (c.args().isEmpty() ? "star" : c.name().toLowerCase(Locale.ROOT)) : "group";
+                kinds[i] = isAggregate(expression) && expression instanceof Expr.Call c ? (c.args().isEmpty() ? "star" : c.name().toLowerCase(Locale.ROOT)) : "group";
             }
             rows = DuckResult.aggregate(rows, kinds, duck, cancellation);
             keys = new ArrayList<>();
@@ -823,10 +1020,22 @@ public final class RemoteQueryEngine {
                 keys.add(sort);
             }
         }
+        List<String> columns = items.stream().map(item -> item.alias() == null ? item.text() : item.alias()).toList();
+        if (postFilter != null) {
+            List<List<Object>> keptRows = new ArrayList<>(), keptKeys = new ArrayList<>();
+            for (int row = 0; row < rows.size(); row++) {
+                check(canceled);
+                Map<String, ExprEval.Slot> values = new HashMap<>();
+                for (int i = 0; i < columns.size(); i++) values.put(columns.get(i), ExprEval.Slot.scalar(rows.get(row).get(i)));
+                eval.slots(values);
+                if (eval.isTrue(postFilter)) { keptRows.add(rows.get(row)); keptKeys.add(keys.get(row)); }
+            }
+            rows = keptRows; keys = keptKeys;
+        }
         Long offset = skip == null ? null : ((Number) eval.eval(skip)).longValue();
         Long max = limit == null ? null : ((Number) eval.eval(limit)).longValue();
         rows = DuckResult.arrange(rows, keys, sorts, distinct, offset, max, duck, cancellation);
-        return new QueryResult(items.stream().map(item -> item.alias() == null ? item.text() : item.alias()).toList(), rows, 0);
+        return new QueryResult(columns, rows, 0);
     }
 
     private static void addInsertNode(Stmt.NodePat pattern, ExprEval eval, List<Entity> entities) {
@@ -843,7 +1052,32 @@ public final class RemoteQueryEngine {
     }
     /** 模式里写了标签就直接读这个类型的记录，一次点读；没写标签先查点目录。 */
     private Entity node(GraphDefinition graph, String typeName, Value id, TransactionEngine.QueryScope scope) {
-        return typeName == null || typeName.isBlank() ? data.get(graph, true, id, scope) : data.get(graph, true, typeName, id, scope);
+        String type = typeName == null || typeName.isBlank() ? "" : typeName;
+        NodeKey key = new NodeKey(type, id);
+        Optional<Entity> cached = nodeCache.get(key);
+        if (cached == null) {
+            cached = Optional.ofNullable(reads.node(graph, type, id, scope));
+            nodeCache.put(key, cached);
+            cached.ifPresent(found -> nodeCache.putIfAbsent(new NodeKey(type.isEmpty() ? found.getType() : "", id), Optional.of(found)));
+        }
+        return cached.orElse(null);
+    }
+    /** 一个点在模式方向上的邻接边，同一条边只出现一次。 */
+    private List<Entity> adjacent(GraphDefinition graph, Value vertex, Stmt.EdgePat.Direction direction, String edgeType,
+                                  TransactionEngine.QueryScope scope) {
+        List<Entity> result = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (boolean out : direction == Stmt.EdgePat.Direction.OUT ? List.of(true)
+                : direction == Stmt.EdgePat.Direction.IN ? List.of(false) : List.of(true, false)) {
+            AdjacencyKey key = new AdjacencyKey(vertex, out, edgeType == null ? "" : edgeType);
+            List<Entity> edges = adjacencyCache.get(key);
+            if (edges == null) {
+                edges = List.copyOf(reads.neighbors(graph, vertex, out, edgeType, scope));
+                adjacencyCache.put(key, edges);
+            }
+            for (Entity edge : edges) if (seen.add(identity(edge))) result.add(edge);
+        }
+        return result;
     }
     private static Object property(List<Stmt.Prop> properties, String field, ExprEval eval) {
         for (var prop : properties) if (prop.name().equals(field)) return eval.eval(prop.value());
