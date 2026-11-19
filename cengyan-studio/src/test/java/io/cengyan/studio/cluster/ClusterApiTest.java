@@ -123,6 +123,23 @@ class ClusterApiTest {
         }
     }
 
+    /** 滚动升级期间新 Studio 配旧版 Compute：旧 Compute 把 root 报成 write，Studio 仍按 admin 放行集群管理。 */
+    @Test void rootIsAdminWithOldCompute() throws Exception {
+        Path home = Fakes.home(tmp.resolve("old-compute-home"));
+        try (var db = new io.cengyan.studio.FakeDb(request -> switch (request.path("op").asText()) {
+            case "login" -> "{\"code\":\"OK\",\"session\":\"old-root\",\"token\":\"old-root\",\"columns\":[\"user\",\"role\"],\"rows\":[[\"root\",\"write\"]]}";
+            case "session" -> "{\"code\":\"OK\",\"session\":\"old-root\",\"user\":\"root\",\"role\":\"write\"}";
+            default -> "{\"code\":\"OK\"}";
+        }); StudioServer studio = StudioServer.start(config(home, db.port()))) {
+            int port = studio.port();
+            assertEquals("OK", call(port, "POST", "admin/setup", null, "{\"password\":\"root-pass-1\"}").body().path("code").asText());
+            JsonNode login = api(port, "/api/login", null, login("root", "root-pass-1")).body();
+            assertEquals("admin", login.path("rows").get(0).get(1).asText(), login.toString());
+            assertEquals("admin", api(port, "/api/session", "old-root", "{}").body().path("role").asText());
+            assertEquals(200, call(port, "GET", "overview", "old-root", null).status(), "root 能进集群管理");
+        }
+    }
+
     /** 数据库能回答时不走兜底；集群管理只给 admin，运维监控所有角色；root 登录成功后同步保存的密码。 */
     @Test void databaseSessionsAndRoles() throws Exception {
         Path home = Fakes.home(tmp.resolve("db-home"));

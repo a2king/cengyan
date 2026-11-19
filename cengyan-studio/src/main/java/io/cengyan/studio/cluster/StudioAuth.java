@@ -110,10 +110,19 @@ public final class StudioAuth {
         String code = reply.path("code").asText();
         if (code.equals("UNAUTHENTICATED")) { cache.remove(token); throw new ClusterError("UNAUTHORIZED", "登录已失效，请重新登录"); }
         if (!code.equals("OK")) throw new ClusterError("DB_UNAVAILABLE", "数据库不可用（" + reply.path("message").asText(code) + "），可用 root 重新登录进入集群管理");
-        Principal principal = new Principal(reply.path("user").asText(), reply.path("role").asText(), false);
+        String user = reply.path("user").asText();
+        Principal principal = new Principal(user, effectiveRole(user, reply.path("role").asText()), false);
         if (cache.size() > 1000) cache.entrySet().removeIf(e -> e.getValue().expiresAt() <= now);
         cache.put(token, new Cached(principal, now + CACHE_MS));
         return principal;
+    }
+
+    /**
+     * root 一律按 admin 处理，与 TokenAuthority.level 一致。滚动升级期间旧版 Compute 仍按存储里的历史值把 root 报成 write，
+     * 不在这里纠正的话，新 Studio 配旧 Compute 时 root 进不了集群管理，也就无法继续升级 Compute。
+     */
+    public static String effectiveRole(String user, String role) {
+        return ROOT.equals(user) ? "admin" : role;
     }
 
     public Principal requireAdmin(String token) {

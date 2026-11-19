@@ -166,7 +166,23 @@ public final class StudioServer implements AutoCloseable {
         ObjectNode request = MAPPER.createObjectNode();
         request.put("op", "session");
         request.put("session", token);
-        forward(exchange, request, 3000);
+        try {
+            JsonNode reply = MAPPER.readTree(db.exchange(request, 3000));
+            if (reply instanceof ObjectNode node && "OK".equals(node.path("code").asText())) {
+                node.put("role", StudioAuth.effectiveRole(node.path("user").asText(), node.path("role").asText()));
+            }
+            send(exchange, 200, reply);
+        } catch (IOException ex) {
+            send(exchange, 502, error("UNAVAILABLE", "连不上图数据库：" + ex.getMessage()));
+        }
+    }
+
+    /** 登录成功的响应里 rows[0] = [user, role]：root 按 admin 返回（旧版 Compute 报 write，见 StudioAuth.effectiveRole）。 */
+    private static void normalizeLoginRole(JsonNode reply) {
+        JsonNode row = reply.path("rows").path(0);
+        if (row instanceof com.fasterxml.jackson.databind.node.ArrayNode array && array.size() >= 2) {
+            array.set(1, MAPPER.getNodeFactory().textNode(StudioAuth.effectiveRole(array.get(0).asText(), array.get(1).asText())));
+        }
     }
 
     private static ObjectNode localSession(String token) {
@@ -271,6 +287,7 @@ public final class StudioServer implements AutoCloseable {
             if (StudioAuth.ROOT.equals(user)) {
                 try { auth.rootVerified(password); } catch (IOException | RuntimeException ignored) { /* 同步失败不影响登录 */ }
             }
+            normalizeLoginRole(reply);
             send(exchange, 200, reply);
             return;
         }
