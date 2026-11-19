@@ -4,14 +4,30 @@ import java.util.List;
 
 /** 一条语句。字段名沿用用户写下的大小写。 */
 public sealed interface Stmt {
-    record CreateGraph(String name, int parts, String comment, boolean ifNotExists, int replicas, String idType, int idLength) implements Stmt {
+    /**
+     * @param types 标准写法 {@code CREATE GRAPH g { ... }} 里一起建的点类型和边类型，没有写时为空
+     * @param like  {@code CREATE GRAPH g LIKE other}：复制另一张图的类型定义，没有写时为空
+     */
+    record CreateGraph(String name, int parts, String comment, boolean ifNotExists, int replicas, String idType, int idLength,
+                       List<CreateType> types, String like) implements Stmt {
+        public CreateGraph {
+            types = types == null ? List.of() : List.copyOf(types);
+        }
+        public CreateGraph(String name, int parts, String comment, boolean ifNotExists, int replicas, String idType, int idLength) {
+            this(name, parts, comment, ifNotExists, replicas, idType, idLength, List.of(), null);
+        }
         public CreateGraph(String name) { this(name, 1, null, false, 1, "INT", 0); }
         public CreateGraph(String name, String comment) { this(name, 1, comment, false, 1, "INT", 0); }
         public CreateGraph(String name, int parts, String comment) { this(name, parts, comment, false, 1, "INT", 0); }
         public CreateGraph(String name, int parts, String comment, boolean ifNotExists) { this(name, parts, comment, ifNotExists, 1, "INT", 0); }
     }
 
+    /** 切换当前图：{@code USE g} 单独成句，或 {@code SESSION SET GRAPH g}。 */
     record Use(String name) implements Stmt {
+    }
+
+    /** 标准的 USE 子句：{@code USE g MATCH ...}，只对这一条查询换图，不改变会话的当前图。 */
+    record UseQuery(String graph, Stmt body) implements Stmt {
     }
 
     record CreateAlias(String alias, String graph) implements Stmt {
@@ -119,9 +135,21 @@ public sealed interface Stmt {
     record Arg(String name, Expr value) {
     }
 
-    record Call(String name, List<Arg> args, List<String> yield) implements Stmt {
+    /**
+     * 过程调用。{@code yield} 是过程输出的列名，{@code as} 是同位置的别名（没写 AS 时与列名相同）；
+     * {@code yield} 为空表示返回全部列。{@code optional} 对应 {@code OPTIONAL CALL}：没有结果时保留输入行，输出列为空值。
+     */
+    record Call(String name, List<Arg> args, List<String> yield, List<String> as, boolean optional) implements Stmt {
+        public Call {
+            yield = yield == null ? List.of() : List.copyOf(yield);
+            as = as == null || as.isEmpty() ? yield : List.copyOf(as);
+        }
+        public Call(String name, List<Arg> args, List<String> yield) {
+            this(name, args, yield, null, false);
+        }
     }
 
+    /** 列定义。标准规定属性默认可空，写 {@code NOT NULL} 才不能为空。 */
     record Field(String name, String valueType, boolean nullable, String comment) {
         public Field(String name, String valueType, boolean nullable) { this(name, valueType, nullable, null); }
     }
@@ -132,7 +160,7 @@ public sealed interface Stmt {
         }
     }
 
-    /** 点上的标签表达式。单个名字时 {@link NodePat#typeName()} 同时有值。 */
+    /** 点或边上的标签表达式。单个名字时 {@link NodePat#typeName()} 同时有值。 */
     sealed interface Label {
         record One(String name) implements Label {
         }
@@ -156,29 +184,64 @@ public sealed interface Stmt {
     record AggregateFilter(Stmt query, Expr condition) implements Stmt {
     }
 
+    /** {@code op} 为 UNION、EXCEPT、INTERSECT 或 OTHERWISE（左边没有结果时取右边）。 */
     record Composite(String op, boolean all, Stmt left, Stmt right) implements Stmt {
     }
 
-    record Next(Stmt left, Stmt right) implements Stmt {
+    /** {@code left NEXT [YIELD ...] right}。{@code yield} 为空时把左边的全部列传给右边。 */
+    record Next(Stmt left, Stmt right, List<Item> yield) implements Stmt {
+        public Next {
+            yield = yield == null ? List.of() : List.copyOf(yield);
+        }
+        public Next(Stmt left, Stmt right) {
+            this(left, right, List.of());
+        }
     }
 
-    record InsertGraph(List<Element> elements) implements Stmt {
+    /** 不带 MATCH 的 INSERT。{@code tail} 是 INSERT 之后的 RETURN，没有写时为空。 */
+    record InsertGraph(List<Element> elements, Tail tail) implements Stmt {
+        public InsertGraph(List<Element> elements) {
+            this(elements, null);
+        }
     }
 
-    record InsertUsing(List<Clause> clauses, List<Element> elements) implements Stmt {
+    record InsertUsing(List<Clause> clauses, List<Element> elements, Tail tail) implements Stmt {
+        public InsertUsing(List<Clause> clauses, List<Element> elements) {
+            this(clauses, elements, null);
+        }
     }
 
-    /** MATCH 之后的写入：赋值、REMOVE、DELETE 至少有一种。 */
+    /**
+     * MATCH 之后的写入：赋值、REMOVE、DELETE 至少有一种。
+     * {@code labelSets} / {@code labelRemovals} 是 {@code SET n:L} / {@code REMOVE n:L}，变量放在 variable，标签放在 field。
+     * {@code tail} 是写入之后的 RETURN，没有写时为空。
+     */
     record Mutate(
             List<Clause> clauses,
             List<Assign> assignments,
             List<Assign> replacements,
             List<String> removals,
             List<String> deletes,
-            boolean detach) implements Stmt {
+            boolean detach,
+            List<Assign> labelSets,
+            List<Assign> labelRemovals,
+            Tail tail) implements Stmt {
+        public Mutate {
+            labelSets = labelSets == null ? List.of() : List.copyOf(labelSets);
+            labelRemovals = labelRemovals == null ? List.of() : List.copyOf(labelRemovals);
+        }
+        public Mutate(List<Clause> clauses, List<Assign> assignments, List<Assign> replacements, List<String> removals,
+                      List<String> deletes, boolean detach) {
+            this(clauses, assignments, replacements, removals, deletes, detach, List.of(), List.of(), null);
+        }
     }
 
     sealed interface Clause {
+        /**
+         * 一条 MATCH。{@code pathVariable}、{@code search}、{@code searchCount}、{@code mode} 是第一个路径模式上的写法，
+         * 为兼容旧代码保留；每个路径模式自己的前缀见 {@link Pattern}。
+         * {@code matchMode} 为 REPEATABLE_ELEMENTS、DIFFERENT_EDGES 或空。
+         */
         record Match(
                 boolean optional,
                 String pathVariable,
@@ -186,7 +249,12 @@ public sealed interface Stmt {
                 Integer searchCount,
                 String mode,
                 List<Pattern> patterns,
-                Expr where) implements Clause {
+                Expr where,
+                String matchMode) implements Clause {
+            public Match(boolean optional, String pathVariable, String search, Integer searchCount, String mode,
+                         List<Pattern> patterns, Expr where) {
+                this(optional, pathVariable, search, searchCount, mode, patterns, where, null);
+            }
         }
 
         record Filter(Expr expr) implements Clause {
@@ -195,14 +263,44 @@ public sealed interface Stmt {
         record Let(String name, Expr value) implements Clause {
         }
 
-        record For(String name, Expr list) implements Clause {
+        /** {@code FOR x IN list [WITH ORDINALITY i | WITH OFFSET i]}。ORDINALITY 从 1 开始，OFFSET 从 0 开始。 */
+        record For(String name, Expr list, String position, boolean zeroBased) implements Clause {
+            public For(String name, Expr list) {
+                this(name, list, null, false);
+            }
         }
 
         record Call(Stmt.Call call) implements Clause {
         }
+
+        /** 管道中间的 {@code ORDER BY ... OFFSET ... LIMIT ...}。 */
+        record OrderPage(List<Sort> orderBy, Expr skip, Expr limit) implements Clause {
+        }
+
+        /**
+         * 内联过程 {@code [OPTIONAL] CALL [(x, y)] { 查询 }}。{@code scope} 为空表示外层变量都可见，
+         * 否则只有列出的变量可见。
+         */
+        record Inline(Stmt body, List<String> scope, boolean optional) implements Clause {
+        }
+
+        /** {@code OPTIONAL { MATCH ... MATCH ... }}：块内全部匹配不上时保留输入行，块内变量为空。 */
+        record OptionalBlock(List<Clause> clauses) implements Clause {
+        }
     }
 
-    record Pattern(List<Element> elements) {
+    /**
+     * 一个路径模式：{@code [p =] [搜索前缀] [路径模式] 元素序列}。
+     * {@code union} 是用 {@code |} 或 {@code |+|} 接在后面的其他分支；{@code multiset} 为真表示 {@code |+|}，保留重复。
+     */
+    record Pattern(String pathVariable, String search, Integer searchCount, String mode, List<Element> elements,
+                   List<List<Element>> union, boolean multiset) {
+        public Pattern {
+            union = union == null ? List.of() : List.copyOf(union);
+        }
+        public Pattern(List<Element> elements) {
+            this(null, null, null, null, elements, List.of(), false);
+        }
     }
 
     sealed interface Element {
@@ -216,6 +314,7 @@ public sealed interface Stmt {
         }
     }
 
+    /** {@code finish} 对应 {@code FINISH}：不返回结果。{@code noBindings} 对应 {@code RETURN NO BINDINGS}。 */
     record Tail(
             boolean distinct,
             boolean star,
@@ -224,13 +323,23 @@ public sealed interface Stmt {
             List<Sort> orderBy,
             Expr skip,
             Expr limit,
-            Expr postFilter) {
+            Expr postFilter,
+            boolean finish) {
+        public Tail(boolean distinct, boolean star, List<Item> items, List<Expr> groupBy,
+                    List<Sort> orderBy, Expr skip, Expr limit, Expr postFilter) {
+            this(distinct, star, items, groupBy, orderBy, skip, limit, postFilter, false);
+        }
         public Tail(boolean distinct, boolean star, List<Item> items, List<Expr> groupBy,
                     List<Sort> orderBy, Expr skip, Expr limit) {
-            this(distinct, star, items, groupBy, orderBy, skip, limit, null);
+            this(distinct, star, items, groupBy, orderBy, skip, limit, null, false);
         }
     }
 
+    /**
+     * 边模式。{@code label} 是完整的标签表达式；{@code typeNames} 是它能直接列出的类型（单个名字或只由名字组成的 {@code |}），
+     * 列不出来（含 {@code !}、{@code &}、{@code %}）时为空，执行时读全部类型再按 {@code label} 过滤。
+     * {@code where} 是边内的 {@code -[e WHERE ...]->}。
+     */
     record EdgePat(
             Direction direction,
             String variable,
@@ -238,14 +347,22 @@ public sealed interface Stmt {
             Long rank,
             List<Prop> properties,
             Integer minHop,
-            Integer maxHop) {
+            Integer maxHop,
+            Label label,
+            Expr where) {
         public EdgePat {
             typeNames = typeNames == null ? List.of() : List.copyOf(typeNames);
+            properties = properties == null ? List.of() : List.copyOf(properties);
+        }
+
+        public EdgePat(Direction direction, String variable, List<String> typeNames, Long rank, List<Prop> properties,
+                       Integer minHop, Integer maxHop) {
+            this(direction, variable, typeNames, rank, properties, minHop, maxHop, null, null);
         }
 
         /** 正好一个类型时返回它。不写类型或写了多个类型时返回空。 */
         public String typeName() {
-            return typeNames.size() == 1 ? typeNames.get(0) : null;
+            return typeNames.size() == 1 && (label == null || label instanceof Label.One) ? typeNames.get(0) : null;
         }
 
         public enum Direction {

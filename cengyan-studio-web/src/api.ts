@@ -112,7 +112,7 @@ export class CengyanApi {
   }
 
   async query(query: string, timeoutMs = 10000): Promise<QueryResponse> {
-    const use = /^\s*USE\s+([\p{L}][\p{L}\p{N}_]*)\s*;?\s*$/iu.exec(query);
+    const use = /^\s*(?:USE|SESSION\s+SET\s+(?:PROPERTY\s+)?GRAPH)\s+([\p{L}_][\p{L}\p{N}_]*)\s*;?\s*$/iu.exec(query);
     const target = use ? use[1] : usesCurrentGraph(query) ? this.graph : '';
     try {
       const response = await this.request('/api/query', { query, timeoutMs, graph: target });

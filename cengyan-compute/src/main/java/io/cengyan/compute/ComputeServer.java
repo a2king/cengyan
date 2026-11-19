@@ -303,9 +303,12 @@ public final class ComputeServer implements AutoCloseable {
                      log.info("请求开始 requestId={} op={} graph={} write={} timeoutMs={} query={}", id, op,
                              request.path("graph").asText(""), write, Math.max(1, TimeUnit.NANOSECONDS.toMillis(ingressDeadline - System.nanoTime())),
                              queryText.length() > 8192 ? queryText.substring(0, 8192) + "...(truncated)" : queryText);
-                    if (request.path("query").asText().stripLeading().toUpperCase(Locale.ROOT).startsWith("USE ")) {
+                    String leading = request.path("query").asText().stripLeading().toUpperCase(Locale.ROOT);
+                    if (leading.startsWith("USE") || leading.startsWith("SESSION")) {
                         var statements = Gql.parseAll(request.path("query").asText());
+                        // USE g / SESSION SET GRAPH g 切换当前图；USE g 查询 只让这一条请求换图。
                         if (statements.size() == 1 && statements.getFirst() instanceof Stmt.Use use) request.put("graph", use.name());
+                        if (statements.size() == 1 && statements.getFirst() instanceof Stmt.UseQuery use) request.put("graph", use.graph());
                     }
                     long timeout = request.path("remainingTimeoutMs").asLong(request.path("timeoutMs").asLong(config.executionTimeoutMs()));
                     if (timeout <= 0) timeout = config.executionTimeoutMs();
@@ -355,7 +358,7 @@ public final class ComputeServer implements AutoCloseable {
         if ("createGraph".equals(op)) return false;
         if (!"execute".equals(op)) return true;
         String text = query == null ? "" : query.stripLeading().toUpperCase(Locale.ROOT);
-        return !(text.startsWith("CREATE GRAPH") || text.startsWith("SHOW GRAPHS") || text.startsWith("SHOW ALIASES"));
+        return !(text.startsWith("CREATE GRAPH") || text.startsWith("CREATE PROPERTY GRAPH") || text.startsWith("SHOW GRAPHS") || text.startsWith("SHOW ALIASES"));
     }
 
     private final ConcurrentMap<String, SchemaLease> schemaLeases = new ConcurrentHashMap<>();
@@ -859,6 +862,7 @@ public final class ComputeServer implements AutoCloseable {
         return TokenAuthority.ADMIN;
     }
     static int statementLevel(Stmt stmt) {
+        if (stmt instanceof Stmt.UseQuery use) return statementLevel(use.body());
         if (stmt instanceof Stmt.Composite composite) return Math.max(statementLevel(composite.left()), statementLevel(composite.right()));
         if (stmt instanceof Stmt.Next next) return Math.max(statementLevel(next.left()), statementLevel(next.right()));
         if (stmt instanceof Stmt.AggregateFilter filter) return statementLevel(filter.query());
@@ -948,6 +952,7 @@ public final class ComputeServer implements AutoCloseable {
         return (host.contains(":") ? "[" + host + "]" : host) + ":" + endpoint.getPort();
     }
     private static boolean readOnly(Stmt stmt) {
+        if (stmt instanceof Stmt.UseQuery use) return readOnly(use.body());
         if (stmt instanceof Stmt.Composite composite) return readOnly(composite.left()) && readOnly(composite.right());
         if (stmt instanceof Stmt.Next next) return readOnly(next.left()) && readOnly(next.right());
         if (stmt instanceof Stmt.AggregateFilter filter) return readOnly(filter.query());

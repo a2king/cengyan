@@ -43,6 +43,24 @@ class PermissionLevelTest {
     }
 
     @Test
+    void 标准新写法的权限() {
+        for (String q : new String[] {"USE g MATCH (a:Company) RETURN a", "SESSION SET GRAPH g", "LET x = 1 RETURN x",
+                "MATCH (a) RETURN a OTHERWISE RETURN 1 AS a", "MATCH (a) CALL (a) { MATCH (a)-[:holder]->(b) RETURN count(*) AS c } RETURN c",
+                "MATCH (a) WHERE EXISTS { (a)-[:holder]->(b) } RETURN a", "MATCH (a) RETURN a NEXT FILTER a IS NOT NULL RETURN a"}) {
+            assertEquals(READ, gql(q), q);
+        }
+        for (String q : new String[] {"USE g INSERT (n:Company {id:'x'})", "MATCH (a:Company) SET a.name = 'n' RETURN a",
+                "MATCH (a:Company) REMOVE a.name", "INSERT (n:Company {id:'x'}) RETURN n", "USE g MATCH (a) DETACH DELETE a FINISH"}) {
+            assertEquals(WRITE, gql(q), q);
+        }
+        assertEquals(ADMIN, gql("CREATE GRAPH g { (:Company {name STRING}) }"));
+        assertEquals(ADMIN, gql("CREATE PROPERTY GRAPH g LIKE other"));
+        // 子查询里写入在解析阶段就被拒绝，不会被当成只读语句放行。
+        assertEquals("SYNTAX", assertThrows(ClusterException.class,
+                () -> gql("MATCH (a) CALL { MATCH (b) SET b.x = 1 RETURN b } RETURN a")).code());
+    }
+
+    @Test
     void 语法错误直接返回SYNTAX() {
         ClusterException ex = assertThrows(ClusterException.class, () -> gql("MATCH (a RETURN"));
         assertEquals("SYNTAX", ex.code());

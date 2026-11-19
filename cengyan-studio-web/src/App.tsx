@@ -625,7 +625,7 @@ function quoteComment(comment?: string): string {
 async function typeSchemaStatement(api: CengyanApi, type: TypeRow, node: boolean): Promise<string> {
   const response = await api.query(`DESCRIBE ${node ? 'NODE' : 'REL'} TYPE ${escapeIdent(type.name)}`);
   const properties = rowsAsObjects<TypeProperty>(response)
-    .map((property) => `${escapeIdent(property.property)} ${property.type}${property.nullable ? ' NULL' : ''}${quoteComment(property.comment)}`)
+    .map((property) => `${escapeIdent(property.property)} ${property.type}${property.nullable ? ' NULL' : ' NOT NULL'}${quoteComment(property.comment)}`)
     .join(', ');
   const idClause = node ? ` ${graphKeySpec(type.idType, type.idLength).clause}` : '';
   return `CREATE ${node ? 'NODE' : 'REL'} TYPE ${escapeIdent(type.name)}${quoteComment(type.comment)}${idClause} (${properties})`;
@@ -832,7 +832,7 @@ function TypesPanel({ api, graph, node, canWrite, onCopied, idType, idLength }: 
     comment?: string;
     properties?: Array<{ name?: string; type?: string; nullable?: boolean; comment?: string }>;
   }) => {
-    const props = (values.properties || []).filter((item) => item.name?.trim()).map((item) => `${escapeIdent(item.name!.trim())} ${item.type || 'STRING'}${item.nullable === false ? '' : ' NULL'}${item.comment ? ` COMMENT '${item.comment.replaceAll("'", "''")}'` : ''}`);
+    const props = (values.properties || []).filter((item) => item.name?.trim()).map((item) => `${escapeIdent(item.name!.trim())} ${item.type || 'STRING'}${item.nullable === false ? ' NOT NULL' : ' NULL'}${item.comment ? ` COMMENT '${item.comment.replaceAll("'", "''")}'` : ''}`);
     const idClause = node ? ` ${keySpec.clause}` : '';
     const comment = values.comment ? ` COMMENT '${values.comment.replaceAll("'", "''")}'` : '';
     try { await api.query(`CREATE ${kind} TYPE ${escapeIdent(values.name.trim())}${comment}${idClause} (${props.join(', ')})`); setCreateOpen(false); createForm.resetFields(); await load(); }
@@ -1206,7 +1206,8 @@ function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, o
        done.push({ statement: text.trim(), response, elapsedMs: Number(response.elapsedMs ?? 0) });
        setResult([...done]);
        setQueryError('');
-      const uses = [...text.matchAll(/\bUSE\s+([A-Za-z][A-Za-z0-9_]*)/gi)];
+      // 只认单独成句的 USE g / SESSION SET GRAPH g；USE g MATCH ... 只对那一条生效，不切换当前图。
+      const uses = [...text.matchAll(/(?:^|;)\s*(?:USE|SESSION\s+SET\s+(?:PROPERTY\s+)?GRAPH)\s+([\p{L}_][\p{L}\p{N}_]*)\s*(?=;|$)/giu)];
       if (uses.length) onGraphChanged(uses[uses.length - 1][1]);
       localStorage.setItem('cengyan.studio.last-query', text);
     } catch (reason) {

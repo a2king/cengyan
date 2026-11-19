@@ -9,8 +9,11 @@ final class TreeText {
 
     static String of(Stmt stmt) {
         return switch (stmt) {
-            case Stmt.CreateGraph graph -> "(createGraph " + graph.name() + note(graph.comment()) + ")";
+            case Stmt.CreateGraph graph -> "(createGraph " + graph.name() + note(graph.comment())
+                    + (graph.like() == null ? "" : " like " + graph.like())
+                    + (graph.types().isEmpty() ? "" : " " + graph.types().stream().map(TreeText::of).toList()) + ")";
             case Stmt.Use use -> "(use " + use.name() + ")";
+            case Stmt.UseQuery use -> "(use " + use.graph() + " " + of(use.body()) + ")";
             case Stmt.CreateAlias alias -> "(createAlias " + alias.alias() + " " + alias.graph() + ")";
             case Stmt.DropAlias drop -> "(dropAlias " + drop.name() + ")";
             case Stmt.DropGraph drop -> "(dropGraph " + drop.name() + ")";
@@ -73,10 +76,16 @@ final class TreeText {
             case Stmt.Composite composite -> "(" + composite.op() + (composite.all() ? " all " : " ")
                     + of(composite.left()) + " " + of(composite.right()) + ")";
             case Stmt.Next next -> "(next " + of(next.left()) + " " + of(next.right()) + ")";
-            case Stmt.InsertGraph insert -> "(insertGraph " + insert.elements().size() + ")";
-            case Stmt.InsertUsing insert -> "(insertUsing " + insert.elements().size() + ")";
-            case Stmt.Mutate mutate -> "(mutate deletes=" + mutate.deletes().size()
-                    + " detach=" + mutate.detach() + ")";
+            case Stmt.InsertGraph insert -> "(insertGraph " + insert.elements().size()
+                    + (insert.tail() == null ? "" : " " + tail(insert.tail())) + ")";
+            case Stmt.InsertUsing insert -> "(insertUsing " + insert.elements().size()
+                    + (insert.tail() == null ? "" : " " + tail(insert.tail())) + ")";
+            case Stmt.Mutate mutate -> "(mutate"
+                    + (mutate.assignments().isEmpty() ? "" : " set=" + mutate.assignments().size())
+                    + (mutate.removals().isEmpty() ? "" : " remove=" + String.join(",", mutate.removals()))
+                    + " deletes=" + mutate.deletes().size()
+                    + " detach=" + mutate.detach()
+                    + (mutate.tail() == null ? "" : " " + tail(mutate.tail())) + ")";
             case Stmt.Call call -> {
                 StringBuilder text = new StringBuilder("(call ");
                 text.append(call.name());
@@ -84,8 +93,12 @@ final class TreeText {
                     text.append(' ').append(arg.name()).append('=').append(expr(arg.value()));
                 }
                 text.append(" (yield");
-                for (String column : call.yield()) {
+                for (int i = 0; i < call.yield().size(); i++) {
+                    String column = call.yield().get(i);
                     text.append(' ').append(column);
+                    if (!column.equals(call.as().get(i))) {
+                        text.append(':').append(call.as().get(i));
+                    }
                 }
                 text.append("))");
                 yield text.toString();
@@ -152,6 +165,8 @@ final class TreeText {
         }
         if (node.typeName() != null) {
             text.append(':').append(node.typeName());
+        } else if (node.label() != null) {
+            text.append(':').append(label(node.label()));
         }
         for (Stmt.Prop prop : node.properties()) {
             text.append(' ').append(prop.name()).append('=').append(expr(prop.value()));
@@ -166,7 +181,9 @@ final class TreeText {
         if (edge.variable() != null) {
             text.append(' ').append(edge.variable());
         }
-        if (!edge.typeNames().isEmpty()) {
+        if (edge.label() != null && !(edge.label() instanceof Stmt.Label.One) && edge.typeNames().isEmpty()) {
+            text.append(':').append(label(edge.label()));
+        } else if (!edge.typeNames().isEmpty()) {
             text.append(':').append(String.join("|", edge.typeNames()));
         }
         if (edge.rank() != null) {
@@ -184,8 +201,21 @@ final class TreeText {
         for (Stmt.Prop prop : edge.properties()) {
             text.append(' ').append(prop.name()).append('=').append(expr(prop.value()));
         }
+        if (edge.where() != null) {
+            text.append(" (where ").append(expr(edge.where())).append(')');
+        }
         text.append(')');
         return text.toString();
+    }
+
+    private static String label(Stmt.Label label) {
+        return switch (label) {
+            case Stmt.Label.One one -> one.name();
+            case Stmt.Label.Any ignored -> "%";
+            case Stmt.Label.Not not -> "!" + label(not.inner());
+            case Stmt.Label.Or or -> "(" + String.join("|", or.options().stream().map(TreeText::label).toList()) + ")";
+            case Stmt.Label.And and -> "(" + String.join("&", and.options().stream().map(TreeText::label).toList()) + ")";
+        };
     }
 
     private static String expr(Expr expr) {
@@ -212,10 +242,16 @@ final class TreeText {
                     + item.whens().size() + ")";
             case Expr.Exists ignored -> "(exists)";
             case Expr.Typed typed -> "(typed " + expr(typed.value()) + ")";
-            case Expr.Labeled labeled -> "(labeled " + expr(labeled.value()) + ")";
+            case Expr.Labeled labeled -> "(labeled " + expr(labeled.value()) + " " + label(labeled.label()) + ")";
             case Expr.EndpointOf endpoint -> "(endpoint " + expr(endpoint.node()) + ")";
-            case Expr.Same same -> "(same " + same.values().size() + ")";
-            case Expr.PropExists prop -> "(prop-exists " + expr(prop.value()) + ")";
+            case Expr.Same same -> "(" + (same.different() ? "all-different " : "same ") + same.values().size() + ")";
+            case Expr.PropExists prop -> "(prop-exists " + expr(prop.value()) + " " + prop.property() + ")";
+            case Expr.Truth truth -> "(is" + (truth.negated() ? "-not " : " ")
+                    + (truth.truth() == null ? "unknown" : truth.truth().toString()) + " " + expr(truth.value()) + ")";
+            case Expr.Directed directed -> "(" + (directed.negated() ? "is-not-directed " : "is-directed ") + expr(directed.value()) + ")";
+            case Expr.LetIn let -> "(let " + String.join(",", let.names()) + " " + expr(let.body()) + ")";
+            case Expr.ValueQuery ignored -> "(value)";
+            case Expr.Trim trim -> "(trim " + trim.spec() + (trim.chars() == null ? "" : " " + expr(trim.chars())) + " " + expr(trim.source()) + ")";
         };
     }
 
@@ -227,6 +263,9 @@ final class TreeText {
     }
 
     private static String tail(Stmt.Tail tail) {
+        if (tail.finish()) {
+            return "finish";
+        }
         return (tail.star() ? "*" : String.valueOf(tail.items().size()))
                 + (tail.limit() == null ? "" : " limit " + countText(tail.limit()));
     }

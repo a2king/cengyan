@@ -45,8 +45,11 @@ class GqlSyntaxTest {
                 .contains("(edge OUT:holder{3})"));
         assertEquals("(insert (node a:Company id=1 name='root') (edge OUT:holder@3 ratio=0.5) (node b id=2))",
                 Gql.tree("INSERT (a:Company {id:1, name:'root'})-[:holder@3 {ratio:0.5}]->(b {id:2})"));
-        assertEquals("(createType node Company (name:STRING capital:INT64?))",
+        // 标准规定属性默认可空，写 NOT NULL 才不能为空。
+        assertEquals("(createType node Company (name:STRING? capital:INT64?))",
                 Gql.tree("CREATE NODE TYPE Company (name STRING, capital INT64 NULL)"));
+        assertEquals("(createType node Company (name:STRING capital:INT64?))",
+                Gql.tree("CREATE NODE TYPE Company (name STRING NOT NULL, capital INT64)"));
         assertEquals("(alter rel holder note STRING)",
                 Gql.tree("ALTER REL TYPE holder ADD note STRING NULL"));
         assertEquals("(set (node a:Company id=1) (edge OUT e:holder) (node b id=2) (assign e.ratio=0.2))",
@@ -79,9 +82,9 @@ class GqlSyntaxTest {
     }
 
     @Test
-    void 中文和空查询不能通过() {
-        ParseException chinese = assertThrows(ParseException.class, () -> Gql.parse("CREATE GRAPH 股东"));
-        assertTrue(chinese.getMessage().contains("无法识别"));
+    void 中文名字可以直接写而空查询不能通过() {
+        // 标准的正则标识符允许 Unicode 字母，不用反引号。
+        assertEquals("股东", assertInstanceOf(Stmt.CreateGraph.class, Gql.parse("CREATE GRAPH 股东")).name());
         ParseException empty = assertThrows(ParseException.class, () -> Gql.parse("   "));
         assertTrue(empty.getMessage().contains("不能为空"));
         assertInstanceOf(Stmt.Match.class, Gql.parse("match (a:Company {id:1})-[:holder]->(b) return b.id;"));

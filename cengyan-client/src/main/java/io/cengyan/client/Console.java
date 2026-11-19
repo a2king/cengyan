@@ -122,8 +122,11 @@ final class Console {
             node.put("op", "execute");
             node.put("session", session);
             node.put("query", trimmed);
-            if (trimmed.matches("(?iu)^USE\\s+[\\p{L}][\\p{L}\\p{N}_]*\\s*;?$")) {
-                graph = trimmed.substring(3).trim().replaceFirst(";\\s*$", "");
+            // USE g 和 SESSION SET [PROPERTY] GRAPH g 切换当前图；USE g MATCH ... 只对这一条生效，不切换。
+            var use = java.util.regex.Pattern.compile("(?iu)^(?:USE|SESSION\\s+SET\\s+(?:PROPERTY\\s+)?GRAPH)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)\\s*;?$")
+                    .matcher(trimmed);
+            if (use.matches()) {
+                graph = use.group(1);
             }
             node.set("params", MAPPER.createObjectNode());
         }

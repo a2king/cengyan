@@ -73,6 +73,26 @@ public sealed interface Expr {
     record PropExists(Expr value, String property) implements Expr {
     }
 
+    /** {@code x IS [NOT] TRUE / FALSE / UNKNOWN}。{@code truth} 为空表示 UNKNOWN。 */
+    record Truth(Expr value, Boolean truth, boolean negated) implements Expr {
+    }
+
+    /** {@code e IS [NOT] DIRECTED}。 */
+    record Directed(Expr value, boolean negated) implements Expr {
+    }
+
+    /** {@code LET a = 1, b = 2 IN a + b END}，名字按顺序绑定，后面的可以引用前面的。 */
+    record LetIn(List<String> names, List<Expr> values, Expr body) implements Expr {
+    }
+
+    /** {@code VALUE { 子查询 }}：子查询必须正好返回一行一列，没有行时为空值。 */
+    record ValueQuery(Stmt query) implements Expr {
+    }
+
+    /** {@code TRIM([BOTH|LEADING|TRAILING] [字符] FROM 文本)}。{@code chars} 为空表示去空格。 */
+    record Trim(String spec, Expr chars, Expr source) implements Expr {
+    }
+
     static List<Expr> children(Expr expr) {
         return switch (expr) {
             case Literal ignored -> List.of();
@@ -115,6 +135,15 @@ public sealed interface Expr {
             case EndpointOf endpoint -> List.of(endpoint.node(), endpoint.edge());
             case Same same -> same.values();
             case PropExists prop -> List.of(prop.value());
+            case Truth truth -> List.of(truth.value());
+            case Directed directed -> List.of(directed.value());
+            case LetIn let -> {
+                List<Expr> all = new java.util.ArrayList<>(let.values());
+                all.add(let.body());
+                yield all;
+            }
+            case ValueQuery ignored -> List.of();
+            case Trim trim -> trim.chars() == null ? List.of(trim.source()) : List.of(trim.chars(), trim.source());
         };
     }
 }

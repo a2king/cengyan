@@ -6,8 +6,8 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * {@code Gql.g4} 的直接实现。生成器不可用时仍按同一套规则解析，
- * 关键字不区分大小写，标识符保留原来的大小写。
+ * 手写的 GQL 解析器，规则对照 ISO/IEC 39075:2024 与 {@code Gql.g4}。
+ * 关键字不区分大小写，标识符保留原来的大小写；除少数保留字外，关键字都可以当名字用。
  */
 final class GqlReader {
     private static final Map<String, Kind> KEYWORDS = Map.ofEntries(
@@ -22,8 +22,8 @@ final class GqlReader {
             Map.entry("datetime", Kind.DATETIME),
             Map.entry("comment", Kind.COMMENT),
             Map.entry("create", Kind.CREATE),
-             Map.entry("graph", Kind.GRAPH),
-             Map.entry("parts", Kind.PARTS),
+            Map.entry("graph", Kind.GRAPH),
+            Map.entry("parts", Kind.PARTS),
             Map.entry("replicas", Kind.REPLICAS),
             Map.entry("graphs", Kind.GRAPHS),
             Map.entry("use", Kind.USE),
@@ -56,7 +56,9 @@ final class GqlReader {
             Map.entry("in", Kind.IN),
             Map.entry("as", Kind.AS),
             Map.entry("asc", Kind.ASC),
+            Map.entry("ascending", Kind.ASC),
             Map.entry("desc", Kind.DESC),
+            Map.entry("descending", Kind.DESC),
             Map.entry("set", Kind.SET),
             Map.entry("delete", Kind.DELETE),
             Map.entry("distinct", Kind.DISTINCT),
@@ -68,15 +70,18 @@ final class GqlReader {
             Map.entry("on", Kind.ON),
             Map.entry("true", Kind.TRUE),
             Map.entry("false", Kind.FALSE),
+            Map.entry("unknown", Kind.UNKNOWN),
             Map.entry("if", Kind.IF),
             Map.entry("exists", Kind.EXISTS),
             Map.entry("optional", Kind.OPTIONAL),
             Map.entry("filter", Kind.FILTER),
             Map.entry("let", Kind.LET),
             Map.entry("group", Kind.GROUP),
+            Map.entry("groups", Kind.GROUPS),
             Map.entry("union", Kind.UNION),
             Map.entry("except", Kind.EXCEPT),
             Map.entry("intersect", Kind.INTERSECT),
+            Map.entry("otherwise", Kind.OTHERWISE),
             Map.entry("all", Kind.ALL),
             Map.entry("any", Kind.ANY),
             Map.entry("next", Kind.NEXT),
@@ -97,17 +102,63 @@ final class GqlReader {
             Map.entry("simple", Kind.SIMPLE),
             Map.entry("acyclic", Kind.ACYCLIC),
             Map.entry("shortest", Kind.SHORTEST),
+            Map.entry("path", Kind.PATH),
+            Map.entry("paths", Kind.PATHS),
             Map.entry("xor", Kind.XOR),
             Map.entry("typed", Kind.TYPED),
             Map.entry("labeled", Kind.LABELED),
             Map.entry("source", Kind.SOURCE),
             Map.entry("destination", Kind.DESTINATION),
+            Map.entry("directed", Kind.DIRECTED),
             Map.entry("of", Kind.OF),
-            Map.entry("same", Kind.SAME));
+            Map.entry("same", Kind.SAME),
+            Map.entry("session", Kind.SESSION),
+            Map.entry("property", Kind.PROPERTY),
+            Map.entry("start", Kind.START),
+            Map.entry("transaction", Kind.TRANSACTION),
+            Map.entry("commit", Kind.COMMIT),
+            Map.entry("rollback", Kind.ROLLBACK),
+            Map.entry("finish", Kind.FINISH),
+            Map.entry("no", Kind.NO),
+            Map.entry("bindings", Kind.BINDINGS),
+            Map.entry("repeatable", Kind.REPEATABLE),
+            Map.entry("different", Kind.DIFFERENT),
+            Map.entry("element", Kind.ELEMENT),
+            Map.entry("elements", Kind.ELEMENTS),
+            Map.entry("edge", Kind.EDGE),
+            Map.entry("edges", Kind.EDGES),
+            Map.entry("relationship", Kind.EDGE),
+            Map.entry("relationships", Kind.EDGES),
+            Map.entry("keep", Kind.KEEP),
+            Map.entry("with", Kind.WITH),
+            Map.entry("ordinality", Kind.ORDINALITY),
+            Map.entry("value", Kind.VALUE),
+            Map.entry("list", Kind.LIST),
+            Map.entry("array", Kind.LIST),
+            Map.entry("record", Kind.RECORD),
+            Map.entry("like", Kind.LIKE),
+            Map.entry("typed_graph", Kind.IDENT),
+            Map.entry("label", Kind.LABEL),
+            Map.entry("labels", Kind.LABELS),
+            Map.entry("connecting", Kind.CONNECTING),
+            Map.entry("undirected", Kind.UNDIRECTED),
+            Map.entry("leading", Kind.LEADING),
+            Map.entry("trailing", Kind.TRAILING),
+            Map.entry("both", Kind.BOTH),
+            Map.entry("from", Kind.FROM),
+            Map.entry("replace", Kind.REPLACE));
+
+    /** 写成名字时当作无参函数调用的标准函数，例如 {@code RETURN CURRENT_DATE}。 */
+    private static final java.util.Set<String> NILADIC = java.util.Set.of(
+            "current_date", "current_time", "current_timestamp", "local_time", "local_timestamp", "local_datetime");
 
     private final String source;
     private final List<Tok> tokens;
     private int cursor;
+    /** 大于 0 时不把 {@code x:Label} 当成标签谓词，用于下标切片 {@code list[a:b]}。 */
+    private int sliceDepth;
+    /** 大于 0 时不把 {@code x IN ...} 当成列表成员谓词，用于 {@code LET a = ... IN 表达式 END} 的绑定值。 */
+    private int letDepth;
 
     private GqlReader(String source) {
         this.source = source;
@@ -137,55 +188,692 @@ final class GqlReader {
             case CREATE -> create();
             case USE -> {
                 next();
-                yield new Stmt.Use(ident());
+                String graph = graphName();
+                if (queryStart(peek())) {
+                    yield new Stmt.UseQuery(graph, block());
+                }
+                yield new Stmt.Use(graph);
             }
+            case SESSION -> session();
+            case START, COMMIT, ROLLBACK -> fail("不支持跨语句事务：每条语句单独提交，失败不留下半截结果");
             case DROP -> drop();
             case SHOW -> show();
             case DESCRIBE -> describe();
             case ALTER -> alter();
-            case INSERT -> insert();
-            case MATCH -> query(false);
-            case RETURN -> new Stmt.Select(List.of(), tail());
-            case OPTIONAL -> {
-                next();
-                expect(Kind.MATCH, "OPTIONAL 后面要写 MATCH");
-                yield query(true);
-            }
             case EXPLAIN -> {
                 next();
-                Stmt explained = query(false);
-                if (!(explained instanceof Stmt.Match match)) {
-                    yield new Stmt.ExplainQuery(explained);
+                Stmt explained = statement();
+                if (explained instanceof Stmt.Match match) {
+                    yield new Stmt.Explain(match);
                 }
-                yield new Stmt.Explain(match);
+                yield new Stmt.ExplainQuery(explained);
             }
-            case CALL -> call();
-            default -> fail("无法识别的语句");
+            default -> {
+                if (queryStart(peek())) {
+                    yield block();
+                }
+                yield fail("无法识别的语句");
+            }
         };
     }
 
-    private Stmt create() {
-        expect(Kind.CREATE, "缺少 CREATE");
-        if (take(Kind.GRAPH)) {
-            String name = ident();
-            boolean ifNotExists = ifNotExists();
-            int parts = take(Kind.PARTS) ? positiveInt("分片数量") : 1;
-            int replicas = take(Kind.REPLICAS) ? positiveInt("副本数量") : 1;
-            String idType = "INT";
-            int idLength = 0;
-            if (take(Kind.ID)) {
-                if (take(Kind.STRING)) {
-                    idType = "STRING";
-                    idLength = stringIdLength();
-                } else if (take(Kind.INT) || take(Kind.INT64) || take(Kind.INTEGER_WORD)) {
-                    idType = "INT";
-                    if (take(Kind.LP)) return fail("INT64 主键固定为 64 位，不要写长度");
-                    idLength = 64;
-                } else {
-                    return fail("ID 后面要写 INT64 或 STRING");
+    /** 能开始一段线性查询的关键字。 */
+    private boolean queryStart(Kind kind) {
+        return switch (kind) {
+            case MATCH, OPTIONAL, RETURN, FILTER, LET, ORDER, OFFSET, SKIP, LIMIT, CALL, INSERT, FINISH -> true;
+            case FOR -> look(1) != Kind.EQ;
+            default -> false;
+        };
+    }
+
+    /** 图名：标准允许写目录路径，这里只有一层名字。 */
+    private String graphName() {
+        if (peek() == Kind.SLASH) {
+            return fail("层岩没有目录和模式，图名直接写名字");
+        }
+        return ident();
+    }
+
+    private Stmt session() {
+        expect(Kind.SESSION, "缺少 SESSION");
+        if (take(Kind.SET)) {
+            take(Kind.PROPERTY);
+            if (take(Kind.GRAPH)) {
+                return new Stmt.Use(graphName());
+            }
+        }
+        return fail("层岩不保存服务端会话状态，只支持 SESSION SET GRAPH");
+    }
+
+    // ---------------------------------------------------------------- 查询的组合
+
+    /** {@code 复合查询 (NEXT [YIELD ...] 复合查询)*}。NEXT 比集合运算结合得松。 */
+    private Stmt block() {
+        Stmt left = composite();
+        while (take(Kind.NEXT)) {
+            List<Stmt.Item> yield = List.of();
+            if (take(Kind.YIELD)) {
+                yield = items();
+            }
+            if (!queryStart(peek())) {
+                return fail("NEXT 后面要写查询");
+            }
+            left = new Stmt.Next(left, composite(), yield);
+        }
+        return left;
+    }
+
+    /** {@code 线性查询 ((UNION | EXCEPT | INTERSECT) [ALL | DISTINCT] | OTHERWISE) 线性查询 ...}，左结合。 */
+    private Stmt composite() {
+        Stmt left = linear();
+        while (peek() == Kind.UNION || peek() == Kind.EXCEPT || peek() == Kind.INTERSECT || peek() == Kind.OTHERWISE) {
+            String op = next().text.toUpperCase(Locale.ROOT);
+            boolean all = false;
+            if (!op.equals("OTHERWISE")) {
+                all = take(Kind.ALL);
+                if (!all) {
+                    take(Kind.DISTINCT);
                 }
             }
-            return new Stmt.CreateGraph(name, parts, comment(), ifNotExists, replicas, idType, idLength);
+            if (!queryStart(peek())) {
+                return fail("集合运算后面要写查询");
+            }
+            left = new Stmt.Composite(op, all, left, linear());
+        }
+        return left;
+    }
+
+    /**
+     * 一段线性查询：若干查询语句（MATCH、OPTIONAL、FILTER、LET、FOR、ORDER BY / OFFSET / LIMIT、CALL），
+     * 以 RETURN / FINISH 结尾，或者以写入语句（INSERT、SET、REMOVE、DELETE）结尾，写入之后可以再写 RETURN。
+     */
+    private Stmt linear() {
+        List<Stmt.Clause> clauses = new ArrayList<>();
+        Stmt.Call standalone = null;
+        while (true) {
+            Kind kind = peek();
+            if (kind == Kind.MATCH) {
+                next();
+                clauses.add(matchClause(false));
+            } else if (kind == Kind.OPTIONAL) {
+                next();
+                if (take(Kind.MATCH)) {
+                    clauses.add(matchClause(true));
+                } else if (peek() == Kind.LC || peek() == Kind.LP) {
+                    clauses.add(optionalBlock());
+                } else if (peek() == Kind.CALL) {
+                    clauses.add(callClause(true));
+                } else {
+                    return fail("OPTIONAL 后面要写 MATCH、CALL 或 { MATCH ... }");
+                }
+            } else if (kind == Kind.FILTER) {
+                next();
+                take(Kind.WHERE);
+                clauses.add(new Stmt.Clause.Filter(expr()));
+            } else if (kind == Kind.LET) {
+                next();
+                do {
+                    String name = ident();
+                    expect(Kind.EQ, "LET 后面要写等号");
+                    clauses.add(new Stmt.Clause.Let(name, expr()));
+                } while (take(Kind.COMMA));
+            } else if (kind == Kind.FOR && look(1) != Kind.EQ) {
+                next();
+                clauses.add(forClause());
+            } else if (kind == Kind.ORDER || kind == Kind.OFFSET || kind == Kind.SKIP || kind == Kind.LIMIT) {
+                clauses.add(orderPage());
+            } else if (kind == Kind.CALL) {
+                Stmt.Clause clause = callClause(false);
+                clauses.add(clause);
+                if (clauses.size() == 1 && clause instanceof Stmt.Clause.Call named) {
+                    standalone = named.call();
+                }
+            } else {
+                break;
+            }
+        }
+        if (peek() == Kind.INSERT) {
+            next();
+            List<Stmt.Element> elements = insertElements();
+            Stmt.Tail tail = optionalTail();
+            mutationEnd();
+            if (clauses.isEmpty()) {
+                return insert(elements, tail);
+            }
+            return new Stmt.InsertUsing(List.copyOf(clauses), elements, tail);
+        }
+        if (peek() == Kind.SET || peek() == Kind.REMOVE || peek() == Kind.DELETE || peek() == Kind.DETACH
+                || peek() == Kind.NODETACH) {
+            if (clauses.isEmpty()) {
+                return fail("写入前面要先用 MATCH 绑定变量");
+            }
+            return mutation(clauses);
+        }
+        if (peek() == Kind.RETURN || peek() == Kind.FINISH) {
+            Stmt.Tail tail = tail();
+            Expr aggregateFilter = take(Kind.FILTER) ? expr() : null;
+            Stmt query = lower(clauses, tail);
+            Stmt selected = query == null ? new Stmt.Select(List.copyOf(clauses), tail) : query;
+            return aggregateFilter == null ? selected : new Stmt.AggregateFilter(selected, aggregateFilter);
+        }
+        if (standalone != null && clauses.size() == 1) {
+            return standalone;
+        }
+        if (clauses.isEmpty()) {
+            return fail("无法识别的语句");
+        }
+        return fail("缺少 RETURN");
+    }
+
+    private Stmt insert(List<Stmt.Element> elements, Stmt.Tail tail) {
+        if (tail == null && elements.size() == 1 && elements.get(0) instanceof Stmt.Element.Node node) {
+            return new Stmt.Insert(node.node(), null, null);
+        }
+        if (tail == null && elements.size() == 3
+                && elements.get(0) instanceof Stmt.Element.Node source
+                && elements.get(1) instanceof Stmt.Element.Rel rel
+                && elements.get(2) instanceof Stmt.Element.Node target) {
+            return new Stmt.Insert(source.node(), rel.edge(), target.node());
+        }
+        return new Stmt.InsertGraph(elements, tail);
+    }
+
+    /** 写入语句之后只能接 RETURN / FINISH，不能再写查询。 */
+    private void mutationEnd() {
+        if (peek() == Kind.MATCH || peek() == Kind.OPTIONAL || peek() == Kind.LET || peek() == Kind.FILTER
+                || peek() == Kind.INSERT || peek() == Kind.CALL || (peek() == Kind.FOR && look(1) != Kind.EQ)) {
+            fail("写入之后只能接 RETURN 或 FINISH，暂不支持在写入后继续查询");
+        }
+    }
+
+    private Stmt.Tail optionalTail() {
+        return peek() == Kind.RETURN || peek() == Kind.FINISH ? tail() : null;
+    }
+
+    private Stmt.Clause forClause() {
+        String name = ident();
+        expect(Kind.IN, "FOR 后面要写 IN");
+        Expr list = expr();
+        String position = null;
+        boolean zeroBased = false;
+        if (take(Kind.WITH)) {
+            if (take(Kind.ORDINALITY)) {
+                position = ident();
+            } else if (take(Kind.OFFSET)) {
+                position = ident();
+                zeroBased = true;
+            } else {
+                return fail("FOR ... WITH 后面要写 ORDINALITY 或 OFFSET");
+            }
+        }
+        return new Stmt.Clause.For(name, list, position, zeroBased);
+    }
+
+    private Stmt.Clause orderPage() {
+        List<Stmt.Sort> order = List.of();
+        if (take(Kind.ORDER)) {
+            expect(Kind.BY, "ORDER 后面要写 BY");
+            order = sorts();
+        }
+        Expr skip = null;
+        if (take(Kind.SKIP) || take(Kind.OFFSET)) {
+            skip = expr();
+        }
+        Expr limit = take(Kind.LIMIT) ? expr() : null;
+        return new Stmt.Clause.OrderPage(order, skip, limit);
+    }
+
+    private Stmt.Clause optionalBlock() {
+        boolean brace = take(Kind.LC);
+        if (!brace) {
+            expect(Kind.LP, "OPTIONAL 块缺少左括号");
+        }
+        List<Stmt.Clause> clauses = new ArrayList<>();
+        while (true) {
+            if (take(Kind.MATCH)) {
+                clauses.add(matchClause(false));
+            } else if (peek() == Kind.OPTIONAL && look(1) == Kind.MATCH) {
+                next();
+                next();
+                clauses.add(matchClause(true));
+            } else {
+                break;
+            }
+        }
+        if (clauses.isEmpty()) {
+            return fail("OPTIONAL 块里要写 MATCH");
+        }
+        expect(brace ? Kind.RC : Kind.RP, "OPTIONAL 块没有结束");
+        return new Stmt.Clause.OptionalBlock(List.copyOf(clauses));
+    }
+
+    /** 嵌套查询 {@code { ... }} 的内容。{@code needReturn} 为假时可以不写 RETURN（EXISTS 用）。 */
+    private Stmt nested(boolean needReturn) {
+        if (!needReturn && peek() == Kind.LP) {
+            // EXISTS { (a)-[]->(b) }：直接写图模式。
+            return new Stmt.Select(List.of(matchClause(false)), null);
+        }
+        if (needReturn) {
+            return readOnly(block(), "子查询");
+        }
+        List<Stmt.Clause> clauses = new ArrayList<>();
+        while (peek() == Kind.MATCH || peek() == Kind.OPTIONAL || peek() == Kind.FILTER || peek() == Kind.LET
+                || (peek() == Kind.FOR && look(1) != Kind.EQ)) {
+            if (take(Kind.MATCH)) {
+                clauses.add(matchClause(false));
+            } else if (take(Kind.OPTIONAL)) {
+                expect(Kind.MATCH, "OPTIONAL 后面要写 MATCH");
+                clauses.add(matchClause(true));
+            } else if (take(Kind.FILTER)) {
+                take(Kind.WHERE);
+                clauses.add(new Stmt.Clause.Filter(expr()));
+            } else if (take(Kind.LET)) {
+                do {
+                    String name = ident();
+                    expect(Kind.EQ, "LET 后面要写等号");
+                    clauses.add(new Stmt.Clause.Let(name, expr()));
+                } while (take(Kind.COMMA));
+            } else {
+                next();
+                clauses.add(forClause());
+            }
+        }
+        if (clauses.isEmpty()) {
+            return fail("子查询里要写 MATCH");
+        }
+        Stmt.Tail tail = optionalTail();
+        return new Stmt.Select(List.copyOf(clauses), tail);
+    }
+
+    /** 嵌套查询只能读：写入在这里被拒绝，否则权限检查会把整条语句当成只读。 */
+    private Stmt readOnly(Stmt statement, String where) {
+        boolean write = switch (statement) {
+            case Stmt.Insert ignored -> true;
+            case Stmt.InsertGraph ignored -> true;
+            case Stmt.InsertUsing ignored -> true;
+            case Stmt.Set ignored -> true;
+            case Stmt.Delete ignored -> true;
+            case Stmt.Mutate ignored -> true;
+            case Stmt.Composite composite -> {
+                readOnly(composite.left(), where);
+                readOnly(composite.right(), where);
+                yield false;
+            }
+            case Stmt.Next next -> {
+                readOnly(next.left(), where);
+                readOnly(next.right(), where);
+                yield false;
+            }
+            default -> false;
+        };
+        if (write) {
+            fail(where + "里不能写入");
+        }
+        return statement;
+    }
+
+    private Stmt mutation(List<Stmt.Clause> clauses) {
+        List<Stmt.Assign> assignments = new ArrayList<>();
+        List<Stmt.Assign> replacements = new ArrayList<>();
+        List<String> removals = new ArrayList<>();
+        List<Stmt.Assign> labelSets = new ArrayList<>();
+        List<Stmt.Assign> labelRemovals = new ArrayList<>();
+        List<String> deletes = new ArrayList<>();
+        boolean detach = false;
+        boolean any = true;
+        while (any) {
+            any = false;
+            if (take(Kind.SET)) {
+                any = true;
+                do {
+                    String variable = ident();
+                    if (take(Kind.EQ)) {
+                        replacements.add(new Stmt.Assign(variable, "", expr()));
+                    } else if (take(Kind.COLON) || take(Kind.IS)) {
+                        labelSets.add(new Stmt.Assign(variable, ident(), null));
+                    } else {
+                        expect(Kind.DOT, "SET 要写成 变量.属性 = 值、变量 = {...} 或 变量:标签");
+                        String field = ident();
+                        expect(Kind.EQ, "SET 缺少等号");
+                        assignments.add(new Stmt.Assign(variable, field, expr()));
+                    }
+                } while (take(Kind.COMMA));
+            }
+            if (take(Kind.REMOVE)) {
+                any = true;
+                do {
+                    String variable = ident();
+                    if (take(Kind.COLON) || take(Kind.IS)) {
+                        labelRemovals.add(new Stmt.Assign(variable, ident(), null));
+                    } else {
+                        expect(Kind.DOT, "REMOVE 要写成 变量.属性 或 变量:标签");
+                        removals.add(variable + "." + ident());
+                    }
+                } while (take(Kind.COMMA));
+            }
+            if (peek() == Kind.DETACH || peek() == Kind.NODETACH || peek() == Kind.DELETE) {
+                any = true;
+                if (take(Kind.DETACH)) {
+                    detach = true;
+                    expect(Kind.DELETE, "DETACH 后面要写 DELETE");
+                } else if (take(Kind.NODETACH)) {
+                    expect(Kind.DELETE, "NODETACH 后面要写 DELETE");
+                } else {
+                    next();
+                }
+                deletes.addAll(variables());
+            }
+        }
+        Stmt.Tail tail = optionalTail();
+        mutationEnd();
+        if (tail == null && replacements.isEmpty() && removals.isEmpty() && labelSets.isEmpty() && labelRemovals.isEmpty()) {
+            Stmt legacy = lowerMutation(clauses, assignments, deletes, detach);
+            if (legacy != null) {
+                return legacy;
+            }
+        }
+        return new Stmt.Mutate(List.copyOf(clauses), List.copyOf(assignments), List.copyOf(replacements), List.copyOf(removals),
+                List.copyOf(deletes), detach, labelSets, labelRemovals, tail);
+    }
+
+    // ---------------------------------------------------------------- MATCH 与图模式
+
+    private Stmt.Clause.Match matchClause(boolean optional) {
+        String matchMode = null;
+        if (take(Kind.REPEATABLE)) {
+            if (take(Kind.ELEMENT)) {
+                take(Kind.BINDINGS);
+            } else {
+                expect(Kind.ELEMENTS, "REPEATABLE 后面要写 ELEMENTS");
+            }
+            matchMode = "REPEATABLE_ELEMENTS";
+        } else if (take(Kind.DIFFERENT)) {
+            if (take(Kind.EDGE)) {
+                take(Kind.BINDINGS);
+            } else {
+                expect(Kind.EDGES, "DIFFERENT 后面要写 EDGES");
+            }
+            matchMode = "DIFFERENT_EDGES";
+        }
+        List<Stmt.Pattern> patterns = new ArrayList<>();
+        patterns.add(pathPattern());
+        while (take(Kind.COMMA)) {
+            patterns.add(pathPattern());
+        }
+        if (peek() == Kind.KEEP) {
+            return fail("暂不支持 KEEP，请把路径搜索前缀写在每个路径模式前面");
+        }
+        Expr where = take(Kind.WHERE) ? expr() : null;
+        Stmt.Pattern first = patterns.get(0);
+        return new Stmt.Clause.Match(optional, first.pathVariable(), first.search(), first.searchCount(), first.mode(),
+                List.copyOf(patterns), where, matchMode);
+    }
+
+    /** {@code [p =] [ALL | ANY [k] | ANY SHORTEST | ALL SHORTEST | SHORTEST k [GROUPS]] [WALK | TRAIL | SIMPLE | ACYCLIC] [PATH | PATHS] 模式}。 */
+    private Stmt.Pattern pathPattern() {
+        String pathVariable = null;
+        if (isName(peek()) && look(1) == Kind.EQ) {
+            pathVariable = name();
+            expect(Kind.EQ, "路径变量后面要写等号");
+        }
+        String search = null;
+        Integer count = null;
+        if (take(Kind.ALL)) {
+            if (take(Kind.SHORTEST)) {
+                search = "ALL_SHORTEST";
+            }
+            // 单独的 ALL 就是全部路径，和不写前缀相同。
+        } else if (take(Kind.ANY)) {
+            if (take(Kind.SHORTEST)) {
+                search = "ANY_SHORTEST";
+            } else {
+                search = "ANY";
+                count = peek() == Kind.INTEGER ? (int) nonNegative("路径数量") : 1;
+            }
+        } else if (take(Kind.SHORTEST)) {
+            search = "SHORTEST";
+            count = peek() == Kind.INTEGER ? (int) nonNegative("路径数量") : null;
+        }
+        String mode = null;
+        if (peek() == Kind.WALK || peek() == Kind.TRAIL || peek() == Kind.SIMPLE || peek() == Kind.ACYCLIC) {
+            mode = next().text.toUpperCase(Locale.ROOT);
+        }
+        if (!take(Kind.PATH)) {
+            take(Kind.PATHS);
+        }
+        if ("SHORTEST".equals(search) && (take(Kind.GROUP) || take(Kind.GROUPS))) {
+            search = "SHORTEST_GROUPS";
+        }
+        if ("SHORTEST".equals(search) && count == null) {
+            count = 1;
+        }
+        if ("SHORTEST_GROUPS".equals(search) && count == null) {
+            count = 1;
+        }
+        List<Stmt.Element> elements = patternTerm();
+        List<List<Stmt.Element>> union = new ArrayList<>();
+        boolean multiset = false;
+        while (peek() == Kind.PIPE || peek() == Kind.MULTISET) {
+            boolean isMultiset = next().kind == Kind.MULTISET;
+            if (!union.isEmpty() && isMultiset != multiset) {
+                return fail("同一个路径模式里不能混用 | 和 |+|");
+            }
+            multiset = isMultiset;
+            union.add(patternTerm());
+        }
+        return new Stmt.Pattern(pathVariable, search, count, mode, List.copyOf(elements), union, multiset);
+    }
+
+    /** 点、边、量化路径的序列。量化路径可以和点直接相邻：{@code (s) ((a)-[e]->(b)){1,3} (t)}，相邻的点是同一个点。 */
+    private List<Stmt.Element> patternTerm() {
+        List<Stmt.Element> elements = new ArrayList<>();
+        elements.add(patternElement(true));
+        while (true) {
+            if (edgeStart()) {
+                elements.add(new Stmt.Element.Rel(edge()));
+                elements.add(patternElement(false));
+            } else if (peek() == Kind.LP && look(1) == Kind.LP) {
+                elements.add(group());
+            } else if (peek() == Kind.LP && elements.get(elements.size() - 1) instanceof Stmt.Element.Group) {
+                elements.add(new Stmt.Element.Node(node()));
+            } else {
+                break;
+            }
+        }
+        return elements;
+    }
+
+    private boolean edgeStart() {
+        Kind kind = peek();
+        return kind == Kind.MINUS || kind == Kind.LARROW || kind == Kind.ARROW || kind == Kind.TILDE
+                || (kind == Kind.LT && look(1) == Kind.TILDE);
+    }
+
+    private Stmt.Element patternElement(boolean nodeFirst) {
+        if (peek() == Kind.LP && look(1) == Kind.LP) {
+            return group();
+        }
+        if (!nodeFirst && peek() != Kind.LP) {
+            return fail("路径缺少节点");
+        }
+        return new Stmt.Element.Node(node());
+    }
+
+    private Stmt.Element.Group group() {
+        expect(Kind.LP, "量化路径缺少左括号");
+        List<Stmt.Element> elements = new ArrayList<>();
+        elements.add(new Stmt.Element.Node(node()));
+        while (edgeStart()) {
+            elements.add(new Stmt.Element.Rel(edge()));
+            elements.add(new Stmt.Element.Node(node()));
+        }
+        Expr where = take(Kind.WHERE) ? expr() : null;
+        expect(Kind.RP, "量化路径缺少右括号");
+        int[] range = quantifier();
+        if (range == null) {
+            return fail("量化路径后面要写跳数");
+        }
+        int max = range[1] < 0 ? Integer.MAX_VALUE : range[1];
+        return new Stmt.Element.Group(List.copyOf(elements), where, range[0], max);
+    }
+
+    private Stmt.Tail tail() {
+        if (take(Kind.FINISH)) {
+            return new Stmt.Tail(false, false, List.of(), List.of(), List.of(), null, null, null, true);
+        }
+        expect(Kind.RETURN, "缺少 RETURN");
+        if (take(Kind.NO)) {
+            expect(Kind.BINDINGS, "RETURN NO 后面要写 BINDINGS");
+            return new Stmt.Tail(false, false, List.of(), List.of(), List.of(), null, null, null, true);
+        }
+        boolean distinct = take(Kind.DISTINCT);
+        if (!distinct) {
+            take(Kind.ALL);
+        }
+        boolean star = false;
+        List<Stmt.Item> items = List.of();
+        if (take(Kind.STAR)) {
+            star = true;
+        } else {
+            items = items();
+        }
+        List<Expr> groupBy = List.of();
+        if (take(Kind.GROUP)) {
+            expect(Kind.BY, "GROUP 后面要写 BY");
+            if (peek() == Kind.LP && look(1) == Kind.RP) {
+                next();
+                next();
+            } else {
+                groupBy = new ArrayList<>();
+                groupBy.add(expr());
+                while (take(Kind.COMMA)) {
+                    groupBy.add(expr());
+                }
+                groupBy = List.copyOf(groupBy);
+            }
+        }
+        Expr postFilter = take(Kind.FILTER) ? expr() : null;
+        List<Stmt.Sort> order = List.of();
+        if (take(Kind.ORDER)) {
+            expect(Kind.BY, "ORDER 后面要写 BY");
+            order = sorts();
+        }
+        Expr skip = null;
+        if (take(Kind.SKIP) || take(Kind.OFFSET)) {
+            skip = expr();
+        }
+        Expr limit = take(Kind.LIMIT) ? expr() : null;
+        return new Stmt.Tail(distinct, star, items, groupBy, order, skip, limit, postFilter, false);
+    }
+
+    /** 只有一条普通 MATCH、没有路径前缀时降成单跳快速路径 {@link Stmt.Match}。 */
+    private Stmt lower(List<Stmt.Clause> clauses, Stmt.Tail tail) {
+        if (clauses.size() != 1 || !(clauses.get(0) instanceof Stmt.Clause.Match match)) {
+            return null;
+        }
+        if (match.optional() || match.matchMode() != null || match.patterns().size() != 1) {
+            return null;
+        }
+        Stmt.Pattern pattern = match.patterns().get(0);
+        // 带路径变量的 MATCH 要走路径搜索才能绑定路径，不能降成单跳快速路径。
+        if (pattern.pathVariable() != null || pattern.search() != null || pattern.mode() != null || !pattern.union().isEmpty()) {
+            return null;
+        }
+        if (tail.star() || tail.finish() || !tail.groupBy().isEmpty()) {
+            return null;
+        }
+        List<Stmt.Element> elements = pattern.elements();
+        if (elements.size() != 1 && elements.size() != 3) {
+            return null;
+        }
+        if (!(elements.get(0) instanceof Stmt.Element.Node source)) {
+            return null;
+        }
+        if (source.node().where() != null || complex(source.node().label())) {
+            return null;
+        }
+        Stmt.EdgePat edge = null;
+        Stmt.NodePat target = null;
+        if (elements.size() == 3) {
+            if (!(elements.get(1) instanceof Stmt.Element.Rel rel) || !(elements.get(2) instanceof Stmt.Element.Node node)) {
+                return null;
+            }
+            if (node.node().where() != null || complex(node.node().label())) {
+                return null;
+            }
+            if (rel.edge().maxHop() != null && rel.edge().maxHop() < 0 && rel.edge().variable() != null) {
+                return null;
+            }
+            edge = rel.edge();
+            target = node.node();
+        }
+        return new Stmt.Match(
+                source.node(), edge, target, match.where(), tail.items(), tail.orderBy(),
+                tail.skip(), tail.limit(), tail.distinct(), null);
+    }
+
+    private Stmt lowerMutation(List<Stmt.Clause> clauses, List<Stmt.Assign> assignments, List<String> deletes, boolean detach) {
+        if (clauses.size() != 1 || !(clauses.get(0) instanceof Stmt.Clause.Match match)) {
+            return null;
+        }
+        if (match.optional() || match.matchMode() != null || match.patterns().size() != 1) {
+            return null;
+        }
+        Stmt.Pattern pattern = match.patterns().get(0);
+        if (pattern.search() != null || pattern.mode() != null || !pattern.union().isEmpty()) {
+            return null;
+        }
+        List<Stmt.Element> elements = pattern.elements();
+        if (elements.size() != 1 && elements.size() != 3) {
+            return null;
+        }
+        if (!(elements.get(0) instanceof Stmt.Element.Node source) || source.node().where() != null || complex(source.node().label())) {
+            return null;
+        }
+        Stmt.EdgePat edge = null;
+        Stmt.NodePat target = null;
+        if (elements.size() == 3) {
+            if (!(elements.get(1) instanceof Stmt.Element.Rel rel) || !(elements.get(2) instanceof Stmt.Element.Node node)) {
+                return null;
+            }
+            if (rel.edge().minHop() != null || rel.edge().where() != null || complex(rel.edge().label())
+                    || node.node().where() != null || complex(node.node().label())) {
+                return null;
+            }
+            edge = rel.edge();
+            target = node.node();
+        }
+        if (!deletes.isEmpty() && assignments.isEmpty()) {
+            return new Stmt.Delete(source.node(), edge, target, match.where(), List.copyOf(deletes), detach);
+        }
+        if (!assignments.isEmpty() && deletes.isEmpty()) {
+            return new Stmt.Set(source.node(), edge, target, match.where(), List.copyOf(assignments));
+        }
+        return null;
+    }
+
+    private static boolean complex(Stmt.Label label) {
+        return label != null && !(label instanceof Stmt.Label.One);
+    }
+
+    // ---------------------------------------------------------------- DDL
+
+    private Stmt create() {
+        expect(Kind.CREATE, "缺少 CREATE");
+        if (peek() == Kind.OR) {
+            return fail("暂不支持 CREATE OR REPLACE：请先 DROP GRAPH 再建");
+        }
+        if (peek() == Kind.PROPERTY && look(1) == Kind.GRAPH) {
+            next();
+        }
+        if (take(Kind.GRAPH)) {
+            if (take(Kind.TYPE)) {
+                return fail("暂不支持单独的图类型对象，请直接写 CREATE GRAPH 名字 { 类型定义 }");
+            }
+            boolean ifNotExists = ifNotExists();
+            String name = graphName();
+            ifNotExists |= ifNotExists();
+            return createGraph(name, ifNotExists);
         }
         if (take(Kind.ALIAS)) {
             String alias = ident();
@@ -217,10 +905,212 @@ final class GqlReader {
                 return fail("ID 后面要写 INT 或 STRING");
             }
         }
-        expect(Kind.LP, "类型定义缺少左括号");
-        List<Stmt.Field> fields = fields();
-        expect(Kind.RP, "类型定义缺少右括号");
+        boolean brace = take(Kind.LC);
+        if (!brace) {
+            expect(Kind.LP, "类型定义缺少左括号");
+        }
+        List<Stmt.Field> fields = fields(brace ? Kind.RC : Kind.RP);
+        expect(brace ? Kind.RC : Kind.RP, "类型定义缺少右括号");
         return new Stmt.CreateType(node, name, comment, idType, idLength, idSpecified, fields, ifNotExists);
+    }
+
+    /** 图的选项顺序不限：层岩扩展 PARTS / REPLICAS / ID / COMMENT，和标准的图类型 {@code { ... }}、{@code ANY}、{@code LIKE g}。 */
+    private Stmt createGraph(String name, boolean ifNotExists) {
+        int parts = 1;
+        int replicas = 1;
+        String idType = "INT";
+        int idLength = 0;
+        String comment = null;
+        String like = null;
+        List<Stmt.CreateType> types = List.of();
+        boolean typed = false;
+        while (true) {
+            if (take(Kind.PARTS)) {
+                parts = positiveInt("分片数量");
+            } else if (take(Kind.REPLICAS)) {
+                replicas = positiveInt("副本数量");
+            } else if (take(Kind.ID)) {
+                if (take(Kind.STRING)) {
+                    idType = "STRING";
+                    idLength = stringIdLength();
+                } else if (take(Kind.INT) || take(Kind.INT64) || take(Kind.INTEGER_WORD)) {
+                    idType = "INT";
+                    if (take(Kind.LP)) return fail("INT64 主键固定为 64 位，不要写长度");
+                    idLength = 64;
+                } else {
+                    return fail("ID 后面要写 INT64 或 STRING");
+                }
+            } else if (peek() == Kind.COMMENT) {
+                comment = comment();
+            } else if (!typed && (peek() == Kind.LC || peek() == Kind.TYPED || peek() == Kind.COLON)) {
+                typed = true;
+                if (take(Kind.TYPED) || take(Kind.COLON)) {
+                    take(Kind.COLON);
+                    if (peek() != Kind.LC) {
+                        return fail("暂不支持引用已命名的图类型，请直接写 { 类型定义 }");
+                    }
+                }
+                types = graphTypeSpec();
+            } else if (!typed && take(Kind.ANY)) {
+                typed = true;
+                take(Kind.PROPERTY);
+                take(Kind.GRAPH);
+            } else if (!typed && take(Kind.LIKE)) {
+                typed = true;
+                like = graphName();
+            } else if (peek() == Kind.AS) {
+                return fail("暂不支持 AS COPY OF：复制数据请用导出再导入");
+            } else {
+                break;
+            }
+        }
+        return new Stmt.CreateGraph(name, parts, comment, ifNotExists, replicas, idType, idLength, types, like);
+    }
+
+    /**
+     * 标准的嵌套图类型：{@code { (Person :Person {name STRING}), (:Person)-[:knows {since INT}]->(:Person) }}，
+     * 也接受 {@code NODE [TYPE] Person {...}} 和 {@code [DIRECTED] EDGE [TYPE] knows {...} CONNECTING (Person -> Person)}。
+     * 层岩的类型名就是标签，一个类型只有一个标签。
+     */
+    private List<Stmt.CreateType> graphTypeSpec() {
+        expect(Kind.LC, "图类型缺少左花括号");
+        List<Stmt.CreateType> types = new ArrayList<>();
+        java.util.Map<String, String> aliases = new java.util.HashMap<>();
+        if (!take(Kind.RC)) {
+            do {
+                types.add(elementType(aliases));
+            } while (take(Kind.COMMA));
+            expect(Kind.RC, "图类型缺少右花括号");
+        }
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (Stmt.CreateType type : types) {
+            if (!seen.add((type.node() ? "node/" : "rel/") + type.name())) {
+                return fail("图类型里重复定义了 " + type.name());
+            }
+        }
+        return List.copyOf(types);
+    }
+
+    private Stmt.CreateType elementType(java.util.Map<String, String> aliases) {
+        if (take(Kind.NODE)) {
+            take(Kind.TYPE);
+            String name = isName(peek()) && peek() != Kind.LABEL && peek() != Kind.LABELS ? ident() : null;
+            String label = typeLabel();
+            String typeName = resolveTypeName(name, label);
+            if (name != null) aliases.put(name, typeName);
+            return new Stmt.CreateType(true, typeName, null, "INT", 64, false, typePropertiesOrEmpty(), false);
+        }
+        if (peek() == Kind.DIRECTED || peek() == Kind.EDGE || peek() == Kind.UNDIRECTED) {
+            if (take(Kind.UNDIRECTED)) {
+                return fail("层岩的边都有方向，不支持 UNDIRECTED EDGE");
+            }
+            take(Kind.DIRECTED);
+            expect(Kind.EDGE, "DIRECTED 后面要写 EDGE");
+            take(Kind.TYPE);
+            String name = isName(peek()) && peek() != Kind.LABEL && peek() != Kind.LABELS ? ident() : null;
+            String label = typeLabel();
+            String typeName = resolveTypeName(name, label);
+            List<Stmt.Field> fields = typePropertiesOrEmpty();
+            expect(Kind.CONNECTING, "边类型要写 CONNECTING (起点 -> 终点)");
+            expect(Kind.LP, "CONNECTING 缺少左括号");
+            endpointType(aliases);
+            if (!take(Kind.ARROW)) {
+                if (take(Kind.TO)) {
+                    // CONNECTING (A TO B)
+                } else {
+                    return fail("CONNECTING 里要写 -> 或 TO");
+                }
+            }
+            endpointType(aliases);
+            expect(Kind.RP, "CONNECTING 缺少右括号");
+            return new Stmt.CreateType(false, typeName, null, "INT", 64, false, fields, false);
+        }
+        // 模式写法：(name :Label {...}) 或 (:A)-[:R {...}]->(:B)
+        expect(Kind.LP, "这里要写点类型 ( ... ) 或边类型 (:A)-[:R]->(:B)");
+        String name = isName(peek()) && peek() != Kind.LABEL && peek() != Kind.LABELS ? ident() : null;
+        String label = typeLabel();
+        List<Stmt.Field> fields = typePropertiesOrEmpty();
+        expect(Kind.RP, "点类型缺少右括号");
+        if (peek() != Kind.MINUS && peek() != Kind.LARROW && peek() != Kind.TILDE) {
+            String typeName = resolveTypeName(name, label);
+            if (name != null) aliases.put(name, typeName);
+            return new Stmt.CreateType(true, typeName, null, "INT", 64, false, fields, false);
+        }
+        String sourceType = name != null && label == null ? aliases.get(name) : label;
+        if (sourceType == null) {
+            return fail("边类型的起点要写已定义的点类型");
+        }
+        if (peek() == Kind.TILDE) {
+            return fail("层岩的边都有方向，不支持无向边类型");
+        }
+        boolean reverse = take(Kind.LARROW);
+        if (!reverse) {
+            expect(Kind.MINUS, "边类型缺少 -[");
+        }
+        expect(Kind.LB, "边类型缺少左方括号");
+        String edgeName = isName(peek()) && peek() != Kind.LABEL && peek() != Kind.LABELS ? ident() : null;
+        String edgeLabel = typeLabel();
+        List<Stmt.Field> edgeFields = typePropertiesOrEmpty();
+        expect(Kind.RB, "边类型缺少右方括号");
+        if (reverse) {
+            expect(Kind.MINUS, "入边类型的箭头不完整");
+        } else {
+            expect(Kind.ARROW, "边类型要写 ]->");
+        }
+        expect(Kind.LP, "边类型的终点缺少左括号");
+        String targetName = isName(peek()) && peek() != Kind.LABEL && peek() != Kind.LABELS ? ident() : null;
+        String targetLabel = typeLabel();
+        expect(Kind.RP, "边类型的终点缺少右括号");
+        String targetType = targetName != null && targetLabel == null ? aliases.get(targetName) : targetLabel;
+        if (targetType == null) {
+            return fail("边类型的终点要写已定义的点类型");
+        }
+        return new Stmt.CreateType(false, resolveTypeName(edgeName, edgeLabel), null, "INT", 64, false, edgeFields, false);
+    }
+
+    private void endpointType(java.util.Map<String, String> aliases) {
+        String name = ident();
+        if (!aliases.containsKey(name) && !aliases.containsValue(name)) {
+            fail("边类型引用了没有定义的点类型 " + name);
+        }
+    }
+
+    /** {@code :L}、{@code IS L}、{@code LABEL L}；{@code LABELS A & B} 和多个标签不支持。 */
+    private String typeLabel() {
+        if (take(Kind.COLON) || take(Kind.IS) || take(Kind.LABEL)) {
+            String label = ident();
+            if (peek() == Kind.AMP) {
+                return fail("层岩一个类型只有一个标签，不支持多标签类型");
+            }
+            return label;
+        }
+        if (take(Kind.LABELS)) {
+            String label = ident();
+            if (peek() == Kind.AMP) {
+                return fail("层岩一个类型只有一个标签，不支持多标签类型");
+            }
+            return label;
+        }
+        return null;
+    }
+
+    private String resolveTypeName(String name, String label) {
+        if (label == null && name == null) {
+            return fail("类型要写名字或标签");
+        }
+        if (label == null) {
+            return name;
+        }
+        return label;
+    }
+
+    private List<Stmt.Field> typePropertiesOrEmpty() {
+        if (!take(Kind.LC)) {
+            return List.of();
+        }
+        List<Stmt.Field> fields = fields(Kind.RC);
+        expect(Kind.RC, "属性类型缺少右花括号");
+        return fields;
     }
 
     private int stringIdLength() {
@@ -242,6 +1132,14 @@ final class GqlReader {
             return fail(label + "必须在 1 到 4096 之间");
         }
         return (int) value;
+    }
+
+    private long nonNegative(String label) {
+        long value = integer();
+        if (value < 0 || value > Integer.MAX_VALUE) {
+            return fail(label + "超出范围");
+        }
+        return value;
     }
 
     private Stmt createIndex(boolean unique) {
@@ -278,8 +1176,16 @@ final class GqlReader {
             expect(Kind.TYPE, "缺少 TYPE");
             return new Stmt.DropType(node, ident(), ifExists());
         }
+        if (peek() == Kind.PROPERTY && look(1) == Kind.GRAPH) {
+            next();
+        }
         expect(Kind.GRAPH, "只能 DROP GRAPH、DROP ALIAS、DROP INDEX 或 DROP TYPE");
-        return new Stmt.DropGraph(ident(), ifExists());
+        if (peek() == Kind.TYPE) {
+            return fail("暂不支持单独的图类型对象");
+        }
+        boolean ifExists = ifExists();
+        String name = graphName();
+        return new Stmt.DropGraph(name, ifExists || ifExists());
     }
 
     private Stmt show() {
@@ -324,341 +1230,54 @@ final class GqlReader {
         }
         expect(Kind.ADD, "只能增加、删除或重命名列");
         String property = ident();
+        take(Kind.TYPED);
+        if (peek() == Kind.COLON && look(1) == Kind.COLON) {
+            next();
+            next();
+        }
         String valueType = typeName();
-        expect(Kind.NULL, "只能在末尾增加可空列");
+        if (peek() == Kind.NOT && look(1) == Kind.NULL) {
+            return fail("已有数据没有这一列的值，只能增加可空列");
+        }
+        take(Kind.NULL);
         return new Stmt.AlterType(node, typeName, property, valueType, comment());
     }
 
-    private Stmt insert() {
-        expect(Kind.INSERT, "缺少 INSERT");
-        List<Stmt.Element> elements = insertElements();
-        if (elements.size() == 1 && elements.get(0) instanceof Stmt.Element.Node node) {
-            return new Stmt.Insert(node.node(), null, null);
-        }
-        if (elements.size() == 3
-                && elements.get(0) instanceof Stmt.Element.Node source
-                && elements.get(1) instanceof Stmt.Element.Rel rel
-                && elements.get(2) instanceof Stmt.Element.Node target) {
-            return new Stmt.Insert(source.node(), rel.edge(), target.node());
-        }
-        return new Stmt.InsertGraph(elements);
-    }
+    // ---------------------------------------------------------------- CALL
 
-    private Stmt query(boolean optional) {
-        take(Kind.MATCH);
-        List<Stmt.Clause> clauses = new ArrayList<>();
-        boolean nextOptional = optional;
-        while (true) {
-            if (!clauses.isEmpty()) {
-                if (take(Kind.OPTIONAL)) {
-                    nextOptional = true;
-                    expect(Kind.MATCH, "OPTIONAL 后面要写 MATCH");
-                } else if (take(Kind.MATCH)) {
-                    nextOptional = false;
-                } else {
-                    break;
-                }
-            }
-            clauses.add(matchClause(nextOptional));
-            nextOptional = false;
-            while (true) {
-                if (take(Kind.FILTER)) {
-                    clauses.add(new Stmt.Clause.Filter(expr()));
-                } else if (take(Kind.LET)) {
-                    String letName = ident();
-                    expect(Kind.EQ, "LET 后面要写等号");
-                    clauses.add(new Stmt.Clause.Let(letName, expr()));
-                } else if (peek() == Kind.FOR && look(1) != Kind.EQ) {
-                    next();
-                    String forName = ident();
-                    expect(Kind.IN, "FOR 后面要写 IN");
-                    clauses.add(new Stmt.Clause.For(forName, expr()));
-                } else {
-                    break;
-                }
-            }
-            if (peek() != Kind.MATCH && peek() != Kind.OPTIONAL) {
-                break;
-            }
-        }
-        if (take(Kind.INSERT)) {
-            return new Stmt.InsertUsing(clauses, insertElements());
-        }
-        if (peek() == Kind.SET || peek() == Kind.DETACH || peek() == Kind.NODETACH || peek() == Kind.DELETE
-                || peek() == Kind.REMOVE) {
-            return mutation(clauses);
-        }
-        Stmt.Tail tail = tail();
-        Expr aggregateFilter = null;
-        if (take(Kind.FILTER)) {
-            aggregateFilter = expr();
-        }
-        Stmt query = lower(clauses, tail);
-        Stmt selected = query == null ? new Stmt.Select(clauses, tail) : query;
-        return compose(aggregateFilter == null ? selected : new Stmt.AggregateFilter(selected, aggregateFilter));
-    }
-
-    private Stmt mutation(List<Stmt.Clause> clauses) {
-        List<Stmt.Assign> assignments = List.of();
-        List<Stmt.Assign> replacements = List.of();
-        List<String> removals = List.of();
-        if (take(Kind.SET)) {
-            if (peek() == Kind.IDENT || isName(peek())) {
-                String variable = ident();
-                if (take(Kind.EQ)) {
-                    replacements = List.of(new Stmt.Assign(variable, "", expr()));
-                } else {
-                    expect(Kind.DOT, "SET 要写成 变量.属性 = 值");
-                    String field = ident();
-                    expect(Kind.EQ, "SET 缺少等号");
-                    List<Stmt.Assign> all = new ArrayList<>();
-                    all.add(new Stmt.Assign(variable, field, expr()));
-                    while (take(Kind.COMMA)) {
-                        all.add(assignment());
-                    }
-                    assignments = all;
-                }
-            }
-        }
-        if (take(Kind.REMOVE)) {
-            removals = variables();
-        }
-        boolean detach = false;
-        List<String> deletes = List.of();
-        if (take(Kind.DETACH)) {
-            detach = true;
-            expect(Kind.DELETE, "DETACH 后面要写 DELETE");
-            deletes = variables();
-        } else if (take(Kind.NODETACH)) {
-            expect(Kind.DELETE, "NODETACH 后面要写 DELETE");
-            deletes = variables();
-        } else if (take(Kind.DELETE)) {
-            deletes = variables();
-        }
-        Stmt legacy = lowerMutation(clauses, assignments, deletes, detach);
-        if (legacy != null && replacements.isEmpty() && removals.isEmpty()) {
-            return legacy;
-        }
-        return new Stmt.Mutate(clauses, assignments, replacements, removals, deletes, detach);
-    }
-
-    private Stmt.Clause.Match matchClause(boolean optional) {
-        String pathVariable = null;
-        if (isName(peek()) && look(1) == Kind.EQ) {
-            pathVariable = name();
-            expect(Kind.EQ, "路径变量后面要写等号");
-        }
-        String search = null;
-        Integer searchCount = null;
-        if (take(Kind.ANY)) {
-            if (take(Kind.SHORTEST)) {
-                search = "ANY_SHORTEST";
-            } else {
-                search = "ANY";
-                searchCount = (int) integer();
-            }
-        } else if (take(Kind.ALL)) {
-            expect(Kind.SHORTEST, "ALL 后面要写 SHORTEST");
-            search = "ALL_SHORTEST";
-        } else if (take(Kind.SHORTEST)) {
-            search = "SHORTEST";
-            searchCount = (int) integer();
-        }
-        String mode = null;
-        if (peek() == Kind.WALK || peek() == Kind.TRAIL || peek() == Kind.SIMPLE || peek() == Kind.ACYCLIC) {
-            mode = next().text.toUpperCase(Locale.ROOT);
-        }
-        List<Stmt.Pattern> patterns = new ArrayList<>();
-        patterns.add(pattern());
-        while (take(Kind.COMMA)) {
-            patterns.add(pattern());
-        }
-        Expr where = take(Kind.WHERE) ? expr() : null;
-        return new Stmt.Clause.Match(optional, pathVariable, search, searchCount, mode, patterns, where);
-    }
-
-    private Stmt.Pattern pattern() {
-        List<Stmt.Element> elements = new ArrayList<>();
-        elements.add(patternElement(true));
-        while (peek() == Kind.MINUS || peek() == Kind.LARROW) {
-            elements.add(new Stmt.Element.Rel(edge()));
-            elements.add(patternElement(false));
-        }
-        return new Stmt.Pattern(elements);
-    }
-
-    private Stmt.Element patternElement(boolean nodeFirst) {
-        if (peek() == Kind.LP && look(1) == Kind.LP) {
-            return group();
-        }
-        if (!nodeFirst && peek() != Kind.LP) {
-            return fail("路径缺少节点");
-        }
-        return new Stmt.Element.Node(node());
-    }
-
-    private Stmt.Element.Group group() {
-        expect(Kind.LP, "量化路径缺少左括号");
-        List<Stmt.Element> elements = new ArrayList<>();
-        elements.add(new Stmt.Element.Node(node()));
-        while (peek() == Kind.MINUS || peek() == Kind.LARROW) {
-            elements.add(new Stmt.Element.Rel(edge()));
-            elements.add(new Stmt.Element.Node(node()));
-        }
-        Expr where = take(Kind.WHERE) ? expr() : null;
-        expect(Kind.RP, "量化路径缺少右括号");
-        int[] range = quantifier();
-        if (range == null) {
-            return fail("量化路径后面要写跳数");
-        }
-        int max = range[1] < 0 ? Integer.MAX_VALUE : range[1];
-        return new Stmt.Element.Group(elements, where, range[0], max);
-    }
-
-    private Stmt.Tail tail() {
-        expect(Kind.RETURN, "缺少 RETURN");
-        boolean distinct = take(Kind.DISTINCT);
-        boolean star = false;
-        List<Stmt.Item> items = List.of();
-        if (take(Kind.STAR)) {
-            star = true;
-        } else {
-            items = items();
-        }
-        List<Expr> groupBy = List.of();
-        if (take(Kind.GROUP)) {
-            expect(Kind.BY, "GROUP 后面要写 BY");
-            groupBy = new ArrayList<>();
-            groupBy.add(expr());
-            while (take(Kind.COMMA)) {
-                groupBy.add(expr());
-            }
-            groupBy = List.copyOf(groupBy);
-        }
-        Expr postFilter = take(Kind.FILTER) ? expr() : null;
-        List<Stmt.Sort> order = List.of();
-        if (take(Kind.ORDER)) {
-            expect(Kind.BY, "ORDER 后面要写 BY");
-            order = sorts();
-        }
-        Expr skip = null;
-        if (take(Kind.SKIP) || take(Kind.OFFSET)) {
-            skip = expr();
-        }
-        Expr limit = take(Kind.LIMIT) ? expr() : null;
-        return new Stmt.Tail(distinct, star, items, groupBy, order, skip, limit, postFilter);
-    }
-
-    private Stmt compose(Stmt query) {
-        if (peek() == Kind.UNION || peek() == Kind.EXCEPT || peek() == Kind.INTERSECT) {
-            String op = next().text.toUpperCase(Locale.ROOT);
-            boolean all = take(Kind.ALL);
-            if (!all) {
-                take(Kind.DISTINCT);
-            }
-            expect(Kind.MATCH, "集合运算后面要写查询");
-            Stmt right = query(false);
-            return new Stmt.Composite(op, all, query, right);
-        }
-        if (take(Kind.NEXT)) {
-            if (peek() != Kind.MATCH && peek() != Kind.OPTIONAL && peek() != Kind.CALL) {
-                return fail("NEXT 后面要写查询");
-            }
-            Stmt right = peek() == Kind.CALL ? call() : query(false);
-            return new Stmt.Next(query, right);
-        }
-        return query;
-    }
-
-    private Stmt lower(List<Stmt.Clause> clauses, Stmt.Tail tail) {
-        if (clauses.size() != 1 || !(clauses.get(0) instanceof Stmt.Clause.Match match)) {
-            return null;
-        }
-        // 带路径变量的 MATCH 要走路径搜索才能绑定路径，不能降成单跳快速路径。
-        if (match.optional() || match.pathVariable() != null || match.search() != null || match.mode() != null
-                || match.patterns().size() != 1) {
-            return null;
-        }
-        if (tail.star() || !tail.groupBy().isEmpty()) {
-            return null;
-        }
-        List<Stmt.Element> elements = match.patterns().get(0).elements();
-        if (elements.size() != 1 && elements.size() != 3) {
-            return null;
-        }
-        if (!(elements.get(0) instanceof Stmt.Element.Node source)) {
-            return null;
-        }
-        if (source.node().where() != null || complex(source.node().label())) {
-            return null;
-        }
-        Stmt.EdgePat edge = null;
-        Stmt.NodePat target = null;
-        if (elements.size() == 3) {
-            if (!(elements.get(1) instanceof Stmt.Element.Rel rel) || !(elements.get(2) instanceof Stmt.Element.Node node)) {
-                return null;
-            }
-            if (node.node().where() != null || complex(node.node().label())) {
-                return null;
-            }
-            if (rel.edge().maxHop() != null && rel.edge().maxHop() < 0 && rel.edge().variable() != null) {
-                return null;
-            }
-            edge = rel.edge();
-            target = node.node();
-        }
-        return new Stmt.Match(
-                source.node(), edge, target, match.where(), tail.items(), tail.orderBy(),
-                tail.skip(), tail.limit(), tail.distinct(), match.pathVariable());
-    }
-
-    private Stmt lowerMutation(List<Stmt.Clause> clauses, List<Stmt.Assign> assignments, List<String> deletes, boolean detach) {
-        if (clauses.size() != 1 || !(clauses.get(0) instanceof Stmt.Clause.Match match)) {
-            return null;
-        }
-        if (match.optional() || match.search() != null || match.mode() != null || match.patterns().size() != 1) {
-            return null;
-        }
-        List<Stmt.Element> elements = match.patterns().get(0).elements();
-        if (elements.size() != 1 && elements.size() != 3) {
-            return null;
-        }
-        if (!(elements.get(0) instanceof Stmt.Element.Node source) || source.node().where() != null || complex(source.node().label())) {
-            return null;
-        }
-        Stmt.EdgePat edge = null;
-        Stmt.NodePat target = null;
-        if (elements.size() == 3) {
-            if (!(elements.get(1) instanceof Stmt.Element.Rel rel) || !(elements.get(2) instanceof Stmt.Element.Node node)) {
-                return null;
-            }
-            if (rel.edge().minHop() != null || node.node().where() != null || complex(node.node().label())) {
-                return null;
-            }
-            edge = rel.edge();
-            target = node.node();
-        }
-        if (!deletes.isEmpty()) {
-            return new Stmt.Delete(source.node(), edge, target, match.where(), deletes, detach);
-        }
-        if (!assignments.isEmpty()) {
-            return new Stmt.Set(source.node(), edge, target, match.where(), assignments);
-        }
-        return null;
-    }
-
-    private static boolean complex(Stmt.Label label) {
-        return label != null && !(label instanceof Stmt.Label.One);
-    }
-
-    private Stmt call() {
+    /** {@code CALL 过程(参数) [YIELD 列 [AS 别名], ...]} 或内联 {@code CALL [(变量, ...)] { 查询 }}。 */
+    private Stmt.Clause callClause(boolean optional) {
         expect(Kind.CALL, "缺少 CALL");
-        String namespace = name();
-        expect(Kind.DOT, "过程名要写成名字.名字");
+        if (peek() == Kind.LC || peek() == Kind.LP) {
+            List<String> scope = null;
+            if (take(Kind.LP)) {
+                scope = new ArrayList<>();
+                if (!take(Kind.RP)) {
+                    scope.add(ident());
+                    while (take(Kind.COMMA)) {
+                        scope.add(ident());
+                    }
+                    expect(Kind.RP, "变量列表缺少右括号");
+                }
+                scope = List.copyOf(scope);
+            }
+            expect(Kind.LC, "内联过程缺少左花括号");
+            Stmt body = readOnly(block(), "内联 CALL");
+            expect(Kind.RC, "内联过程缺少右花括号");
+            return new Stmt.Clause.Inline(body, scope, optional);
+        }
+        return new Stmt.Clause.Call(call(optional));
+    }
+
+    private Stmt.Call call(boolean optional) {
         String procedure = name();
+        while (take(Kind.DOT)) {
+            procedure = procedure + "." + name();
+        }
         expect(Kind.LP, "过程缺少左括号");
         List<Stmt.Arg> args = new ArrayList<>();
-        if (take(Kind.LC)) {
+        if (peek() == Kind.LC && (look(1) == Kind.RC || look(2) == Kind.COLON)) {
+            next();
             if (!take(Kind.RC)) {
                 args.add(arg(args));
                 while (take(Kind.COMMA)) {
@@ -674,25 +1293,16 @@ final class GqlReader {
             }
             expect(Kind.RP, "过程缺少右括号");
         }
-        expect(Kind.YIELD, "过程调用要写 YIELD");
         List<String> columns = new ArrayList<>();
-        columns.add(name());
-        while (take(Kind.COMMA)) {
-            columns.add(name());
+        List<String> aliases = new ArrayList<>();
+        if (take(Kind.YIELD)) {
+            do {
+                String column = name();
+                columns.add(column);
+                aliases.add(take(Kind.AS) ? ident() : column);
+            } while (take(Kind.COMMA));
         }
-        Stmt.Call call = new Stmt.Call(namespace + "." + procedure, args, columns);
-        if (peek() == Kind.FILTER || peek() == Kind.RETURN || peek() == Kind.WHERE || peek() == Kind.ORDER) {
-            List<Stmt.Clause> clauses = new ArrayList<>();
-            clauses.add(new Stmt.Clause.Call(call));
-            while (take(Kind.FILTER)) {
-                clauses.add(new Stmt.Clause.Filter(expr()));
-            }
-            if (peek() != Kind.RETURN) {
-                return call;
-            }
-            return new Stmt.Select(clauses, tail());
-        }
-        return call;
+        return new Stmt.Call(procedure, List.copyOf(args), List.copyOf(columns), List.copyOf(aliases), optional);
     }
 
     private Stmt.Arg arg(List<Stmt.Arg> args) {
@@ -704,23 +1314,6 @@ final class GqlReader {
         }
         expect(Kind.COLON, "参数名后面要写冒号");
         return new Stmt.Arg(key, expr());
-    }
-
-    private List<Stmt.Assign> assignments() {
-        List<Stmt.Assign> assignments = new ArrayList<>();
-        assignments.add(assignment());
-        while (take(Kind.COMMA)) {
-            assignments.add(assignment());
-        }
-        return List.copyOf(assignments);
-    }
-
-    private Stmt.Assign assignment() {
-        String variable = ident();
-        expect(Kind.DOT, "SET 要写成 变量.属性 = 值");
-        String field = ident();
-        expect(Kind.EQ, "SET 缺少等号");
-        return new Stmt.Assign(variable, field, expr());
     }
 
     private List<String> variables() {
@@ -736,43 +1329,141 @@ final class GqlReader {
         if (take(Kind.NODE)) {
             return true;
         }
+        if (take(Kind.EDGE)) {
+            return false;
+        }
         expect(Kind.REL, "这里要写 NODE 或 REL");
         return false;
     }
 
-    private List<Stmt.Field> fields() {
-        if (peek() == Kind.RP) {
+    private List<Stmt.Field> fields(Kind close) {
+        if (peek() == close) {
             return List.of();
         }
         List<Stmt.Field> fields = new ArrayList<>();
-        fields.add(field());
-        while (take(Kind.COMMA)) {
-            fields.add(field());
-        }
+        java.util.Set<String> names = new java.util.HashSet<>();
+        do {
+            Stmt.Field field = field();
+            if (!names.add(field.name())) {
+                return fail("属性 " + field.name() + " 写了两次");
+            }
+            fields.add(field);
+        } while (take(Kind.COMMA));
         return List.copyOf(fields);
     }
 
+    /** {@code 名字 [::|TYPED] 类型 [NOT NULL | NULL] [COMMENT '...']}。不写时可空，和标准一致。 */
     private Stmt.Field field() {
         String name = ident();
+        take(Kind.TYPED);
+        if (peek() == Kind.COLON && look(1) == Kind.COLON) {
+            next();
+            next();
+        }
         String valueType = typeName();
-        boolean nullable = take(Kind.NULL);
+        boolean nullable = true;
+        if (take(Kind.NOT)) {
+            expect(Kind.NULL, "NOT 后面要写 NULL");
+            nullable = false;
+        } else {
+            take(Kind.NULL);
+        }
         return new Stmt.Field(name, valueType, nullable, comment());
     }
 
     private String comment() {
         if (!take(Kind.COMMENT)) return null;
-        if (peek() != Kind.STRING) return fail("COMMENT 后面要写字符串");
+        if (peek() != Kind.TEXT) return fail("COMMENT 后面要写字符串");
         return next().text;
     }
 
+    /**
+     * 属性和 CAST 的类型名，统一成存储能识别的名字：BOOL、INT64、DOUBLE、STRING、DATETIME。
+     * 标准里其他写法按含义对应；存储还没有的类型直接报错，不悄悄换成别的类型。
+     */
     private String typeName() {
-        Kind kind = peek();
-        if (kind == Kind.BOOL || kind == Kind.BOOLEAN || kind == Kind.INT || kind == Kind.INTEGER_WORD
-                || kind == Kind.INT64 || kind == Kind.DOUBLE || kind == Kind.STRING || kind == Kind.DATETIME) {
-            return next().text;
+        Tok token = at();
+        String word = token.text.toUpperCase(Locale.ROOT);
+        if (!(token.kind == Kind.IDENT || KEYWORDS.containsKey(token.text.toLowerCase(Locale.ROOT)))) {
+            return fail("无法识别的列类型");
         }
-        return fail("无法识别的列类型");
+        next();
+        switch (word) {
+            case "BOOL", "BOOLEAN" -> {
+                return token.text;
+            }
+            case "INT", "INTEGER", "INT64", "INTEGER64", "BIGINT" -> {
+                return word.equals("INT") || word.equals("INT64") || word.equals("INTEGER") ? token.text : "INT64";
+            }
+            case "SIGNED" -> {
+                String inner = at().text.toUpperCase(Locale.ROOT);
+                if (inner.equals("INTEGER64") || inner.equals("BIGINT") || inner.equals("INTEGER") || inner.equals("INT64")) {
+                    next();
+                    return "INT64";
+                }
+                return fail("只支持 64 位整数");
+            }
+            case "INT8", "INT16", "INT32", "INT128", "INT256", "INTEGER8", "INTEGER16", "INTEGER32", "INTEGER128", "INTEGER256",
+                 "SMALLINT", "UINT", "UINT8", "UINT16", "UINT32", "UINT64", "UINT128", "UINT256", "USMALLINT", "UBIGINT",
+                 "UNSIGNED" -> {
+                return fail("暂不支持 " + token.text + "：整数只有 64 位有符号一种，请写 INT64");
+            }
+            case "DOUBLE" -> {
+                if (at().text.equalsIgnoreCase("PRECISION")) {
+                    next();
+                }
+                return "DOUBLE";
+            }
+            case "FLOAT", "FLOAT64" -> {
+                if (take(Kind.LP)) {
+                    return fail("暂不支持指定 FLOAT 精度，请写 DOUBLE");
+                }
+                return "DOUBLE";
+            }
+            case "REAL", "FLOAT16", "FLOAT32", "FLOAT128", "FLOAT256", "DECIMAL", "DEC" -> {
+                return fail("暂不支持 " + token.text + "：小数只有 64 位浮点一种，请写 DOUBLE");
+            }
+            case "STRING", "VARCHAR", "CHAR" -> {
+                if (peek() == Kind.LP) {
+                    return fail("暂不支持字符串长度约束，请直接写 STRING");
+                }
+                return word.equals("STRING") ? token.text : "STRING";
+            }
+            case "DATETIME" -> {
+                return token.text;
+            }
+            case "ZONED" -> {
+                if (!at().text.equalsIgnoreCase("DATETIME")) {
+                    return fail("暂不支持 ZONED TIME，日期时间请写 ZONED DATETIME");
+                }
+                next();
+                return "DATETIME";
+            }
+            case "TIMESTAMP" -> {
+                if (take(Kind.WITH)) {
+                    expectWord("TIME");
+                    expectWord("ZONE");
+                }
+                return "DATETIME";
+            }
+            case "DATE", "TIME", "LOCAL", "DURATION", "BYTES", "BINARY", "VARBINARY", "LIST", "ARRAY", "RECORD", "PATH",
+                 "NODE", "EDGE", "VERTEX", "RELATIONSHIP", "ANY", "NOTHING" -> {
+                return fail("存储暂不支持 " + token.text + " 类型的属性，现有类型：BOOL、INT64、DOUBLE、STRING、DATETIME");
+            }
+            default -> {
+                return fail("无法识别的列类型");
+            }
+        }
     }
+
+    private void expectWord(String word) {
+        if (!at().text.equalsIgnoreCase(word)) {
+            fail("这里要写 " + word);
+        }
+        next();
+    }
+
+    // ---------------------------------------------------------------- 节点、边和标签
 
     private Stmt.NodePat node() {
         expect(Kind.LP, "节点缺少左括号");
@@ -782,8 +1473,8 @@ final class GqlReader {
         }
         String typeName = null;
         Stmt.Label label = null;
-        if (take(Kind.COLON)) {
-            label = label();
+        if (take(Kind.COLON) || take(Kind.IS)) {
+            label = label(true);
             if (label instanceof Stmt.Label.One one) {
                 typeName = one.name();
             }
@@ -794,35 +1485,75 @@ final class GqlReader {
         return new Stmt.NodePat(variable, typeName, props, where, label);
     }
 
-    private Stmt.Label label() {
-        Stmt.Label label = labelTerm();
-        if (peek() == Kind.PIPE || peek() == Kind.AND) {
-            Kind op = peek();
-            List<Stmt.Label> options = new ArrayList<>();
-            options.add(label);
-            while (peek() == op) {
-                next();
-                options.add(labelTerm());
-            }
-            label = op == Kind.PIPE ? new Stmt.Label.Or(List.copyOf(options)) : new Stmt.Label.And(List.copyOf(options));
+    /**
+     * 标签表达式，优先级 {@code !} 高于 {@code &} 高于 {@code |}，可以加括号，{@code %} 表示任意标签。
+     * {@code keywordAnd} 为真时（点和边模式里）也接受关键字 AND 作为 {@code &}，这是层岩旧写法；
+     * 表达式里的 {@code n:A AND ...} 中的 AND 是逻辑与，不能吞掉。
+     */
+    private Stmt.Label label(boolean keywordAnd) {
+        List<Stmt.Label> options = new ArrayList<>();
+        options.add(labelConjunction(keywordAnd));
+        while (peek() == Kind.PIPE) {
+            next();
+            take(Kind.COLON);
+            options.add(labelConjunction(keywordAnd));
         }
-        return label;
+        return options.size() == 1 ? options.get(0) : new Stmt.Label.Or(List.copyOf(options));
     }
 
-    private Stmt.Label labelTerm() {
+    private Stmt.Label labelConjunction(boolean keywordAnd) {
+        List<Stmt.Label> options = new ArrayList<>();
+        options.add(labelTerm(keywordAnd));
+        while (peek() == Kind.AMP || (keywordAnd && peek() == Kind.AND)) {
+            next();
+            options.add(labelTerm(keywordAnd));
+        }
+        return options.size() == 1 ? options.get(0) : new Stmt.Label.And(List.copyOf(options));
+    }
+
+    private Stmt.Label labelTerm(boolean keywordAnd) {
         if (take(Kind.PERCENT)) {
             return new Stmt.Label.Any();
         }
         if (take(Kind.BANG) || take(Kind.NOT)) {
-            return new Stmt.Label.Not(labelTerm());
+            return new Stmt.Label.Not(labelTerm(keywordAnd));
+        }
+        if (take(Kind.LP)) {
+            Stmt.Label inner = label(keywordAnd);
+            expect(Kind.RP, "标签表达式缺少右括号");
+            return inner;
         }
         return new Stmt.Label.One(ident());
+    }
+
+    /** 只由名字和 {@code |} 组成时列出这些类型；否则为空，执行时读全部类型再过滤。 */
+    private List<String> typeNames(Stmt.Label label) {
+        if (label == null) {
+            return List.of();
+        }
+        if (label instanceof Stmt.Label.One one) {
+            return List.of(one.name());
+        }
+        if (label instanceof Stmt.Label.Or or) {
+            List<String> names = new ArrayList<>();
+            for (Stmt.Label option : or.options()) {
+                if (!(option instanceof Stmt.Label.One one)) {
+                    return List.of();
+                }
+                if (names.contains(one.name())) {
+                    return fail("边类型重复：" + one.name());
+                }
+                names.add(one.name());
+            }
+            return List.copyOf(names);
+        }
+        return List.of();
     }
 
     private List<Stmt.Element> insertElements() {
         List<Stmt.Element> elements = new ArrayList<>();
         elements.add(new Stmt.Element.Node(node()));
-        while (peek() == Kind.COMMA || peek() == Kind.MINUS || peek() == Kind.LARROW) {
+        while (peek() == Kind.COMMA || edgeStart()) {
             if (take(Kind.COMMA)) {
                 elements.add(new Stmt.Element.Node(node()));
                 continue;
@@ -831,51 +1562,122 @@ final class GqlReader {
             if (edge.minHop() != null) {
                 return fail("插入边不能是多跳");
             }
+            if (edge.direction() == Stmt.EdgePat.Direction.ANY) {
+                return fail("插入的边要写方向");
+            }
+            if (edge.label() != null && !(edge.label() instanceof Stmt.Label.One)) {
+                return fail("插入的边只能有一个类型");
+            }
+            if (edge.where() != null) {
+                return fail("插入的边不能写 WHERE");
+            }
             elements.add(new Stmt.Element.Rel(edge));
             elements.add(new Stmt.Element.Node(node()));
         }
-        return elements;
+        for (Stmt.Element element : elements) {
+            if (element instanceof Stmt.Element.Node node) {
+                if (node.node().label() != null && !(node.node().label() instanceof Stmt.Label.One)) {
+                    return fail("层岩一个点只有一个类型，插入时只能写一个标签");
+                }
+                if (node.node().where() != null) {
+                    return fail("插入的点不能写 WHERE");
+                }
+            }
+        }
+        return List.copyOf(elements);
     }
 
+    /**
+     * 边模式，完整写法和缩写都接受：
+     * {@code -[ ]->}、{@code <-[ ]-}、{@code -[ ]-}、{@code <-[ ]->}、{@code <~[ ]~}、{@code ~[ ]~>}，
+     * 缩写 {@code ->}、{@code <-}、{@code -}、{@code <->}、{@code <~}、{@code ~>}。
+     * 层岩只有有向边：「左或无向」等于左，「无向或右」等于右，单纯的无向 {@code ~[ ]~} 报错。
+     */
     private Stmt.EdgePat edge() {
         Stmt.EdgePat.Direction direction;
+        Stmt.EdgePat body;
         if (take(Kind.LARROW)) {
+            if (take(Kind.LB)) {
+                body = edgeBody();
+                expect(Kind.RB, "边缺少右方括号");
+                if (take(Kind.ARROW)) {
+                    direction = Stmt.EdgePat.Direction.ANY;
+                } else {
+                    expect(Kind.MINUS, "入边的箭头不完整");
+                    direction = Stmt.EdgePat.Direction.IN;
+                }
+            } else {
+                body = emptyEdge();
+                direction = take(Kind.GT) ? Stmt.EdgePat.Direction.ANY : Stmt.EdgePat.Direction.IN;
+            }
+        } else if (peek() == Kind.LT && look(1) == Kind.TILDE) {
+            next();
+            next();
+            if (take(Kind.LB)) {
+                body = edgeBody();
+                expect(Kind.RB, "边缺少右方括号");
+                expect(Kind.TILDE, "<~[ 要以 ]~ 结束");
+            } else {
+                body = emptyEdge();
+            }
             direction = Stmt.EdgePat.Direction.IN;
-            expect(Kind.LB, "边缺少左方括号");
-            Stmt.EdgePat edge = edgeBody(direction);
-            expect(Kind.RB, "边缺少右方括号");
-            expect(Kind.MINUS, "入边的箭头不完整");
-            return hops(edge, quantifier());
-        }
-        expect(Kind.MINUS, "边缺少方向");
-        expect(Kind.LB, "边缺少左方括号");
-        Stmt.EdgePat undecided = edgeBody(Stmt.EdgePat.Direction.OUT);
-        expect(Kind.RB, "边缺少右方括号");
-        if (take(Kind.ARROW)) {
+        } else if (take(Kind.TILDE)) {
+            if (take(Kind.LB)) {
+                body = edgeBody();
+                expect(Kind.RB, "边缺少右方括号");
+                expect(Kind.TILDE, "~[ 要以 ]~ 或 ]~> 结束");
+            } else {
+                body = emptyEdge();
+            }
+            if (!take(Kind.GT)) {
+                return fail("层岩的边都有方向，不支持无向边 ~");
+            }
             direction = Stmt.EdgePat.Direction.OUT;
-        } else if (take(Kind.MINUS)) {
-            direction = Stmt.EdgePat.Direction.ANY;
+        } else if (take(Kind.ARROW)) {
+            body = emptyEdge();
+            direction = Stmt.EdgePat.Direction.OUT;
         } else {
-            return fail("边的方向不完整");
+            expect(Kind.MINUS, "边缺少方向");
+            if (take(Kind.LB)) {
+                body = edgeBody();
+                expect(Kind.RB, "边缺少右方括号");
+                if (take(Kind.ARROW)) {
+                    direction = Stmt.EdgePat.Direction.OUT;
+                } else if (take(Kind.MINUS)) {
+                    direction = Stmt.EdgePat.Direction.ANY;
+                } else {
+                    return fail("边的方向不完整");
+                }
+            } else {
+                body = emptyEdge();
+                direction = Stmt.EdgePat.Direction.ANY;
+            }
         }
-        return hops(new Stmt.EdgePat(
-                direction, undecided.variable(), undecided.typeNames(), undecided.rank(), undecided.properties(),
-                null, null), quantifier());
+        int[] range = quantifier();
+        return new Stmt.EdgePat(direction, body.variable(), body.typeNames(), body.rank(), body.properties(),
+                range == null ? null : range[0], range == null ? null : range[1], body.label(), body.where());
     }
 
+    private static Stmt.EdgePat emptyEdge() {
+        return new Stmt.EdgePat(Stmt.EdgePat.Direction.OUT, null, List.of(), null, List.of(), null, null, null, null);
+    }
+
+    /** 量词：{@code *}、{@code +}、{@code ?}、{@code {n}}、{@code {m,}}、{@code {,n}}、{@code {m,n}}。上界 -1 表示不限。 */
     private int[] quantifier() {
-        if (peek() == Kind.STAR) {
-            next();
+        if (take(Kind.STAR)) {
             return new int[] {0, -1};
         }
-        if (peek() == Kind.PLUS) {
-            next();
+        if (take(Kind.PLUS)) {
             return new int[] {1, -1};
         }
-        if (!take(Kind.LC)) {
+        if (take(Kind.QUESTION)) {
+            return new int[] {0, 1};
+        }
+        if (peek() != Kind.LC || (look(1) != Kind.INTEGER && look(1) != Kind.COMMA)) {
             return null;
         }
-        long min = integer();
+        next();
+        long min = peek() == Kind.COMMA ? 0 : integer();
         long max = min;
         if (take(Kind.COMMA)) {
             max = peek() == Kind.RC ? -1 : integer();
@@ -890,44 +1692,22 @@ final class GqlReader {
         return new int[] {(int) min, (int) max};
     }
 
-    private static Stmt.EdgePat hops(Stmt.EdgePat edge, int[] range) {
-        if (range == null) {
-            return edge;
-        }
-        return new Stmt.EdgePat(
-                edge.direction(), edge.variable(), edge.typeNames(), edge.rank(), edge.properties(),
-                range[0], range[1]);
-    }
-
-    private Stmt.EdgePat edgeBody(Stmt.EdgePat.Direction direction) {
+    private Stmt.EdgePat edgeBody() {
         String variable = null;
-        if (isName(peek())) {
+        if (isName(peek()) && peek() != Kind.WHERE) {
             variable = next().text;
         }
-        List<String> typeNames = List.of();
-        if (take(Kind.COLON)) {
-            typeNames = typeNames();
+        Stmt.Label label = null;
+        if (take(Kind.COLON) || take(Kind.IS)) {
+            label = label(true);
         }
         Long rank = null;
         if (take(Kind.AT)) {
             rank = integer();
         }
-        return new Stmt.EdgePat(direction, variable, typeNames, rank, props(), null, null);
-    }
-
-    /** {@code :a|:b} 或 {@code :a|b}。冒号可以写在每个类型前面。 */
-    private List<String> typeNames() {
-        java.util.ArrayList<String> names = new java.util.ArrayList<>();
-        names.add(ident());
-        while (take(Kind.PIPE)) {
-            take(Kind.COLON);
-            String name = ident();
-            if (names.contains(name)) {
-                return fail("边类型重复：" + name);
-            }
-            names.add(name);
-        }
-        return List.copyOf(names);
+        List<Stmt.Prop> props = props();
+        Expr where = take(Kind.WHERE) ? expr() : null;
+        return new Stmt.EdgePat(Stmt.EdgePat.Direction.OUT, variable, typeNames(label), rank, props, null, null, label, where);
     }
 
     private List<Stmt.Prop> props() {
@@ -989,17 +1769,24 @@ final class GqlReader {
         } else {
             take(Kind.ASC);
         }
+        if (at().kind == Kind.IDENT && at().text.equalsIgnoreCase("NULLS")) {
+            fail("暂不支持 NULLS FIRST / NULLS LAST");
+        }
         return new Stmt.Sort(expr, descending);
     }
+
+    // ---------------------------------------------------------------- 表达式
 
     private Expr expr() {
         return or();
     }
 
+    /** 标准里 OR 和 XOR 同一优先级，左结合。 */
     private Expr or() {
-        Expr left = xor(and());
-        while (take(Kind.OR)) {
-            left = new Expr.Binary("OR", left, xor(and()));
+        Expr left = and();
+        while (peek() == Kind.OR || peek() == Kind.XOR) {
+            String op = next().kind == Kind.OR ? "OR" : "XOR";
+            left = new Expr.Binary(op, left, and());
         }
         return left;
     }
@@ -1008,13 +1795,6 @@ final class GqlReader {
         Expr left = not();
         while (take(Kind.AND)) {
             left = new Expr.Binary("AND", left, not());
-        }
-        return left;
-    }
-
-    private Expr xor(Expr left) {
-        while (take(Kind.XOR)) {
-            left = new Expr.Binary("XOR", left, not());
         }
         return left;
     }
@@ -1034,31 +1814,57 @@ final class GqlReader {
             String op = next().text;
             return new Expr.Binary(op, left, add());
         }
-        if (kind == Kind.NOT && look(1) == Kind.IN) {
+        if (kind == Kind.LARROW) {
+            // a<-1 是 a < -1，词法上和左箭头连在一起。
+            next();
+            return new Expr.Binary("<", left, addFrom(new Expr.Unary("-", unary())));
+        }
+        if (kind == Kind.NOT && look(1) == Kind.IN && letDepth == 0) {
             next();
             return in(left, true);
         }
-        if (peek() == Kind.IN) {
+        if (peek() == Kind.IN && letDepth == 0) {
             return in(left, false);
+        }
+        if (kind == Kind.COLON && sliceDepth == 0 && left instanceof Expr.Variable) {
+            next();
+            return new Expr.Labeled(left, label(false), false);
         }
         if (take(Kind.IS)) {
             boolean negated = take(Kind.NOT);
             if (take(Kind.NULL)) {
                 return new Expr.IsNull(left, negated);
             }
+            if (take(Kind.TRUE)) {
+                return new Expr.Truth(left, true, negated);
+            }
+            if (take(Kind.FALSE)) {
+                return new Expr.Truth(left, false, negated);
+            }
+            if (take(Kind.UNKNOWN)) {
+                return new Expr.Truth(left, null, negated);
+            }
+            if (peek() == Kind.COLON && look(1) == Kind.COLON) {
+                next();
+                next();
+                return new Expr.Typed(left, typeName(), negated);
+            }
             if (take(Kind.TYPED)) {
                 return new Expr.Typed(left, typeName(), negated);
             }
-            if (take(Kind.LABELED)) {
-                return new Expr.Labeled(left, label(), negated);
+            if (take(Kind.LABELED) || take(Kind.COLON)) {
+                return new Expr.Labeled(left, label(false), negated);
+            }
+            if (take(Kind.DIRECTED)) {
+                return new Expr.Directed(left, negated);
             }
             if (take(Kind.SOURCE)) {
                 expect(Kind.OF, "SOURCE 后面要写 OF");
-                return new Expr.EndpointOf(left, expr(), true, negated);
+                return new Expr.EndpointOf(left, add(), true, negated);
             }
             if (take(Kind.DESTINATION)) {
                 expect(Kind.OF, "DESTINATION 后面要写 OF");
-                return new Expr.EndpointOf(left, expr(), false, negated);
+                return new Expr.EndpointOf(left, add(), false, negated);
             }
             return fail("IS 后面无法识别");
         }
@@ -1067,7 +1873,18 @@ final class GqlReader {
 
     private Expr in(Expr left, boolean negated) {
         expect(Kind.IN, "缺少 IN");
-        if (take(Kind.LB)) {
+        if (peek() == Kind.LP) {
+            next();
+            List<Expr> options = new ArrayList<>();
+            options.add(expr());
+            while (take(Kind.COMMA)) {
+                options.add(expr());
+            }
+            expect(Kind.RP, "IN 缺少右括号");
+            return new Expr.In(left, List.copyOf(options), negated);
+        }
+        if (peek() == Kind.LB) {
+            next();
             List<Expr> options = new ArrayList<>();
             if (!take(Kind.RB)) {
                 options.add(expr());
@@ -1078,21 +1895,17 @@ final class GqlReader {
             }
             return new Expr.In(left, List.copyOf(options), negated);
         }
-        if (take(Kind.LP)) {
-            List<Expr> options = new ArrayList<>();
-            options.add(expr());
-            while (take(Kind.COMMA)) {
-                options.add(expr());
-            }
-            expect(Kind.RP, "IN 缺少右括号");
-            return new Expr.In(left, List.copyOf(options), negated);
-        }
         // 右边和比较运算的右边同一优先级：x IN $list AND y 里的 AND 不属于列表。
         return new Expr.Member(left, add(), negated);
     }
 
     private Expr add() {
-        Expr left = mul();
+        return addFrom(unary());
+    }
+
+    /** 已经读出第一个一元项时，接着读乘除和加减。 */
+    private Expr addFrom(Expr first) {
+        Expr left = mulFrom(first);
         while (peek() == Kind.PLUS || peek() == Kind.MINUS || peek() == Kind.CONCAT) {
             String op = next().text;
             left = new Expr.Binary(op, left, mul());
@@ -1101,7 +1914,11 @@ final class GqlReader {
     }
 
     private Expr mul() {
-        Expr left = unary();
+        return mulFrom(unary());
+    }
+
+    private Expr mulFrom(Expr first) {
+        Expr left = first;
         while (peek() == Kind.STAR || peek() == Kind.SLASH) {
             String op = next().text;
             left = new Expr.Binary(op, left, unary());
@@ -1113,27 +1930,45 @@ final class GqlReader {
         if (take(Kind.MINUS)) {
             return new Expr.Unary("-", unary());
         }
+        if (take(Kind.PLUS)) {
+            return unary();
+        }
         return primary();
     }
 
     private Expr primary() {
         Expr expr;
         if (take(Kind.LP)) {
-            Expr inner = expr();
+            int saved = letDepth;
+            letDepth = 0;
+            Expr inner;
+            try {
+                inner = expr();
+            } finally {
+                letDepth = saved;
+            }
             expect(Kind.RP, "表达式缺少右括号");
             expr = inner;
         } else if (take(Kind.DOLLAR)) {
             expr = new Expr.Param(ident());
-        } else if (take(Kind.DATETIME)) {
-            if (peek() != Kind.STRING) {
-                return fail("DATETIME 后面要写字符串");
-            }
+        } else if (peek() == Kind.DATETIME && look(1) == Kind.TEXT) {
+            next();
             expr = new Expr.Literal(new DateTimeText(next().text));
+        } else if (peek() == Kind.IDENT && look(1) == Kind.TEXT && at().text.equalsIgnoreCase("TIMESTAMP")) {
+            next();
+            expr = new Expr.Literal(new DateTimeText(next().text));
+        } else if (peek() == Kind.IDENT && at().text.equalsIgnoreCase("ZONED") && look(1) == Kind.DATETIME && look(2) == Kind.TEXT) {
+            next();
+            next();
+            expr = new Expr.Literal(new DateTimeText(next().text));
+        } else if (peek() == Kind.IDENT && look(1) == Kind.TEXT
+                && java.util.Set.of("DATE", "TIME", "DURATION", "LOCAL").contains(at().text.toUpperCase(Locale.ROOT))) {
+            return fail("暂不支持 " + at().text.toUpperCase(Locale.ROOT) + " 类型的值，日期时间请写 DATETIME '...'");
         } else if (peek() == Kind.INTEGER) {
             expr = new Expr.Literal(integer());
         } else if (peek() == Kind.REAL) {
             expr = new Expr.Literal(Double.valueOf(next().text));
-        } else if (peek() == Kind.STRING) {
+        } else if (peek() == Kind.TEXT) {
             expr = new Expr.Literal(next().text);
         } else if (take(Kind.TRUE)) {
             expr = new Expr.Literal(true);
@@ -1141,37 +1976,77 @@ final class GqlReader {
             expr = new Expr.Literal(false);
         } else if (take(Kind.NULL)) {
             expr = new Expr.Literal(null);
-        } else if (take(Kind.CASE)) {
+        } else if (take(Kind.UNKNOWN)) {
+            expr = new Expr.Literal(null);
+        } else if (peek() == Kind.CASE && look(1) != Kind.LP) {
+            next();
             expr = caseExpr();
-        } else if (take(Kind.CAST)) {
+        } else if (peek() == Kind.CAST && look(1) == Kind.LP) {
+            next();
             expect(Kind.LP, "CAST 缺少左括号");
             Expr value = expr();
             expect(Kind.AS, "CAST 缺少 AS");
             String type = typeName();
             expect(Kind.RP, "CAST 缺少右括号");
             expr = new Expr.Cast(value, type);
-        } else if (peek() == Kind.IDENT && "REDUCE".equalsIgnoreCase(at().text)
-                && look(1) == Kind.LP) {
+        } else if (peek() == Kind.IDENT && "REDUCE".equalsIgnoreCase(at().text) && look(1) == Kind.LP) {
             next();
             expr = reduceExpr();
         } else if (take(Kind.EXISTS)) {
             if (take(Kind.LC)) {
-                Stmt query = peek() == Kind.MATCH || peek() == Kind.OPTIONAL ? statement() : query(false);
+                Stmt query = nested(false);
                 expect(Kind.RC, "EXISTS 缺少右花括号");
+                expr = new Expr.Exists(query);
+            } else if (peek() == Kind.LP && (look(1) == Kind.LP || look(1) == Kind.MATCH || look(1) == Kind.OPTIONAL)) {
+                next();
+                Stmt query = nested(false);
+                expect(Kind.RP, "EXISTS 缺少右括号");
                 expr = new Expr.Exists(query);
             } else {
                 expr = callExpr("exists");
             }
+        } else if (peek() == Kind.VALUE && look(1) == Kind.LC) {
+            next();
+            next();
+            Stmt query = nested(true);
+            expect(Kind.RC, "VALUE 子查询缺少右花括号");
+            expr = new Expr.ValueQuery(query);
+        } else if (peek() == Kind.LET && isName(look(1)) && look(2) == Kind.EQ) {
+            next();
+            expr = letExpr();
+        } else if (peek() == Kind.LIST && look(1) == Kind.LB) {
+            next();
+            next();
+            expr = listLit();
+        } else if (peek() == Kind.RECORD && look(1) == Kind.LC) {
+            next();
+            next();
+            expr = mapLit();
         } else if (take(Kind.LB)) {
             expr = listLit();
         } else if (take(Kind.LC)) {
             expr = mapLit();
         } else if (isName(peek())) {
             String name = next().text;
+            String lower = name.toLowerCase(Locale.ROOT);
             if (take(Kind.LP)) {
-                expr = arguments(name);
+                expr = switch (lower) {
+                    case "trim" -> trimExpr();
+                    case "same" -> new Expr.Same(callArgs(2, "SAME"), false);
+                    case "all_different" -> new Expr.Same(callArgs(2, "ALL_DIFFERENT"), true);
+                    case "property_exists" -> {
+                        Expr value = expr();
+                        expect(Kind.COMMA, "PROPERTY_EXISTS 要写成 PROPERTY_EXISTS(变量, 属性名)");
+                        String property = peek() == Kind.TEXT ? next().text : ident();
+                        expect(Kind.RP, "PROPERTY_EXISTS 缺少右括号");
+                        yield new Expr.PropExists(value, property);
+                    }
+                    default -> arguments(name);
+                };
             } else if (take(Kind.DOT)) {
                 expr = new Expr.Prop(name, ident());
+            } else if (NILADIC.contains(lower)) {
+                expr = new Expr.Call(name, List.of());
             } else {
                 expr = new Expr.Variable(name);
             }
@@ -1179,6 +2054,77 @@ final class GqlReader {
             return fail("无法识别的表达式");
         }
         return postfix(expr);
+    }
+
+    /** 至少 {@code min} 个参数，左括号已经读过。 */
+    private List<Expr> callArgs(int min, String name) {
+        List<Expr> values = new ArrayList<>();
+        values.add(expr());
+        while (take(Kind.COMMA)) {
+            values.add(expr());
+        }
+        expect(Kind.RP, name + " 缺少右括号");
+        if (values.size() < min) {
+            fail(name + " 至少要 " + min + " 个参数");
+        }
+        return List.copyOf(values);
+    }
+
+    /** {@code TRIM([BOTH|LEADING|TRAILING] [字符] FROM 文本)} 或 {@code TRIM(文本)}，左括号已经读过。 */
+    private Expr trimExpr() {
+        String spec = "BOTH";
+        boolean explicit = false;
+        if (peek() == Kind.BOTH || peek() == Kind.LEADING || peek() == Kind.TRAILING) {
+            spec = next().text.toUpperCase(Locale.ROOT);
+            explicit = true;
+        }
+        Expr chars = null;
+        Expr source;
+        if (take(Kind.FROM)) {
+            source = expr();
+        } else {
+            Expr first = expr();
+            if (take(Kind.FROM)) {
+                chars = first;
+                source = expr();
+            } else if (explicit) {
+                return fail("TRIM 写了 BOTH / LEADING / TRAILING 时要写 FROM");
+            } else if (take(Kind.COMMA)) {
+                // 层岩旧写法 TRIM(文本, 字符)
+                source = first;
+                chars = expr();
+            } else {
+                source = first;
+            }
+        }
+        expect(Kind.RP, "TRIM 缺少右括号");
+        return new Expr.Trim(spec, chars, source);
+    }
+
+    private Expr letExpr() {
+        List<String> names = new ArrayList<>();
+        List<Expr> values = new ArrayList<>();
+        do {
+            names.add(ident());
+            expect(Kind.EQ, "LET 后面要写等号");
+            letDepth++;
+            try {
+                values.add(expr());
+            } finally {
+                letDepth--;
+            }
+        } while (take(Kind.COMMA));
+        expect(Kind.IN, "LET 表达式要写成 LET 名字 = 值 IN 表达式 END");
+        int saved = letDepth;
+        letDepth = 0;
+        Expr body;
+        try {
+            body = expr();
+        } finally {
+            letDepth = saved;
+        }
+        expect(Kind.END, "LET 表达式缺少 END");
+        return new Expr.LetIn(List.copyOf(names), List.copyOf(values), body);
     }
 
     private Expr reduceExpr() {
@@ -1197,16 +2143,24 @@ final class GqlReader {
     }
 
     private Expr postfix(Expr expr) {
-        while (take(Kind.LB)) {
-            Expr start = expr();
-            Expr end = null;
-            if (take(Kind.COLON)) {
-                end = peek() == Kind.RB ? null : expr();
+        while (true) {
+            if (take(Kind.LB)) {
+                sliceDepth++;
+                try {
+                    Expr start = expr();
+                    Expr end = null;
+                    if (take(Kind.COLON)) {
+                        end = peek() == Kind.RB ? null : expr();
+                    }
+                    expect(Kind.RB, "下标缺少右方括号");
+                    expr = new Expr.Index(expr, start, end);
+                } finally {
+                    sliceDepth--;
+                }
+            } else {
+                return expr;
             }
-            expect(Kind.RB, "下标缺少右方括号");
-            expr = new Expr.Index(expr, start, end);
         }
-        return expr;
     }
 
     private Expr listLit() {
@@ -1228,14 +2182,15 @@ final class GqlReader {
         }
         List<String> keys = new ArrayList<>();
         List<Expr> values = new ArrayList<>();
-        keys.add(ident());
-        expect(Kind.COLON, "映射键后面要写冒号");
-        values.add(expr());
-        while (take(Kind.COMMA)) {
-            keys.add(ident());
+        do {
+            String key = ident();
+            if (keys.contains(key)) {
+                return fail("映射键 " + key + " 写了两次");
+            }
+            keys.add(key);
             expect(Kind.COLON, "映射键后面要写冒号");
             values.add(expr());
-        }
+        } while (take(Kind.COMMA));
         expect(Kind.RC, "映射缺少右花括号");
         return new Expr.MapLit(List.copyOf(keys), List.copyOf(values));
     }
@@ -1269,6 +2224,7 @@ final class GqlReader {
             expect(Kind.RP, "函数调用缺少右括号");
             return new Expr.Call(name, List.copyOf(args));
         }
+        take(Kind.ALL);
         if (take(Kind.STAR)) {
             args.add(new Expr.Literal("*"));
             expect(Kind.RP, "函数调用缺少右括号");
@@ -1284,6 +2240,8 @@ final class GqlReader {
         return new Expr.Call(name, List.copyOf(args));
     }
 
+    // ---------------------------------------------------------------- 词法辅助
+
     private String ident() {
         if (!isName(peek())) {
             return fail("这里要写名字");
@@ -1292,9 +2250,10 @@ final class GqlReader {
     }
 
     private boolean ifNotExists() {
-        if (!take(Kind.IF)) {
+        if (peek() != Kind.IF) {
             return false;
         }
+        next();
         expect(Kind.NOT, "IF 后面要写 NOT EXISTS");
         expect(Kind.EXISTS, "IF NOT 后面要写 EXISTS");
         return true;
@@ -1310,7 +2269,7 @@ final class GqlReader {
 
     private boolean isName(Kind kind) {
         if (kind == Kind.AND || kind == Kind.OR || kind == Kind.XOR || kind == Kind.NOT
-                || kind == Kind.TRUE || kind == Kind.FALSE || kind == Kind.NULL
+                || kind == Kind.TRUE || kind == Kind.FALSE || kind == Kind.NULL || kind == Kind.UNKNOWN
                 || kind == Kind.AS || kind == Kind.IN || kind == Kind.IS) {
             return false;
         }
@@ -1413,7 +2372,8 @@ final class GqlReader {
                 column = 1;
                 continue;
             }
-            if (current == '/' && index + 1 < length && source.charAt(index + 1) == '/') {
+            if ((current == '/' || current == '-') && index + 1 < length && source.charAt(index + 1) == current) {
+                // 标准的两种行注释：// 和 --
                 while (index < length && source.charAt(index) != '\n') {
                     index++;
                 }
@@ -1479,15 +2439,16 @@ final class GqlReader {
                 tokens.add(new Tok(Kind.IDENT, body.toString(), index, index, line, startColumn));
                 continue;
             }
-            if (Character.isLetter(current) && current < 128) {
+            int codePoint = source.codePointAt(index);
+            if (identifierStart(codePoint)) {
                 int start = index;
                 int startColumn = column;
-                index++;
+                index += Character.charCount(codePoint);
                 column++;
                 while (index < length) {
-                    char next = source.charAt(index);
-                    if (Character.isLetterOrDigit(next) && next < 128 || next == '_') {
-                        index++;
+                    int next = source.codePointAt(index);
+                    if (identifierPart(next)) {
+                        index += Character.charCount(next);
                         column++;
                     } else {
                         break;
@@ -1510,6 +2471,23 @@ final class GqlReader {
                         || plain.startsWith("0o") || plain.startsWith("0O")
                         || plain.startsWith("0b") || plain.startsWith("0B"))) {
                     text = String.valueOf(parseRadix(plain));
+                }
+                boolean radix = plain.length() > 2 && plain.charAt(0) == '0' && "xXoObB".indexOf(plain.charAt(1)) >= 0;
+                int after = index + consumed;
+                if (!radix && after < length && "dDfFmM".indexOf(source.charAt(after)) >= 0
+                        && (after + 1 >= length || !identifierPart(source.codePointAt(after + 1)))) {
+                    // 数字后缀：d / f 是浮点，m 是精确数。
+                    char suffix = Character.toLowerCase(source.charAt(after));
+                    if (suffix == 'm' && real) {
+                        throw new ParseException("第 " + line + " 行第 " + startColumn + " 列暂不支持 DECIMAL 精确小数");
+                    }
+                    if (suffix != 'm') {
+                        real = true;
+                        text = String.valueOf(Double.parseDouble(plain));
+                    }
+                    consumed++;
+                } else if (after < length && identifierPart(source.codePointAt(after))) {
+                    throw new ParseException("第 " + line + " 行第 " + startColumn + " 列数字后面不能直接跟名字");
                 }
                 tokens.add(new Tok(real ? Kind.REAL : Kind.INTEGER, text, index, index + consumed, line, startColumn));
                 index += consumed;
@@ -1575,7 +2553,7 @@ final class GqlReader {
                 if (!closed) {
                     throw new ParseException("第 " + line + " 行第 " + startColumn + " 列字符串没有结束");
                 }
-                tokens.add(new Tok(Kind.STRING, body.toString(), bodyStart, index, line, startColumn));
+                tokens.add(new Tok(Kind.TEXT, body.toString(), bodyStart, index, line, startColumn));
                 continue;
             }
             Tok symbol = symbol(source, index, line, column);
@@ -1651,9 +2629,22 @@ final class GqlReader {
         return Long.parseLong(text.substring(2), radix);
     }
 
+    /** 标准的正则标识符：以字母或下划线开头，后面是字母、数字、下划线和组合符号。 */
+    private static boolean identifierStart(int codePoint) {
+        return codePoint == '_' || Character.isLetter(codePoint);
+    }
+
+    private static boolean identifierPart(int codePoint) {
+        return codePoint == '_' || Character.isLetterOrDigit(codePoint)
+                || (Character.isUnicodeIdentifierPart(codePoint) && !Character.isIdentifierIgnorable(codePoint) && codePoint > 127);
+    }
+
     private static Tok symbol(String source, int index, int line, int column) {
         char current = source.charAt(index);
         char next = index + 1 < source.length() ? source.charAt(index + 1) : '\0';
+        if (current == '|' && next == '+' && index + 2 < source.length() && source.charAt(index + 2) == '|') {
+            return new Tok(Kind.MULTISET, "|+|", index, index + 3, line, column);
+        }
         if (current == '|' && next == '|') {
             return new Tok(Kind.CONCAT, "||", index, index + 2, line, column);
         }
@@ -1695,6 +2686,9 @@ final class GqlReader {
             case '|' -> Kind.PIPE;
             case '!' -> Kind.BANG;
             case '%' -> Kind.PERCENT;
+            case '&' -> Kind.AMP;
+            case '~' -> Kind.TILDE;
+            case '?' -> Kind.QUESTION;
             default -> null;
         };
         if (kind == null) {
@@ -1704,7 +2698,7 @@ final class GqlReader {
     }
 
     private enum Kind {
-        IDENT, INTEGER, REAL, STRING,
+        IDENT, INTEGER, REAL, TEXT, STRING,
         BOOL, BOOLEAN, INT, INT64, INTEGER_WORD, DOUBLE, DATETIME, ID,
         CREATE, GRAPH, GRAPHS, PARTS, REPLICAS, USE, ALIAS, ALIASES, FOR, DROP, SHOW, NODE, REL, TYPES, TYPE,
         DESCRIBE, ALTER, ADD, NULL, INSERT, MATCH, WHERE, RETURN, ORDER, BY, LIMIT, SKIP,
@@ -1713,7 +2707,10 @@ final class GqlReader {
         IF, EXISTS, OPTIONAL, FILTER, LET, GROUP, UNION, EXCEPT, INTERSECT, ALL, ANY, NEXT, OFFSET,
         DETACH, NODETACH, REMOVE, RENAME, TO, CAST, CASE, WHEN, THEN, ELSE, END,
         WALK, TRAIL, SIMPLE, ACYCLIC, SHORTEST, TYPED, LABELED, SOURCE, DESTINATION, OF, SAME,
-        ARROW, LARROW, LE, GE, NEQ, EQ, LT, GT, PLUS, MINUS, STAR, SLASH, CONCAT, BANG, PERCENT,
+        UNKNOWN, GROUPS, OTHERWISE, PATH, PATHS, DIRECTED, SESSION, PROPERTY, START, TRANSACTION, COMMIT, ROLLBACK,
+        FINISH, NO, BINDINGS, REPEATABLE, DIFFERENT, ELEMENT, ELEMENTS, EDGE, EDGES, KEEP, WITH, ORDINALITY, VALUE,
+        LIST, RECORD, LIKE, LABEL, LABELS, CONNECTING, UNDIRECTED, LEADING, TRAILING, BOTH, FROM, REPLACE,
+        ARROW, LARROW, LE, GE, NEQ, EQ, LT, GT, PLUS, MINUS, STAR, SLASH, CONCAT, BANG, PERCENT, AMP, TILDE, QUESTION, MULTISET,
         LP, RP, LB, RB, LC, RC, COMMA, COLON, SEMI, DOT, AT, DOLLAR, PIPE, EOF
     }
 

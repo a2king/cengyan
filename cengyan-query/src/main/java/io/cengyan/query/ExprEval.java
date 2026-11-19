@@ -94,6 +94,25 @@ final class ExprEval {
             case Expr.EndpointOf endpoint -> endpoint(eval(endpoint.node()), eval(endpoint.edge()), endpoint.source(), endpoint.negated());
             case Expr.Same same -> same(same.values(), same.different());
             case Expr.PropExists prop -> propertyExists(eval(prop.value()), prop.property());
+            case Expr.Truth truth -> {
+                Boolean value = bool(eval(truth.value()));
+                boolean hit = truth.truth() == null ? value == null : truth.truth().equals(value);
+                yield truth.negated() != hit;
+            }
+            case Expr.Directed directed -> {
+                Object value = eval(directed.value());
+                if (value == null) {
+                    yield null;
+                }
+                if (!(value instanceof Map<?, ?> body) || !body.containsKey("src")) {
+                    throw new CengyanException(ErrorCode.TYPE_MISMATCH, "IS DIRECTED 要写边");
+                }
+                // 层岩的边都有方向。
+                yield !directed.negated();
+            }
+            case Expr.LetIn let -> letIn(let);
+            case Expr.ValueQuery value -> valueOf(value.query());
+            case Expr.Trim trim -> trim(trim);
         };
     }
 
@@ -236,6 +255,57 @@ final class ExprEval {
                     throw new CengyanException(ErrorCode.SYNTAX, "聚合只能写在 RETURN");
             default -> scalar(name, args);
         };
+    }
+
+    private Object letIn(Expr.LetIn let) {
+        Map<String, Slot> previous = slots;
+        try {
+            Map<String, Slot> scoped = new LinkedHashMap<>(previous);
+            for (int i = 0; i < let.names().size(); i++) {
+                slots = scoped;
+                Object value = eval(let.values().get(i));
+                scoped = new LinkedHashMap<>(scoped);
+                scoped.put(let.names().get(i), Slot.scalar(value));
+            }
+            slots = scoped;
+            return eval(let.body());
+        } finally {
+            slots = previous;
+        }
+    }
+
+    private Object trim(Expr.Trim trim) {
+        Object source = eval(trim.source());
+        Object chars = trim.chars() == null ? " " : eval(trim.chars());
+        if (source == null || chars == null) {
+            return null;
+        }
+        if (!(source instanceof String text) || !(chars instanceof String set)) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "TRIM 需要字符串");
+        }
+        if (trim.chars() == null) {
+            return switch (trim.spec()) {
+                case "LEADING" -> strip(text, true);
+                case "TRAILING" -> strip(text, false);
+                default -> text.strip();
+            };
+        }
+        boolean leading = !trim.spec().equals("TRAILING");
+        boolean trailing = !trim.spec().equals("LEADING");
+        return trimChars(text, set, leading, trailing);
+    }
+
+    /** 去掉两端出现在 {@code set} 里的字符（按码点）。 */
+    private static String trimChars(String text, String set, boolean leading, boolean trailing) {
+        int start = 0;
+        int end = text.length();
+        while (leading && start < end && set.indexOf(text.codePointAt(start)) >= 0) {
+            start += Character.charCount(text.codePointAt(start));
+        }
+        while (trailing && end > start && set.indexOf(text.codePointBefore(end)) >= 0) {
+            end -= Character.charCount(text.codePointBefore(end));
+        }
+        return text.substring(start, end);
     }
 
     private Object reduce(Expr.Reduce reduce) {
@@ -452,6 +522,22 @@ final class ExprEval {
         if (left == null || right == null) {
             return null;
         }
+        if (("=".equals(op) || "<>".equals(op)) && element(left) && element(right)) {
+            // 点和边按身份比较：点看 ID，边看类型和 ID。
+            boolean same = sameElement((Map<?, ?>) left, (Map<?, ?>) right);
+            return "=".equals(op) == same;
+        }
+        if (("=".equals(op) || "<>".equals(op)) && left instanceof List<?> a && right instanceof List<?> b) {
+            boolean same = a.size() == b.size();
+            for (int i = 0; same && i < a.size(); i++) {
+                Object item = compare("=", a.get(i), b.get(i));
+                if (item == null) {
+                    return null;
+                }
+                same = (Boolean) item;
+            }
+            return "=".equals(op) == same;
+        }
         int order;
         if (left instanceof UtcTime || right instanceof UtcTime) {
             order = Long.compare(time(left), time(right));
@@ -477,6 +563,21 @@ final class ExprEval {
             case ">=" -> order >= 0;
             default -> throw new CengyanException(ErrorCode.SYNTAX, "未知运算符 " + op);
         };
+    }
+
+    private static boolean element(Object value) {
+        return value instanceof Map<?, ?> map && map.containsKey("id") && map.containsKey("type") && map.get("properties") instanceof Map<?, ?>;
+    }
+
+    private static boolean sameElement(Map<?, ?> left, Map<?, ?> right) {
+        boolean leftEdge = left.containsKey("src");
+        if (leftEdge != right.containsKey("src")) {
+            return false;
+        }
+        if (leftEdge && !java.util.Objects.equals(left.get("type"), right.get("type"))) {
+            return false;
+        }
+        return java.util.Objects.equals(left.get("id"), right.get("id"));
     }
 
     private static long time(Object value) {
@@ -523,20 +624,83 @@ final class ExprEval {
             values.add(eval(arg));
         }
         return switch (name) {
-            case "char_length", "size", "length" -> lengthOf(values);
-            case "upper" -> text(values, 1).toUpperCase(Locale.ROOT);
-            case "lower" -> text(values, 1).toLowerCase(Locale.ROOT);
-            case "trim", "btrim" -> text(values, 1).trim();
-            case "ltrim" -> strip(text(values, 1), true);
-            case "rtrim" -> strip(text(values, 1), false);
+            case "char_length", "character_length", "size", "length", "cardinality" -> lengthOf(values);
+            case "byte_length", "octet_length" -> {
+                if (values.size() != 1) {
+                    throw new CengyanException(ErrorCode.SYNTAX, name + " 的参数个数不对");
+                }
+                if (values.get(0) == null) {
+                    yield null;
+                }
+                if (values.get(0) instanceof byte[] bytes) {
+                    yield (long) bytes.length;
+                }
+                yield (long) text(values, 1).getBytes(StandardCharsets.UTF_8).length;
+            }
+            case "upper" -> nullOr(values, () -> text(values, 1).toUpperCase(Locale.ROOT));
+            case "lower" -> nullOr(values, () -> text(values, 1).toLowerCase(Locale.ROOT));
+            case "trim", "btrim" -> nullOr(values, () -> values.size() == 2
+                    ? trimChars(text(values, 2), String.valueOf(values.get(1)), true, true) : text(values, 1).strip());
+            case "ltrim" -> nullOr(values, () -> values.size() == 2
+                    ? trimChars(text(values, 2), String.valueOf(values.get(1)), true, false) : strip(text(values, 1), true));
+            case "rtrim" -> nullOr(values, () -> values.size() == 2
+                    ? trimChars(text(values, 2), String.valueOf(values.get(1)), false, true) : strip(text(values, 1), false));
+            case "normalize" -> nullOr(values, () -> java.text.Normalizer.normalize(text(values, values.size()),
+                    values.size() == 2 ? normalForm(values.get(1)) : java.text.Normalizer.Form.NFC));
+            case "nullif" -> {
+                if (values.size() != 2) {
+                    throw new CengyanException(ErrorCode.SYNTAX, "nullif 要两个参数");
+                }
+                yield Boolean.TRUE.equals(compare("=", values.get(0), values.get(1))) ? null : values.get(0);
+            }
+            case "elements" -> {
+                if (values.size() != 1 || !(values.get(0) instanceof Map<?, ?> path) || !path.containsKey("nodes")) {
+                    throw new CengyanException(ErrorCode.TYPE_MISMATCH, "elements 需要路径");
+                }
+                List<?> nodes = (List<?>) path.get("nodes");
+                List<?> edges = (List<?>) path.get("edges");
+                List<Object> all = new ArrayList<>();
+                for (int i = 0; i < nodes.size(); i++) {
+                    all.add(nodes.get(i));
+                    if (i < edges.size()) {
+                        all.add(edges.get(i));
+                    }
+                }
+                yield all;
+            }
+            case "current_timestamp", "local_timestamp", "local_datetime", "now" -> {
+                if (!values.isEmpty()) {
+                    throw new CengyanException(ErrorCode.SYNTAX, name + " 不要参数");
+                }
+                yield new UtcTime(System.currentTimeMillis());
+            }
+            case "current_date", "current_time", "local_time", "date", "time", "duration", "duration_between",
+                 "zoned_time", "local_date" -> throw new CengyanException(ErrorCode.TYPE_MISMATCH,
+                    "暂不支持 DATE / TIME / DURATION 类型，日期时间请用 DATETIME 和 CURRENT_TIMESTAMP");
             case "left" -> side(values, true);
             case "right" -> side(values, false);
             case "abs" -> abs(number(values));
             case "floor" -> Math.floor(toDouble(number(values)));
-            case "ceil" -> Math.ceil(toDouble(number(values)));
+            case "ceil", "ceiling" -> Math.ceil(toDouble(number(values)));
+            case "sin" -> Math.sin(toDouble(number(values)));
+            case "cos" -> Math.cos(toDouble(number(values)));
+            case "tan" -> Math.tan(toDouble(number(values)));
+            case "cot" -> 1.0d / Math.tan(toDouble(number(values)));
+            case "asin" -> Math.asin(toDouble(number(values)));
+            case "acos" -> Math.acos(toDouble(number(values)));
+            case "atan" -> Math.atan(toDouble(number(values)));
+            case "sinh" -> Math.sinh(toDouble(number(values)));
+            case "cosh" -> Math.cosh(toDouble(number(values)));
+            case "tanh" -> Math.tanh(toDouble(number(values)));
+            case "degrees" -> Math.toDegrees(toDouble(number(values)));
+            case "radians" -> Math.toRadians(toDouble(number(values)));
             case "sqrt" -> Math.sqrt(toDouble(number(values)));
             case "exp" -> Math.exp(toDouble(number(values)));
-            case "ln", "log" -> Math.log(toDouble(number(values)));
+            case "ln" -> Math.log(toDouble(number(values)));
+            // 标准的 LOG(底数, 值)；只写一个参数时是自然对数（层岩旧写法）。
+            case "log" -> values.size() == 2
+                    ? Math.log(toDouble(numberAt(values, 1))) / Math.log(toDouble(numberAt(values, 0)))
+                    : Math.log(toDouble(number(values)));
             case "log10" -> Math.log10(toDouble(number(values)));
             case "power" -> Math.pow(toDouble(values.get(0)), toDouble(values.get(1)));
             case "mod" -> arithmetic("%", values.get(0), values.get(1));
@@ -551,6 +715,28 @@ final class ExprEval {
             case "coalesce" -> values.stream().filter(value -> value != null).findFirst().orElse(null);
             default -> throw new CengyanException(ErrorCode.SYNTAX, "未知函数 " + name);
         };
+    }
+
+    private static Object nullOr(List<Object> values, java.util.function.Supplier<Object> body) {
+        if (!values.isEmpty() && values.get(0) == null) {
+            return null;
+        }
+        return body.get();
+    }
+
+    private static java.text.Normalizer.Form normalForm(Object value) {
+        try {
+            return java.text.Normalizer.Form.valueOf(String.valueOf(value).toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ex) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "规范化形式只能是 NFC、NFD、NFKC、NFKD");
+        }
+    }
+
+    private static Object numberAt(List<Object> values, int index) {
+        if (values.size() <= index || values.get(index) == null || !isNumber(values.get(index))) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "这里要写数字");
+        }
+        return values.get(index);
     }
 
     private Object lengthOf(List<Object> values) {
@@ -735,7 +921,25 @@ final class ExprEval {
         if (subquery == null) {
             throw new CengyanException(ErrorCode.SYNTAX, "这里还不能写子查询");
         }
-        return subquery.exists(query, slots);
+        return !subquery.run(query).rows().isEmpty();
+    }
+
+    /** VALUE { }：没有行是空值，一行一列取这个值，否则报错。 */
+    private Object valueOf(Stmt query) {
+        if (subquery == null) {
+            throw new CengyanException(ErrorCode.SYNTAX, "这里还不能写子查询");
+        }
+        QueryResult result = subquery.run(query);
+        if (result.columns().size() != 1) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "VALUE 子查询必须正好返回一列");
+        }
+        if (result.rows().isEmpty()) {
+            return null;
+        }
+        if (result.rows().size() > 1) {
+            throw new CengyanException(ErrorCode.TYPE_MISMATCH, "VALUE 子查询返回了多行");
+        }
+        return result.rows().get(0).get(0);
     }
 
     private Object typed(Object value, String type, boolean negated) {
@@ -743,7 +947,7 @@ final class ExprEval {
             return null;
         }
         boolean hit = switch (type.toUpperCase(Locale.ROOT)) {
-            case "INT", "INT64", "INTEGER" -> isIntegral(value);
+            case "INT", "INT64", "INTEGER", "BIGINT", "INTEGER64" -> isIntegral(value);
             case "DOUBLE" -> value instanceof Double;
             case "STRING" -> value instanceof String;
             case "BOOL", "BOOLEAN" -> value instanceof Boolean;
@@ -809,9 +1013,10 @@ final class ExprEval {
         return map.containsKey(property);
     }
 
+    /** 在当前行的绑定上执行一个嵌套查询。 */
     @FunctionalInterface
     interface Subquery {
-        boolean exists(Stmt query, Map<String, Slot> outer);
+        QueryResult run(Stmt query);
     }
 
     static final class Slot {

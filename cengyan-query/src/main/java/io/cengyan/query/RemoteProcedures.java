@@ -19,7 +19,9 @@ final class RemoteProcedures {
         Map<String, Object> args = new LinkedHashMap<>();
         for (Stmt.Arg arg : call.args()) {
             Object value = eval.eval(arg.value());
-            if (arg.name() == null && value instanceof Map<?, ?> map) map.forEach((key, val) -> args.put(String.valueOf(key), val));
+            boolean positional = arg.name() == null || arg.name().isEmpty();
+            if (positional && value instanceof Map<?, ?> map) map.forEach((key, val) -> args.put(String.valueOf(key), val));
+            else if (positional) throw new ClusterException("SYNTAX", "过程参数要写成 {名字: 值} 或传一个参数映射");
             else args.put(arg.name(), value);
         }
         String name = call.name().toLowerCase(Locale.ROOT);
