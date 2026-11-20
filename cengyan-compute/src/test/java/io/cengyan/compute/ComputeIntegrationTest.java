@@ -77,6 +77,14 @@ class ComputeIntegrationTest {
             assertEquals("DATA_GROUP_COUNT_STORE", stats.path("statisticsSource").asText());
             assertEquals(2, stats.path("rows").get(0).get(2).asInt());
             assertEquals(1, stats.path("rows").get(1).get(2).asInt());
+            JsonNode storageUsage = call(writer, reader, request(token, "admin").put("command", "storage"));
+            ok(storageUsage);
+            assertEquals(List.of("bytes", "indexBytes", "replicas", "expectedReplicas"), JSON.convertValue(storageUsage.path("columns"), List.class));
+            assertEquals("GRAPH_REPLICA_SST", storageUsage.path("storageScope").asText());
+            JsonNode usageRow = storageUsage.path("rows").get(0);
+            assertTrue(usageRow.get(0).asLong() >= 0 && usageRow.get(1).asLong() >= 0);
+            assertTrue(usageRow.get(2).asInt() > 0, "至少有一个副本上报");
+            assertEquals(usageRow.get(3).asInt(), usageRow.get(2).asInt(), "单节点集群所有副本都应上报");
             JsonNode result = call(writer, reader, query(token, "MATCH (a:Company {id:'a'})-[e:holder]->(b:Company) RETURN b.id, b.name"));
             ok(result);
             assertEquals("b", result.path("rows").get(0).get(0).asText());

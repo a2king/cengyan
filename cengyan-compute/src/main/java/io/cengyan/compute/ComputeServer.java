@@ -81,7 +81,7 @@ public final class ComputeServer implements AutoCloseable {
     /** 用户管理命令，权限规则见 {@link #userCommand}。 */
     static final Set<String> USER_COMMANDS = Set.of("listUsers", "createUser", "setPassword", "setRole", "dropUser", "changePassword");
     /** read 级别可用的管理命令；不在这里的管理命令一律要求 admin（changePassword 在 userCommand 里只允许改自己）。 */
-    static final Set<String> READ_COMMANDS = Set.of("stats", "storage", "showNodes", "showMembers", "computeLoad", "maintenanceStatus", "changePassword");
+    static final Set<String> READ_COMMANDS = Set.of("stats", "storage", "showNodes", "showMembers", "replicaStatus", "computeLoad", "maintenanceStatus", "changePassword");
     /** 已登录即可的非执行操作。 */
     static final Set<String> READ_OPS = Set.of("ping", "session", "logout", "members", "queries", "cancel", "bulkTopology", "ops.metrics", "ops.overview");
     private static final Map<String, String> MAINTENANCE_METHODS = Map.of("maintenanceEnter", "metadata.maintenance.enter",
@@ -594,8 +594,21 @@ public final class ComputeServer implements AutoCloseable {
             } catch (RuntimeException ex) { WriteTimings.finish(); throw ex; }
         }
         if (op.equals("admin") && request.path("command").asText().equals("addReplica")) {
-            storage.call(0, 0, "metadata.resize", id, ByteString.copyFrom(JSON.writeValueAsBytes(request)), Duration.ofMinutes(5));
-            return ok();
+            // 只登记作业就返回；数据复制由存储节点后台按分片推进，进度用 replicaStatus 查。
+            RpcResponse answer = storage.call(0, 0, "metadata.resize", id, ByteString.copyFrom(JSON.writeValueAsBytes(request)), Duration.ofSeconds(60));
+            ObjectNode response = ok();
+            if (!answer.getBody().isEmpty()) response.set("job", JSON.readTree(answer.getBody().toByteArray()));
+            return response;
+        }
+        if (op.equals("admin") && request.path("command").asText().equals("replicaStatus")) {
+            ObjectNode response = ok();
+            response.set("status", new ReplicaController(storage).status(graphName));
+            return response;
+        }
+        if (op.equals("admin") && request.path("command").asText().equals("cancelReplica")) {
+            ObjectNode response = ok();
+            response.set("job", JSON.valueToTree(new ReplicaController(storage).cancel(graphName)));
+            return response;
         }
         if (op.equals("admin") && Set.of("drainStorage", "removeStorage").contains(request.path("command").asText())) {
             storage.call(0, 0, request.path("command").asText().equals("drainStorage") ? "metadata.drain" : "metadata.remove", id,
@@ -656,14 +669,7 @@ public final class ComputeServer implements AutoCloseable {
             response.put("collectedAt", System.currentTimeMillis()); return response;
         }
         if (op.equals("admin") && request.path("command").asText().equals("storage")) {
-            long bytes = 0;
-            for (Node node : catalog.nodes()) {
-                RpcResponse size = storage.direct(DistributedCatalog.address(node), "node.storageSize", ByteString.EMPTY, Duration.ofSeconds(10));
-                if (!size.getCode().equals("OK")) throw new ClusterException(size.getCode(), size.getMessage());
-                bytes = Math.addExact(bytes, Long.parseLong(size.getBody().toStringUtf8()));
-            }
-            var response = ok(); response.set("columns", JSON.valueToTree(List.of("bytes")));
-            response.set("rows", JSON.valueToTree(List.of(List.of(bytes)))); return response;
+            return graphStorage(catalog.graph(graphName));
         }
         if (op.equals("admin") && request.path("command").asText().equals("repairGraphCreate")) {
             GraphDefinition definition = catalog.recoverCreate(request.path("graph").asText());
@@ -684,6 +690,41 @@ public final class ComputeServer implements AutoCloseable {
             response.set("columns", JSON.valueToTree(result.columns())); response.set("rows", JSON.valueToTree(result.rows())); return response;
         }
         throw new ClusterException("UNSUPPORTED", "分布式入口尚不支持该操作：" + op);
+    }
+
+    /**
+     * 单图存储占用：该图每个分片所有副本的 RocksDB 已落盘 SST 之和。bytes 是默认 Column Family（节点、边及其邻接），
+     * indexBytes 是索引 Column Family，另列。不含 Raft 日志、快照、导入暂存、Metadata 和其他图。
+     */
+    private ObjectNode graphStorage(GraphDefinition graph) throws Exception {
+        long dataBytes = 0, indexBytes = 0;
+        int replicas = 0;
+        Map<Integer, Integer> members = new TreeMap<>();
+        for (Node node : catalog.nodes()) {
+            RpcResponse answer = storage.direct(DistributedCatalog.address(node), "ops.shards", ByteString.EMPTY, Duration.ofSeconds(10));
+            if (!answer.getCode().equals("OK")) throw new ClusterException(answer.getCode(), answer.getMessage());
+            for (JsonNode shard : JSON.readTree(answer.getBody().toByteArray()).path("shards")) {
+                if (shard.path("graphId").asLong() != graph.getId()) continue;
+                JsonNode usage = shard.get("physicalUsageBytes");
+                if (usage == null || !usage.isObject()) {
+                    throw new ClusterException("UNSUPPORTED", "Storage " + node.getNodeId() + " 未返回分片占用，请先升级 Storage");
+                }
+                for (var family = usage.fields(); family.hasNext(); ) {
+                    var entry = family.next();
+                    if (entry.getKey().startsWith("idx-")) indexBytes = Math.addExact(indexBytes, entry.getValue().asLong());
+                    else dataBytes = Math.addExact(dataBytes, entry.getValue().asLong());
+                }
+                replicas++;
+                members.merge(shard.path("partId").asInt(), shard.path("members").size(), Math::max);
+            }
+        }
+        int missing = graph.getPartitions() - members.size();
+        if (missing > 0) throw new ClusterException("GROUP_UNAVAILABLE", missing + " 个分片没有副本上报占用，不返回少算的结果");
+        int expected = members.values().stream().mapToInt(Integer::intValue).sum();
+        var response = ok(); response.set("columns", JSON.valueToTree(List.of("bytes", "indexBytes", "replicas", "expectedReplicas")));
+        response.set("rows", JSON.valueToTree(List.of(List.of(dataBytes, indexBytes, replicas, expected))));
+        response.put("storageScope", "GRAPH_REPLICA_SST");
+        response.put("collectedAt", System.currentTimeMillis()); return response;
     }
 
     private ObjectNode bulkTopology(String graphName) throws Exception {
@@ -940,7 +981,7 @@ public final class ComputeServer implements AutoCloseable {
     /** 是否改数据：只用于维护模式禁写和 Schema 租约，不用于权限检查（见 {@link #requiredLevel}）。 */
     private static boolean isWrite(JsonNode request) {
         String op = request.path("op").asText();
-        if (op.equals("admin")) return !Set.of("showNodes", "showMembers", "stats", "storage", "computeLoad", "listUsers").contains(request.path("command").asText());
+        if (op.equals("admin")) return !Set.of("showNodes", "showMembers", "replicaStatus", "stats", "storage", "computeLoad", "listUsers").contains(request.path("command").asText());
         if (op.equals("execute")) {
             try { return Gql.parseAll(request.path("query").asText()).stream().anyMatch(stmt -> !readOnly(stmt)); }
             catch (Exception ex) { return true; }

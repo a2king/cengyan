@@ -35,6 +35,22 @@ export const storage = {
   },
 };
 
+/** 副本数调整作业。state：RUNNING、CANCELING、DONE、CANCELED、FAILED。replicas 是每个分片保留的数据份数。 */
+export interface ReplicaJob {
+  id: string; graph: string; replicas: number; previous: number; parts: number; state: string;
+  createdAt: number; updatedAt: number; message: string;
+}
+/** state：DONE、PENDING、CREATED、CATCHING_UP、UPDATING_TOPOLOGY、ROLLING_BACK、CANCELED、NOT_CHANGED。 */
+export interface ReplicaPartition {
+  part: number; members: string[]; state: string; targets?: string[]; error?: string;
+  commitIndex?: number; match?: Record<string, number>; progressError?: string;
+  /** Leader 最新本机快照大小；receivedBytes 是新副本正在接收的快照已写入字节，只在快照传输期间有。 */
+  snapshotBytes?: number; receivedBytes?: Record<string, number>;
+}
+export interface ReplicaStatus {
+  graph: string; parts: number; job?: ReplicaJob; partitions: ReplicaPartition[]; done: number; running: number; pending: number;
+}
+
 export class CengyanApi {
   private session: string;
   private graph = storage.loadGraph();
@@ -149,8 +165,20 @@ export class CengyanApi {
     return this.request('/api/admin', { command: 'showMembers', graph, timeoutMs: 60000 });
   }
 
-  async addReplica(graph: string, replicas: number): Promise<QueryResponse> {
-    return this.request('/api/admin', { command: 'addReplica', graph, replicas, timeoutMs: 120000 });
+  /** 只登记副本作业就返回，数据在后台按分片同步，进度用 replicaStatus 轮询。 */
+  async addReplica(graph: string, replicas: number): Promise<ReplicaJob | undefined> {
+    const response = await this.request('/api/admin', { command: 'addReplica', graph, replicas, timeoutMs: 60000 });
+    return (response as QueryResponse & { job?: ReplicaJob }).job;
+  }
+
+  async replicaStatus(graph: string): Promise<ReplicaStatus> {
+    const response = await this.request('/api/admin', { command: 'replicaStatus', graph, timeoutMs: 30000 });
+    return (response as QueryResponse & { status: ReplicaStatus }).status;
+  }
+
+  async cancelReplica(graph: string): Promise<ReplicaJob | undefined> {
+    const response = await this.request('/api/admin', { command: 'cancelReplica', graph, timeoutMs: 30000 });
+    return (response as QueryResponse & { job?: ReplicaJob }).job;
   }
 
   private authHeaders(): Record<string, string> {

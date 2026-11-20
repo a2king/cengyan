@@ -296,6 +296,9 @@ class StudioServerTest {
             assertEquals(2, sent.get("replicas").asInt());
             assertEquals(StudioServer.REBUILD_TIMEOUT_MS, sent.get("timeoutMs").asInt());
         }
+        // 副本同步改成后台作业后，页面用这两个命令轮询进度和取消。
+        assertTrue(StudioServer.ADMIN_COMMANDS.contains("replicaStatus"));
+        assertTrue(StudioServer.ADMIN_COMMANDS.contains("cancelReplica"));
     }
 
     @Test

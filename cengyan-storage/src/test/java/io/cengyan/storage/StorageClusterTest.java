@@ -55,7 +55,11 @@ class StorageClusterTest {
                 var created = catalog.create("online-create", "Online", 1, 1, IdType.STRING, IdType.STRING);
                 var before = DataGroupSpec.parseFrom(gateway.get(0, 0, StorageGateway.groupKey(created.getId(), 0)));
                 assertEquals(1, before.getMembersCount());
-                new ReplicaController(gateway).resize("online-scale", "Online", 3);
+                var controller = new ReplicaController(gateway);
+                var job = controller.resize("online-scale", "Online", 3);
+                assertEquals("RUNNING", job.state(), "只登记作业，不等数据复制");
+                controller.runUntilIdle(java.time.Duration.ofSeconds(90));
+                assertEquals("DONE", controller.status("Online").path("job").path("state").asText());
                 var after = DataGroupSpec.parseFrom(gateway.get(0, 0, StorageGateway.groupKey(created.getId(), 0)));
                 assertEquals(3, after.getMembersCount());
                 assertEquals(3, catalog.graph("Online").getReplicas());

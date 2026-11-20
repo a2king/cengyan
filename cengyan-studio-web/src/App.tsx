@@ -61,6 +61,7 @@ import { CengyanApi, escapeIdent, graphFromRows, rowsAsObjects, storage } from '
 import { ClusterApi } from './clusterApi';
 import type { SetupStatus } from './clusterApi';
 import { ChangePasswordModal, PASSWORD_RULES, ROLE_TEXT, UsersPage } from './UsersPage';
+import { ReplicaPanel } from './ReplicaPanel';
 import { ClusterConsole } from './cluster/ClusterConsole';
 import { QueryGraph } from './QueryGraph';
 import { OpsDashboard } from './ops/OpsDashboard';
@@ -757,56 +758,6 @@ function AliasPanel({ api, graph, aliases, canWrite, onChanged }: { api: Cengyan
   </div>;
 }
 
-type MemberRow = { nodeId: number; partId: number; vote: string };
-
-function ReplicaPanel({ api, graph, canWrite, active }: { api: CengyanApi; graph: string; canWrite: boolean; active: boolean }) {
-  const [rows, setRows] = useState<MemberRow[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [target, setTarget] = useState<number | null>(null);
-  const load = useCallback(async () => {
-    setLoading(true); setError('');
-    try {
-      const response = await api.showMembers(graph);
-      setRows(rowsAsObjects<MemberRow>(response).map((row) => ({ nodeId: Number(row.nodeId), partId: Number(row.partId), vote: String(row.vote) })));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '读取副本失败');
-    } finally {
-      setLoading(false);
-    }
-  }, [api, graph]);
-  useEffect(() => { if (active) void load(); }, [active, load]);
-  const voterCount = new Set(rows.map((row) => row.nodeId)).size;
-  const partCount = new Set(rows.map((row) => row.partId)).size;
-  const replicaCount = Math.max(0, (voterCount || 1) - 1);
-  useEffect(() => { setTarget(replicaCount); }, [replicaCount]);
-  const add = () => {
-    const replicas = target ?? replicaCount;
-    if (replicas <= replicaCount) {
-      setError('副本数只能增加。0 表示只有一份数据、没有副本。');
-      return;
-    }
-    Modal.confirm({
-      title: `把副本数增加到 ${replicas}？`,
-      content: `将保留 ${replicas + 1} 份数据。同步期间这个图空间暂时只读，查询仍然可以执行。`,
-      okText: '增加副本',
-      cancelText: '取消',
-      onOk: async () => {
-        setBusy(true); setError('');
-        try { await api.addReplica(graph, replicas + 1); message.success('副本已增加'); await load(); }
-        catch (reason) { setError(reason instanceof Error ? reason.message : '增加副本失败'); throw reason; }
-        finally { setBusy(false); }
-      },
-    });
-  };
-  return <div className="panel-stack">
-    <div className="panel-toolbar"><div><Title level={4}>副本管理</Title><Text type="secondary">{rows.length ? `当前副本数 ${replicaCount}，分片 ${partCount}。` : '打开后读取这个图空间的副本。'}0 表示只有一份数据、没有副本，最多 5。增加副本会复制数据，同步期间暂时只读。</Text></div><Space>{canWrite && <><InputNumber min={0} max={5} precision={0} value={target ?? replicaCount} onChange={(value) => { const next = typeof value === 'number' ? value : Number(value); setTarget(Number.isFinite(next) ? Math.min(5, Math.max(0, Math.trunc(next))) : 0); }} /> <Button type="primary" loading={busy} disabled={(target ?? replicaCount) <= replicaCount} onClick={add}>增加副本</Button></>}<Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></Space></div>
-    {error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}
-    {rows.length ? <Table rowKey={(row) => `${row.nodeId}-${row.partId}`} loading={loading} pagination={false} dataSource={rows} columns={[{ title: '节点', dataIndex: 'nodeId', width: 120 }, { title: '分片', dataIndex: 'partId', width: 120 }, { title: '角色', dataIndex: 'vote', render: () => <Tag color="green">投票成员</Tag> }]} /> : !error && <Empty description={loading ? '正在读取副本' : '还没有投票成员'} />}
-  </div>;
-}
-
 function TypesPanel({ api, graph, node, canWrite, onCopied, idType, idLength }: { api: CengyanApi; graph: string; node: boolean; canWrite: boolean; onCopied: () => void; idType?: string; idLength?: number }) {
   const [rows, setRows] = useState<TypeRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -909,6 +860,7 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
   const [rows, setRows] = useState<StatsRow[]>([]);
   const [countedAt, setCountedAt] = useState<number | null>(null);
   const [storageBytes, setStorageBytes] = useState<number | null>(null);
+  const [storageDetail, setStorageDetail] = useState<{ indexBytes: number; replicas: number; expectedReplicas: number } | null>(null);
   const [storageAt, setStorageAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -927,11 +879,13 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
       setStorageLoading(true);
       void api.admin('storage').then((storageResult) => {
         if (sequence !== requestSequence.current) return;
-        const bytes = Number(storageResult?.rows?.[0]?.[0]);
+        const [bytes, indexBytes, replicas, expectedReplicas] = (storageResult?.rows?.[0] ?? []).map(Number);
         setStorageBytes(Number.isFinite(bytes) && bytes >= 0 ? bytes : null);
+        setStorageDetail(Number.isFinite(indexBytes) && Number.isFinite(replicas) && Number.isFinite(expectedReplicas)
+          ? { indexBytes, replicas, expectedReplicas } : null);
         setStorageAt(typeof storageResult?.collectedAt === 'number' ? storageResult.collectedAt : null);
       }).catch(() => {
-        if (sequence === requestSequence.current) setStorageBytes(null);
+        if (sequence === requestSequence.current) { setStorageBytes(null); setStorageDetail(null); }
       }).finally(() => {
         if (sequence === requestSequence.current) setStorageLoading(false);
       });
@@ -946,6 +900,7 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
     setRows([]);
     setCountedAt(null);
     setStorageBytes(null);
+    setStorageDetail(null);
     setStorageLoading(false);
     void load(false);
     return () => { requestSequence.current++; };
@@ -971,7 +926,10 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
       <div className="storage-icon"><Database size={19} /></div>
       <div>
         <Text strong>存储占用</Text>
-        <Text type="secondary">集群节点目录占用（含副本和日志），不是单图逻辑数据大小。</Text>
+        <Text type="secondary">本图节点和边数据已落盘大小，含全部副本；不含 Raft 日志、快照、索引和其他图。</Text>
+        {!storageLoading && storageDetail && <Text type="secondary">
+          {storageDetail.replicas} 个分片副本{storageDetail.replicas < storageDetail.expectedReplicas ? `（${storageDetail.expectedReplicas - storageDetail.replicas} 个未上报，结果偏小）` : ''}，索引另占 {formatBytes(storageDetail.indexBytes)}
+        </Text>}
         {storageAt != null && <Text type="secondary">读取时间：{formatCollectedAt(storageAt)}</Text>}
       </div>
       <Tag color="blue">{storageLoading ? '读取中' : storageBytes == null ? '未能读取' : formatBytes(storageBytes)}</Tag>

@@ -60,6 +60,11 @@ public final class StorageServer implements AutoCloseable {
     private DroppedGraphCleanup dropCleanup;
     private final Object topologyController = new Object();
     private final java.util.concurrent.ConcurrentMap<RaftGroupId, Object> configurationLocks = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentMap<RaftGroupId, Reconfiguration> reconfigurations = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 成员变更在后台等待 Ratis 追平新成员；控制器限制了同时进行的分片数。 */
+    private final ExecutorService reconfigurers = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "storage-reconfigure"); t.setDaemon(true); return t;
+    });
     private long lastIdempotencyCleanup;
     private final ThreadPoolExecutor coordinators;
     /** 事务恢复单独跑，不占用协调线程。调度线程只负责按间隔派发。 */
@@ -75,6 +80,9 @@ public final class StorageServer implements AutoCloseable {
         Thread t = new Thread(r, "storage-topology-worker"); t.setDaemon(true); return t;
     });
     private final AtomicBoolean topologyRunning = new AtomicBoolean();
+    /** 有副本任务时每 2 秒推进一次；每个分片要经过加入、提升、切路由几步，跟着 10 秒一轮的拓扑循环太慢。 */
+    private static final long REPLICA_INTERVAL_MS = 2000;
+    private volatile boolean replicaBusy;
     /** Every Storage flushes its local database before a planned restart. */
     private final ScheduledExecutorService maintenance = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "storage-maintenance"); t.setDaemon(true); return t;
@@ -199,6 +207,7 @@ public final class StorageServer implements AutoCloseable {
             catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).debug("维护标记等待重试：{}", ex.toString()); }
         }, 1000, 1000, TimeUnit.MILLISECONDS);
         maintenance.scheduleWithFixedDelay(this::expireImports, 1, 1, TimeUnit.MINUTES);
+        maintenance.scheduleWithFixedDelay(this::purgeSnapshotTemps, 1, 1, TimeUnit.MINUTES);
         coordinators.execute(() -> {
             try {
                 Node local = localDescriptor();
@@ -213,6 +222,12 @@ public final class StorageServer implements AutoCloseable {
             try { topologyWorkers.execute(this::recoverTopology); }
             catch (RejectedExecutionException ex) { topologyRunning.set(false); }
         }, topologyInterval, topologyInterval, TimeUnit.MILLISECONDS);
+        topologyRecovery.scheduleWithFixedDelay(() -> {
+            if (closed.get() || !replicaBusy || topologyInterval <= REPLICA_INTERVAL_MS) return;
+            if (!topologyRunning.compareAndSet(false, true)) return;
+            try { topologyWorkers.execute(this::advanceReplicas); }
+            catch (RejectedExecutionException ex) { topologyRunning.set(false); }
+        }, REPLICA_INTERVAL_MS, REPLICA_INTERVAL_MS, TimeUnit.MILLISECONDS);
         if (config.metadataMembers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()))) {
             ScheduledFuture<?>[] retry = new ScheduledFuture<?>[1];
             long interval = Math.max(2000, config.backgroundIntervalMs());
@@ -239,15 +254,33 @@ public final class StorageServer implements AutoCloseable {
                 try (var guard = StorageGateway.controller(epoch, () -> metadata.getInfo().isLeaderReady() && metadata.getInfo().getCurrentTerm() == epoch)) {
                     synchronized (topologyController) {
                         // 各步互不依赖：一步失败（例如某个索引分片暂时不可达）不能让后面的副本修复跳过。
-                        topologyStep("副本任务恢复", replicaController::recover);
+                        topologyStep("副本任务推进", replicaController::tick);
                         topologyStep("Schema 迁移恢复", () -> new SchemaController(gateway).recover());
                         topologyStep("索引任务恢复", () -> new DistributedGraph(gateway).recoverIndexes());
                         topologyStep("副本修复", () -> replicaController.reconcile(config.recoveryTimeoutMs()));
+                        topologyStep("副本任务状态", () -> replicaBusy = replicaController.busy());
                     }
                 }
             }
         } catch (Exception ex) {
             if (!closed.get()) org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("后台拓扑任务等待恢复：{}", ex.toString());
+        } finally { topologyRunning.set(false); }
+    }
+
+    /** 两轮拓扑循环之间只推进副本任务。和完整一轮共用 topologyRunning，不会并发。 */
+    private void advanceReplicas() {
+        try {
+            var metadata = node.server().getDivision(GroupIds.metadata(config.clusterId()));
+            if (!metadata.getInfo().isLeaderReady()) { replicaBusy = false; return; }
+            long epoch = metadata.getInfo().getCurrentTerm();
+            try (var guard = StorageGateway.controller(epoch, () -> metadata.getInfo().isLeaderReady() && metadata.getInfo().getCurrentTerm() == epoch)) {
+                synchronized (topologyController) {
+                    topologyStep("副本任务推进", replicaController::tick);
+                    replicaBusy = replicaController.busy();
+                }
+            }
+        } catch (Exception ex) {
+            if (!closed.get()) org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("副本任务推进等待恢复：{}", ex.toString());
         } finally { topologyRunning.set(false); }
     }
 
@@ -473,10 +506,13 @@ public final class StorageServer implements AutoCloseable {
                         var division = node.server().getDivision(GroupIds.metadata(config.clusterId()));
                         if (!division.getInfo().isLeaderReady()) { result.complete(notLeader(division.getInfo(), division.getRaftConf().getAllPeers())); return; }
                         var body = new com.fasterxml.jackson.databind.ObjectMapper().readTree(inbound.getBody().toByteArray());
+                        ReplicaController.Job job;
                         synchronized (topologyController) {
-                            replicaController.resize(inbound.getContext().getRequestId(), body.path("graph").asText(), body.path("replicas").asInt());
+                            job = replicaController.resize(inbound.getContext().getRequestId(), body.path("graph").asText(), body.path("replicas").asInt());
                         }
-                        result.complete(response("OK", "", ByteString.EMPTY)); return;
+                        // 只登记作业，复制由后台逐个分片推进。
+                        replicaBusy = true;
+                        result.complete(response("OK", "", ByteString.copyFrom(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsBytes(job)))); return;
                     }
                     if (inbound.getMethod().equals("import.heartbeat")) {
                         var beat = io.cengyan.protocol.proto.ClusterProtocol.ImportHeartbeat.parseFrom(inbound.getBody());
@@ -545,36 +581,38 @@ public final class StorageServer implements AutoCloseable {
                         var id = GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId());
                         var division = node.server().getDivision(id);
                         if (!division.getInfo().isLeaderReady()) { result.complete(notLeader(division.getInfo(), division.getRaftConf().getAllPeers())); return; }
-                        synchronized (configurationLocks.computeIfAbsent(id, ignored -> new Object())) {
                         verifyConfigurationTask(spec);
-                        var group = RaftGroup.valueOf(id, division.getRaftConf().getAllPeers());
-                        try (var client = node.client(group)) {
-                            var voters = new java.util.ArrayList<>(division.getRaftConf().getCurrentPeers());
-                            var listeners = new java.util.ArrayList<>(division.getRaftConf().getCurrentPeers(org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER));
-                            for (Node desired : spec.getMembersList()) {
-                                if (voters.stream().anyMatch(peer -> peer.getId().toString().equals(desired.getNodeId()))) continue;
-                                verifyConfigurationTask(spec);
-                                var previousVoters = java.util.List.copyOf(voters);
-                                var previousListeners = java.util.List.copyOf(listeners);
-                                listeners.removeIf(peer -> peer.getId().toString().equals(desired.getNodeId()));
-                                voters.add(raftPeer(desired, false));
-                                var promoted = client.admin().setConfiguration(SetConfigurationRequest.Arguments.newBuilder()
-                                        .setMode(SetConfigurationRequest.Mode.COMPARE_AND_SET).setServersInCurrentConf(previousVoters)
-                                        .setListenersInCurrentConf(previousListeners).setServersInNewConf(voters).setListenersInNewConf(listeners).build());
-                                if (!promoted.isSuccess()) throw new ClusterException("FAILED", "Raft 单成员提升失败：" + promoted.getException());
-                            }
-                            verifyConfigurationTask(spec);
-                            if (spec.getMembersList().stream().noneMatch(member -> member.getNodeId().equals(config.nodeId()))) {
-                                var transfer = client.admin().transferLeadership(org.apache.ratis.protocol.RaftPeerId.valueOf(spec.getMembers(0).getNodeId()), 10000);
-                                if (!transfer.isSuccess()) throw new ClusterException("FAILED", "迁移前 Leader 转移失败");
-                            }
-                            var changed = client.admin().setConfiguration(SetConfigurationRequest.Arguments.newBuilder()
-                                    .setMode(SetConfigurationRequest.Mode.COMPARE_AND_SET).setServersInCurrentConf(voters).setListenersInCurrentConf(listeners)
-                                    .setServersInNewConf(spec.getMembersList().stream().map(member -> raftPeer(member, false)).toList())
-                                    .setListenersInNewConf(spec.getLearnersList().stream().map(member -> raftPeer(member, true)).toList()).build());
-                            if (!changed.isSuccess()) throw new ClusterException("FAILED", "Raft 成员变更未成功确认：" + changed.getException());
+                        // 只发起，不等：Ratis 追平新成员可能要很久，进度由 data.membership 查询。
+                        startReconfiguration(id, spec);
+                        result.complete(response("OK", "", ByteString.EMPTY)); return;
+                    }
+                    if (inbound.getMethod().equals("data.membership")) {
+                        // 分片身份优先取请求体：控制器直接问每个候选节点，不经过分片路由。
+                        var context = inbound.getContext();
+                        long graphId = context.getGraphId();
+                        int partId = context.getPartId();
+                        if (!inbound.getBody().isEmpty()) {
+                            DataGroupSpec asked = DataGroupSpec.parseFrom(inbound.getBody());
+                            graphId = asked.getGraphId(); partId = asked.getPartId();
                         }
-                        }
+                        if (graphId <= 0) throw new IllegalArgumentException("只能查询数据分片的成员");
+                        var id = GroupIds.data(config.clusterId(), graphId, partId);
+                        if (!node.hosts(id)) { result.complete(response("NOT_LEADER", "本节点没有这个分片", ByteString.EMPTY)); return; }
+                        var division = node.server().getDivision(id);
+                        if (!division.getInfo().isLeaderReady()) { result.complete(notLeader(division.getInfo(), division.getRaftConf().getAllPeers())); return; }
+                        result.complete(response("OK", "", membership(id, division))); return;
+                    }
+                    if (inbound.getMethod().equals("data.receiving")) {
+                        // 本节点作为新副本正在接收的快照已写入多少字节；不是 Leader 也回答。-1 表示没有在接收。
+                        DataGroupSpec asked = DataGroupSpec.parseFrom(inbound.getBody());
+                        var id = GroupIds.data(config.clusterId(), asked.getGraphId(), asked.getPartId());
+                        long bytes = -1;
+                        if (node.hosts(id) && node.server().getDivision(id).getStateMachine() instanceof RocksStateMachine machine)
+                            bytes = machine.receivingSnapshotBytes();
+                        result.complete(response("OK", "", ByteString.copyFromUtf8(Long.toString(bytes)))); return;
+                    }
+                    if (inbound.getMethod().equals("data.abandonReplica")) {
+                        abandonReplica(inbound);
                         result.complete(response("OK", "", ByteString.EMPTY)); return;
                     }
                     if (inbound.getMethod().startsWith("auth.")) {
@@ -742,8 +780,9 @@ public final class StorageServer implements AutoCloseable {
         if (method.startsWith("import.")) return importRequests;
         if (method.equals("ops.metrics")) return metricsRequests;
         if (method.equals("ops.shards") || method.equals("node.storageSize")) return opsRequests;
+        if (method.equals("data.membership") || method.equals("data.receiving")) return dataRequests;
         if (method.startsWith("kv.") || method.equals("data.status")) return request.getContext().getGraphId() > 0 ? dataRequests : metadataRequests;
-        if (method.startsWith("auth.") || method.equals("data.configure") || method.startsWith("metadata.") || method.startsWith("schema.")) return coordinators;
+        if (method.startsWith("auth.") || method.equals("data.configure") || method.equals("data.abandonReplica") || method.startsWith("metadata.") || method.startsWith("schema.")) return coordinators;
         return admission;
     }
 
@@ -867,6 +906,141 @@ public final class StorageServer implements AutoCloseable {
                 .setRaft(Endpoint.newBuilder().setHost(config.raftAddress().getHostString()).setPort(config.raftAddress().getPort()))
                 .setZone(config.zone()).setRack(config.rack()).setDataMode("raft").build();
     }
+    /** 一个分片 Leader 上正在后台执行的成员变更。 */
+    private static final class Reconfiguration {
+        final String taskId;
+        final ByteString spec;
+        final java.util.concurrent.atomic.AtomicReference<org.apache.ratis.client.RaftClient> client = new java.util.concurrent.atomic.AtomicReference<>();
+        volatile Future<?> future;
+        volatile boolean finished;
+        volatile boolean cancelled;
+        volatile String error = "";
+        Reconfiguration(String taskId, ByteString spec) { this.taskId = taskId; this.spec = spec; }
+        void cancel() {
+            cancelled = true;
+            var current = client.getAndSet(null);
+            if (current != null) { try { current.close(); } catch (IOException ignored) { } }
+            if (future != null) future.cancel(true);
+        }
+    }
+
+    /**
+     * 在后台执行成员变更。同一分片同一目标已在执行时直接返回；目标不同（例如取消后回滚）时先停掉旧的。
+     * 失败原因留在内存里，由 data.membership 报给控制器，控制器隔一段时间重新发起。
+     */
+    private void startReconfiguration(RaftGroupId id, DataGroupSpec spec) {
+        synchronized (reconfigurations) {
+            Reconfiguration running = reconfigurations.get(id);
+            if (running != null && !running.finished) {
+                if (running.spec.equals(spec.toByteString())) return;
+                running.cancel();
+            }
+            Reconfiguration job = new Reconfiguration(spec.getControlTaskId(), spec.toByteString());
+            reconfigurations.put(id, job);
+            job.future = reconfigurers.submit(() -> {
+                try { reconfigure(id, spec, job); }
+                catch (Exception ex) {
+                    if (!job.cancelled && !closed.get()) {
+                        job.error = ex.getMessage() == null ? ex.toString() : ex.getMessage();
+                        org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("分片 {} 成员变更未完成，等待控制器重新发起：{}", id, job.error);
+                    }
+                } finally {
+                    job.finished = true;
+                    var client = job.client.getAndSet(null);
+                    if (client != null) { try { client.close(); } catch (IOException ignored) { } }
+                }
+            });
+        }
+    }
+
+    private void reconfigure(RaftGroupId id, DataGroupSpec spec, Reconfiguration job) throws Exception {
+        synchronized (configurationLocks.computeIfAbsent(id, ignored -> new Object())) {
+            if (job.cancelled) return;
+            var division = node.server().getDivision(id);
+            if (!division.getInfo().isLeaderReady()) throw new ClusterException("NOT_LEADER", "本节点已不是分片 Leader");
+            verifyConfigurationTask(spec);
+            var group = RaftGroup.valueOf(id, division.getRaftConf().getAllPeers());
+            try (var client = node.patientClient(group)) {
+                job.client.set(client);
+                if (job.cancelled) return;
+                var voters = new java.util.ArrayList<>(division.getRaftConf().getCurrentPeers());
+                var listeners = new java.util.ArrayList<>(division.getRaftConf().getCurrentPeers(org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER));
+                for (Node desired : spec.getMembersList()) {
+                    if (voters.stream().anyMatch(peer -> peer.getId().toString().equals(desired.getNodeId()))) continue;
+                    verifyConfigurationTask(spec);
+                    var previousVoters = java.util.List.copyOf(voters);
+                    var previousListeners = java.util.List.copyOf(listeners);
+                    listeners.removeIf(peer -> peer.getId().toString().equals(desired.getNodeId()));
+                    voters.add(raftPeer(desired, false));
+                    var promoted = client.admin().setConfiguration(SetConfigurationRequest.Arguments.newBuilder()
+                            .setMode(SetConfigurationRequest.Mode.COMPARE_AND_SET).setServersInCurrentConf(previousVoters)
+                            .setListenersInCurrentConf(previousListeners).setServersInNewConf(voters).setListenersInNewConf(listeners).build());
+                    if (!promoted.isSuccess()) throw new ClusterException("FAILED", "Raft 单成员提升失败：" + promoted.getException());
+                }
+                verifyConfigurationTask(spec);
+                if (spec.getMembersList().stream().noneMatch(member -> member.getNodeId().equals(config.nodeId()))) {
+                    var transfer = client.admin().transferLeadership(org.apache.ratis.protocol.RaftPeerId.valueOf(spec.getMembers(0).getNodeId()), 10000);
+                    if (!transfer.isSuccess()) throw new ClusterException("FAILED", "迁移前 Leader 转移失败");
+                }
+                var changed = client.admin().setConfiguration(SetConfigurationRequest.Arguments.newBuilder()
+                        .setMode(SetConfigurationRequest.Mode.COMPARE_AND_SET).setServersInCurrentConf(voters).setListenersInCurrentConf(listeners)
+                        .setServersInNewConf(spec.getMembersList().stream().map(member -> raftPeer(member, false)).toList())
+                        .setListenersInNewConf(spec.getLearnersList().stream().map(member -> raftPeer(member, true)).toList()).build());
+                if (!changed.isSuccess()) throw new ClusterException("FAILED", "Raft 成员变更未成功确认：" + changed.getException());
+            }
+        }
+    }
+
+    /** 分片 Leader 看到的成员、是否在成员变更中、各成员已复制到的日志位置。 */
+    private ByteString membership(RaftGroupId id, org.apache.ratis.server.RaftServer.Division division) throws IOException {
+        var json = new com.fasterxml.jackson.databind.ObjectMapper().createObjectNode();
+        var conf = division.getRaftConf();
+        var voters = json.putArray("voters");
+        conf.getCurrentPeers().forEach(peer -> voters.add(peer.getId().toString()));
+        var listeners = json.putArray("listeners");
+        conf.getCurrentPeers(org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER).forEach(peer -> listeners.add(peer.getId().toString()));
+        long committed = division.getRaftLog().getLastCommittedIndex();
+        boolean transitional = !conf.getPreviousPeers().isEmpty()
+                || !conf.getPreviousPeers(org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER).isEmpty()
+                || conf.getLogEntryIndex() > committed;
+        json.put("transitional", transitional).put("commitIndex", committed);
+        var match = json.putObject("match");
+        try {
+            var followers = division.getInfo().getRoleInfoProto().getLeaderInfo().getFollowerInfoList();
+            long[] indices = division.getInfo().getFollowerMatchIndices();
+            if (indices != null && indices.length == followers.size())
+                for (int i = 0; i < indices.length; i++) match.put(followers.get(i).getId().getId().toStringUtf8(), indices[i]);
+        } catch (RuntimeException ignored) { /* 进度只用于显示 */ }
+        // 新副本没有日志时 Leader 发的是这份快照；页面用它和新副本已收字节算快照传输进度。
+        if (division.getStateMachine() instanceof RocksStateMachine machine) json.put("snapshotBytes", machine.latestSnapshotBytes());
+        Reconfiguration job = reconfigurations.get(id);
+        json.put("configuring", job != null && !job.finished);
+        if (job != null) json.put("configureTask", job.taskId).put("error", job.error);
+        return ByteString.copyFrom(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsBytes(json));
+    }
+
+    /**
+     * 取消副本任务时卸下本节点上新加的副本。只接受回滚中（或已回滚）的任务，且本节点必须是这次新增、原来不在的成员；
+     * 是否还是投票成员由控制器先在分片 Leader 上确认。
+     */
+    private void abandonReplica(RpcRequest request) throws IOException {
+        DataGroupSpec spec = DataGroupSpec.parseFrom(request.getBody());
+        ByteString bytes = gateway.get(0, 0, TransactionEngine.text("tasks/replica/" + spec.getControlTaskId()));
+        if (spec.getControlTaskId().isBlank() || bytes == null) throw new ClusterException("STALE_CONTROLLER", "没有对应的副本任务");
+        ReplicaTask task = ReplicaTask.parseFrom(bytes);
+        if (!java.util.Set.of("ROLLING_BACK", "CANCELED").contains(task.getStage()))
+            throw new ClusterException("STALE_CONTROLLER", "只有回滚中的副本任务才能卸下新副本");
+        if (task.getBefore().getGraphId() != spec.getGraphId() || task.getBefore().getPartId() != spec.getPartId())
+            throw new ClusterException("INVALID_ARGUMENT", "副本任务和分片不一致");
+        boolean original = task.getBefore().getMembersList().stream().anyMatch(member -> member.getNodeId().equals(config.nodeId()));
+        boolean added = task.getAfter().getMembersList().stream().anyMatch(member -> member.getNodeId().equals(config.nodeId()));
+        if (original || !added) throw new ClusterException("INVALID_ARGUMENT", "本节点不是这次新增的副本，拒绝卸下");
+        var id = GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId());
+        if (!node.hosts(id) && !node.dataDirectoryPresent(id)) return;
+        node.detachDataGroup(id);
+        dropCleanup.wake();
+    }
+
     private void verifyConfigurationTask(DataGroupSpec requested) {
         ByteString bytes = gateway.get(0, 0, TransactionEngine.text("tasks/replica/" + requested.getControlTaskId()));
         if (bytes == null) throw new ClusterException("STALE_CONTROLLER", "成员变更没有持久化任务");
@@ -878,6 +1052,8 @@ public final class StorageServer implements AutoCloseable {
                 if (!task.getStage().equals("CREATED") || !desired.getMembersList().equals(task.getBefore().getMembersList())) {
                     throw new ClusterException("STALE_CONTROLLER", "learner 命令的任务阶段已结束，拒绝回退成员配置");
                 }
+            } else if (task.getStage().equals("ROLLING_BACK")) {
+                if (!desired.equals(task.getBefore().toBuilder().clearLearners().build())) throw new ClusterException("STALE_CONTROLLER", "回滚命令必须恢复任务开始前的成员");
             } else if (!task.getStage().equals("CATCHING_UP") || !desired.equals(task.getAfter())) {
                 throw new ClusterException("STALE_CONTROLLER", "提升或移除命令与任务阶段不一致");
             }
@@ -891,6 +1067,18 @@ public final class StorageServer implements AutoCloseable {
         for (RocksStateMachine machine : node.importMachines()) {
             try { machine.expireImports(now); }
             catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).debug("导入暂存清理等待重试：{}", ex.toString()); }
+        }
+    }
+
+    /** 正在接收的快照超过这么久没有新数据，视为 Leader 已放弃这次尝试。 */
+    static final long SNAPSHOT_TEMP_IDLE_MS = TimeUnit.MINUTES.toMillis(10);
+
+    /** 快照安装失败后 Ratis 不清理接收目录，Leader 每次重发都会多一份；每分钟只留正在写的那一份。 */
+    private void purgeSnapshotTemps() {
+        if (closed.get()) return;
+        for (RocksStateMachine machine : node.importMachines()) {
+            try { machine.purgeSnapshotTemps(SNAPSHOT_TEMP_IDLE_MS); }
+            catch (Exception ex) { org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("快照接收残留清理失败，下一分钟重试：{}", ex.toString()); }
         }
     }
 
@@ -1040,7 +1228,31 @@ public final class StorageServer implements AutoCloseable {
             peers.add(raftPeer(member, spec.getLearnersList().contains(member)));
         }
         if (!ids.contains(config.nodeId())) throw new IllegalArgumentException("Data Group 不包含本节点");
-        node.addGroup(RaftGroup.valueOf(GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId()), peers));
+        var id = GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId());
+        try {
+            node.addGroup(RaftGroup.valueOf(id, peers));
+        } catch (IllegalArgumentException ex) {
+            // 以前加副本中途取消或失败、没卸干净时，本地会留着同名分片。本节点不在这次任务开始前的成员里，
+            // 说明路由上它本来就没有这份数据，残留的一定是过期的：先隔离掉，再按新任务建。
+            if (!staleReplica(spec)) throw ex;
+            org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("分片 {} 在本节点有过期的残留副本，隔离后重新加入", id);
+            node.detachDataGroup(id);
+            dropCleanup.wake();
+            node.addGroup(RaftGroup.valueOf(id, peers));
+        }
+    }
+
+    /** 新增副本任务（还在加入阶段）要把本节点加进来，而本节点不在任务开始前的成员里。 */
+    private boolean staleReplica(DataGroupSpec spec) {
+        if (spec.getControlTaskId().isBlank()) return false;
+        ByteString bytes = gateway.get(0, 0, TransactionEngine.text("tasks/replica/" + spec.getControlTaskId()));
+        if (bytes == null) return false;
+        try {
+            ReplicaTask task = ReplicaTask.parseFrom(bytes);
+            return task.getStage().equals("CREATED") && task.getBefore().getGraphId() == spec.getGraphId() && task.getBefore().getPartId() == spec.getPartId()
+                    && task.getBefore().getMembersList().stream().noneMatch(m -> m.getNodeId().equals(config.nodeId()))
+                    && task.getAfter().getMembersList().stream().anyMatch(m -> m.getNodeId().equals(config.nodeId()));
+        } catch (com.google.protobuf.InvalidProtocolBufferException ex) { return false; }
     }
 
     /** 删掉节点后清掉排空、描述和离线标记，同名节点才能再次加入并接收副本。 */
@@ -1110,6 +1322,8 @@ public final class StorageServer implements AutoCloseable {
         recovery.shutdownNow();
         recoveryWorkers.shutdownNow();
         topologyRecovery.shutdownNow();
+        reconfigurations.values().forEach(Reconfiguration::cancel);
+        reconfigurers.shutdownNow();
         topologyWorkers.shutdownNow();
         coordinators.shutdownNow();
         writers.shutdownNow();

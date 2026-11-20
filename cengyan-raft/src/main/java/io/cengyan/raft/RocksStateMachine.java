@@ -81,6 +81,8 @@ public final class RocksStateMachine extends BaseStateMachine {
     private RocksDB db;
     private Path stateDirectory;
     private Path liveDirectory;
+    /** Ratis 接收快照的临时目录（Group 下的 tmp），initialize 之后才有。 */
+    private volatile Path snapshotTempDirectory;
     /** 导入暂存区。上传、合并、归并都只碰这里的文件，不拿分片库的锁。 */
     private volatile ImportStaging imports;
     private boolean rebuildOnly;
@@ -297,6 +299,11 @@ public final class RocksStateMachine extends BaseStateMachine {
         super.initialize(server, groupId, raftStorage);
         storage.init(raftStorage);
         stateDirectory = raftStorage.getStorageDir().getStateMachineDir().toPath();
+        snapshotTempDirectory = raftStorage.getStorageDir().getTmpDir().toPath();
+        // Group 刚打开，还没有快照安装在进行：上次进程留下的接收残留全部删掉。
+        SnapshotTemps.Purged leftover = SnapshotTemps.purge(snapshotTempDirectory, 0, System.currentTimeMillis());
+        if (leftover.directories() > 0)
+            LOG.warning("删除 " + groupId + " 上次未装完的快照残留 " + leftover.directories() + " 个，释放 " + leftover.bytes() + " 字节");
         Files.createDirectories(stateDirectory);
         imports = new ImportStaging(Files.createDirectories(stateDirectory.resolve("import-staging")));
         restore();
@@ -714,6 +721,36 @@ public final class RocksStateMachine extends BaseStateMachine {
             catch (IOException ex) { LOG.warning("导入发布后清理暂存文件失败，会话结束时再删：" + ex.getMessage()); }
         }
         return CompletableFuture.completedFuture(message(result.toByteArray()));
+    }
+
+    /**
+     * 删除快照接收残留：只留最近有写入、且空闲不超过 {@code idleMillis} 的那一次尝试。
+     * 返回删除的目录数，0 表示没有残留。
+     */
+    public int purgeSnapshotTemps(long idleMillis) throws IOException {
+        if (idleMillis <= 0) throw new IllegalArgumentException("空闲时长必须为正数");
+        SnapshotTemps.Purged purged = SnapshotTemps.purge(snapshotTempDirectory, idleMillis, System.currentTimeMillis());
+        if (purged.directories() > 0)
+            LOG.warning("删除失败或过期的快照接收目录 " + purged.directories() + " 个，释放 " + purged.bytes() + " 字节：" + snapshotTempDirectory);
+        return purged.directories();
+    }
+
+    /** 本副本正在接收的快照已写入的字节数（最近有写入的那次尝试）；没有在接收时为 -1。 */
+    public long receivingSnapshotBytes() {
+        try { return SnapshotTemps.receiving(snapshotTempDirectory); }
+        catch (IOException | RuntimeException ex) { return -1; }
+    }
+
+    /** 本副本最新一份本机快照的文件总大小，Leader 发给新副本的就是它；还没有快照时为 -1。 */
+    public long latestSnapshotBytes() {
+        var latest = storage.getLatestSnapshot();
+        if (!(latest instanceof org.apache.ratis.statemachine.impl.FileListSnapshotInfo files)) return -1;
+        long bytes = 0;
+        for (var file : files.getFiles()) {
+            try { bytes += Files.size(file.getPath()); }
+            catch (IOException ex) { return -1; }
+        }
+        return bytes;
     }
 
     /** 当前分片各 Column Family 已落盘 SST 的大小，不含内存表。 */

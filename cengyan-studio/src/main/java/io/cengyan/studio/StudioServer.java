@@ -42,7 +42,7 @@ public final class StudioServer implements AutoCloseable {
     /** 数据库这样回答登录时说明数据库在正常工作，不走 root 本地兜底。 */
     private static final Set<String> DB_ANSWERED = Set.of("OK", "UNAUTHENTICATED", "FORBIDDEN", "INVALID_ARGUMENT", "SYNTAX");
     /** 控制台转发的管理命令：运维、节点维护、副本，以及用户管理（权限由 Compute 判断）。 */
-    static final Set<String> ADMIN_COMMANDS = Set.of("stats", "storage", "showMembers", "addReplica", "showNodes",
+    static final Set<String> ADMIN_COMMANDS = Set.of("stats", "storage", "showMembers", "addReplica", "replicaStatus", "cancelReplica", "showNodes",
             "drainStorage", "removeStorage", "drainCompute", "removeCompute",
             "listUsers", "createUser", "setRole", "setPassword", "dropUser");
 

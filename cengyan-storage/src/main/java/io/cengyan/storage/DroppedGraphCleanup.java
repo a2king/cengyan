@@ -153,6 +153,9 @@ final class DroppedGraphCleanup {
         return result;
     }
 
+    /** 有新的隔离目录时立刻开始清空，不等下一轮。 */
+    void wake() { startDeleter(); }
+
     private void startDeleter() {
         if (!cleaning.compareAndSet(false, true)) return;
         try { deleter.execute(this::drain); }

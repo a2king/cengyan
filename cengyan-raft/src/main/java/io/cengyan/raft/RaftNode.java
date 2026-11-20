@@ -26,6 +26,8 @@ public final class RaftNode implements AutoCloseable {
     private final RaftGroupId metadataGroupId;
     private final RaftServer server;
     private final RaftProperties properties;
+    /** 客户端请求用的配置：节点间请求超时调大了，客户端仍按 Ratis 默认超时换节点重试。 */
+    private final RaftProperties clientProperties;
     private final FileChannel ownerChannel;
     private final java.nio.channels.FileLock ownerLock;
     private final ConcurrentHashMap<RaftGroupId, RocksStateMachine> machines = new ConcurrentHashMap<>();
@@ -69,6 +71,8 @@ public final class RaftNode implements AutoCloseable {
             }
         }
         properties = settings.properties(root.resolve("raft"), host, port);
+        clientProperties = new RaftProperties(properties);
+        org.apache.ratis.client.RaftClientConfigKeys.Rpc.setRequestTimeout(clientProperties, RaftSettings.CLIENT_REQUEST_TIMEOUT);
         Properties operations = new Properties();
         if (Files.exists(root.resolve("operations.properties"))) {
             try (var input = Files.newInputStream(root.resolve("operations.properties"))) { operations.load(input); }
@@ -132,9 +136,18 @@ public final class RaftNode implements AutoCloseable {
     }
 
     public RaftClient client(RaftGroup group) {
-        return RaftClient.newBuilder().setRaftGroup(group).setProperties(properties)
+        return RaftClient.newBuilder().setRaftGroup(group).setProperties(clientProperties)
                 .setRetryPolicy(RetryPolicies.retryUpToMaximumCountWithFixedSleep(30,
                         TimeDuration.valueOf(100, TimeUnit.MILLISECONDS))).build();
+    }
+
+    /**
+     * 成员变更用的客户端：Ratis 要先把新成员追平才确认，大分片可能要几十分钟。一直重试（同一请求号，服务端去重），
+     * 由调用方关闭客户端来取消。
+     */
+    public RaftClient patientClient(RaftGroup group) {
+        return RaftClient.newBuilder().setRaftGroup(group).setProperties(clientProperties)
+                .setRetryPolicy(RetryPolicies.retryForeverWithSleep(TimeDuration.valueOf(1, TimeUnit.SECONDS))).build();
     }
 
     /** 先拒绝这个分片上新的导入和查询，再进入卸下。重复调用没有副作用。 */
@@ -166,7 +179,10 @@ public final class RaftNode implements AutoCloseable {
         }
         if (hosts(groupId)) {
             var division = server.getDivision(groupId);
-            var group = RaftGroup.valueOf(groupId, division.getRaftConf().getAllPeers());
+            // 已被移出这个分片的节点，本地配置里没有自己；请求发给本机，所以总要带上本机。
+            var peers = new ArrayList<>(division.getRaftConf().getAllPeers());
+            if (peers.stream().noneMatch(peer -> peer.getId().equals(server.getId()))) peers.add(server.getPeer());
+            var group = RaftGroup.valueOf(groupId, peers);
             try (var client = client(group)) {
                 // 两个 false：关闭状态机并从 Server 摘除，不在这次调用里递归删文件。
                 var reply = client.getGroupManagementApi(server.getId()).remove(groupId, false, false);

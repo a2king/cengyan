@@ -1,6 +1,7 @@
 package io.cengyan.raft;
 
 import org.apache.ratis.RaftConfigKeys;
+import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.rpc.SupportedRpcType;
@@ -14,7 +15,16 @@ import java.util.concurrent.TimeUnit;
 /** 共识参数显式启用落盘、线性一致读取和安全快照清理。 */
 public record RaftSettings(long segmentBytes, long snapshotEntries, long retainedEntries, int retainedSnapshots,
                            long rpcTimeoutMinMs, long rpcTimeoutMaxMs,
-                           long firstElectionTimeoutMinMs, long firstElectionTimeoutMaxMs) {
+                           long firstElectionTimeoutMinMs, long firstElectionTimeoutMaxMs,
+                           long peerRequestTimeoutMs) {
+    /**
+     * 节点之间单个 Raft 请求（追加日志、快照分块）等回复的上限。Ratis 默认 3 秒：新副本写快照分块时遇到页缓存回写，
+     * 一个 256KB 分块就可能超过 3 秒，Leader 随即换新请求号把整份快照从头重发。
+     */
+    public static final long DEFAULT_PEER_REQUEST_TIMEOUT_MS = 60_000;
+    /** 客户端请求（写入、成员变更）保持 Ratis 默认，Leader 卡住时尽快换节点重试。 */
+    static final TimeDuration CLIENT_REQUEST_TIMEOUT = TimeDuration.valueOf(3, TimeUnit.SECONDS);
+
     /**
      * 首次选主超时保持 Ratis 的默认：不设置时它从 {@code raft.server.rpc.timeout.min} 继承。
      * 显式调大只适合跨机房部署，单机会让进程启动后的第一个选主慢到秒级。
@@ -23,9 +33,15 @@ public record RaftSettings(long segmentBytes, long snapshotEntries, long retaine
         this(segmentBytes, snapshotEntries, retainedEntries, retainedSnapshots, 600, 1200, 0, 0);
     }
 
+    public RaftSettings(long segmentBytes, long snapshotEntries, long retainedEntries, int retainedSnapshots,
+                        long rpcTimeoutMinMs, long rpcTimeoutMaxMs, long firstElectionTimeoutMinMs, long firstElectionTimeoutMaxMs) {
+        this(segmentBytes, snapshotEntries, retainedEntries, retainedSnapshots, rpcTimeoutMinMs, rpcTimeoutMaxMs,
+                firstElectionTimeoutMinMs, firstElectionTimeoutMaxMs, DEFAULT_PEER_REQUEST_TIMEOUT_MS);
+    }
+
     public RaftSettings {
         if (segmentBytes < 1024 * 1024 || snapshotEntries < 1 || retainedEntries < 0 || retainedSnapshots < 1
-                || rpcTimeoutMinMs < 1 || rpcTimeoutMaxMs < rpcTimeoutMinMs
+                || rpcTimeoutMinMs < 1 || rpcTimeoutMaxMs < rpcTimeoutMinMs || peerRequestTimeoutMs < rpcTimeoutMaxMs
                 || (firstElectionTimeoutMinMs != 0 && firstElectionTimeoutMinMs < rpcTimeoutMaxMs)
                 || (firstElectionTimeoutMaxMs != 0 && firstElectionTimeoutMaxMs < firstElectionTimeoutMinMs)) {
             throw new IllegalArgumentException("Raft 日志和快照配置无效");
@@ -68,6 +84,12 @@ public record RaftSettings(long segmentBytes, long snapshotEntries, long retaine
         RaftServerConfigKeys.Read.setLeaderLeaseEnabled(properties, true);
         RaftServerConfigKeys.Rpc.setTimeoutMin(properties, TimeDuration.valueOf(rpcTimeoutMinMs, TimeUnit.MILLISECONDS));
         RaftServerConfigKeys.Rpc.setTimeoutMax(properties, TimeDuration.valueOf(rpcTimeoutMaxMs, TimeUnit.MILLISECONDS));
+        // Netty 传输下，节点之间的请求超时读的是这个客户端键（NettyRpcProxy 用服务端的 properties 建连接）。
+        RaftClientConfigKeys.Rpc.setRequestTimeout(properties, TimeDuration.valueOf(peerRequestTimeoutMs, TimeUnit.MILLISECONDS));
+        // 新成员追平期间，Leader 超过 staging 超时没收到它的回复就判定"没有进展"并放弃这次加入（换新 Appender 从头发快照）。
+        // Ratis 默认取 3 倍 raft_rpc_timeout_max_ms；一个分块最长可以等 peerRequestTimeoutMs，staging 必须比它长。
+        RaftServerConfigKeys.setStagingTimeout(properties, TimeDuration.valueOf(
+                Math.max(3 * rpcTimeoutMaxMs, 2 * peerRequestTimeoutMs), TimeUnit.MILLISECONDS));
         if (customFirstElectionTimeout()) {
             RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMin(properties,
                     TimeDuration.valueOf(firstElectionTimeoutMinMs, TimeUnit.MILLISECONDS));

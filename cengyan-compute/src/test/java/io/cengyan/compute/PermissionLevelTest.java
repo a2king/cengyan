@@ -68,8 +68,8 @@ class PermissionLevelTest {
 
     @Test
     void 管理命令和其他操作() {
-        for (String c : new String[] {"stats", "storage", "showNodes", "showMembers", "computeLoad", "maintenanceStatus", "changePassword"}) assertEquals(READ, admin(c), c);
-        for (String c : new String[] {"addReplica", "drainStorage", "removeStorage", "drainCompute", "resumeCompute", "removeCompute",
+        for (String c : new String[] {"stats", "storage", "showNodes", "showMembers", "replicaStatus", "computeLoad", "maintenanceStatus", "changePassword"}) assertEquals(READ, admin(c), c);
+        for (String c : new String[] {"addReplica", "cancelReplica", "drainStorage", "removeStorage", "drainCompute", "resumeCompute", "removeCompute",
                 "maintenanceEnter", "maintenanceExit", "transferMetadataLeader", "listUsers", "createUser", "setRole", "setPassword", "dropUser",
                 "forceDropGraph", "repairGraphCreate", "某个以后新增的命令"}) assertEquals(ADMIN, admin(c), c);
         assertEquals(WRITE, op("bulkInsert"));
