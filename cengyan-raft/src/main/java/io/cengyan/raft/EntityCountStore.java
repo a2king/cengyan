@@ -77,6 +77,20 @@ final class EntityCountStore {
         }
     }
 
+    /** 批量导入发布：一个类型新增了 delta 个主键。 */
+    static void add(RocksDB db, WriteBatch batch, boolean node, long generation, String type, long delta)
+            throws RocksDBException, IOException {
+        if (delta == 0) return;
+        byte kind = node ? (byte) 16 : (byte) 17;
+        for (Key key : new Key[] {new Key(kind, generation, type), new Key(kind, generation, "")}) {
+            byte[] bytes = key.bytes();
+            byte[] old = db.get(bytes);
+            long next = Math.addExact(old == null ? 0 : number(old), delta);
+            if (next < 0) throw new IOException("实体计数不能为负，拒绝应用损坏的统计");
+            batch.put(bytes, number(next));
+        }
+    }
+
     static EntityCounts read(RocksDB db, long generation) throws RocksDBException, IOException {
         var result = EntityCounts.newBuilder().setFormatVersion(1).setGeneration(generation);
         for (byte kind : new byte[] {16, 17}) {

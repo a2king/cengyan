@@ -38,6 +38,33 @@ public final class HostMetrics {
         }
     }
 
+    /**
+     * 写入 {@code memAvailableBytes}：/proc/meminfo 的 MemAvailable，含可回收的页缓存。
+     * JDK 的 freeMemory 是 MemFree，RocksDB 节点上页缓存会把它压到接近 0，不能当可用内存看。
+     */
+    public static void putMemory(ObjectNode json) {
+        if (!LINUX) return;
+        try {
+            long available = memAvailable(Files.readString(MEMINFO));
+            if (available >= 0) json.put("memAvailableBytes", available);
+        } catch (IOException ignored) { }
+    }
+
+    /** MemAvailable 的字节数；没有这一行（3.14 以前的内核）返回 -1。 */
+    static long memAvailable(String meminfo) {
+        for (String line : meminfo.split("\n", -1)) {
+            if (!line.startsWith("MemAvailable:")) continue;
+            String[] fields = line.substring("MemAvailable:".length()).trim().split("\\s+");
+            try {
+                long value = Long.parseLong(fields[0]);
+                return fields.length > 1 && fields[1].equalsIgnoreCase("kB") ? value * 1024 : value;
+            } catch (NumberFormatException ex) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
     /** kernel diskstats 的扇区单位固定是 512 字节，与物理扇区大小无关。 */
     static final long SECTOR_BYTES = 512;
     static final long MIN_INTERVAL_NS = 200_000_000L;
@@ -46,6 +73,7 @@ public final class HostMetrics {
     private static final Path MOUNTINFO = Path.of("/proc/self/mountinfo");
     private static final Path DISKSTATS = Path.of("/proc/diskstats");
     private static final Path NETDEV = Path.of("/proc/net/dev");
+    private static final Path MEMINFO = Path.of("/proc/meminfo");
     private static final Path SYS_CLASS_NET = Path.of("/sys/class/net");
     private static final boolean LINUX = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux");
     private static final Path ETC_HOSTNAME = Path.of("/etc/hostname");

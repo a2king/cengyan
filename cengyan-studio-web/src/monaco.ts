@@ -26,6 +26,7 @@ monaco.languages.setMonarchTokensProvider('gql', {
   tokenizer: {
     root: [
       [/\/\/.*$/, 'comment'],
+      [/--.*$/, 'comment'],
       [/\/\*/, 'comment', '@comment'],
       [/'([^'\\]|\\.)*'/, 'string'],
       [/"([^"\\]|\\.)*"/, 'string'],

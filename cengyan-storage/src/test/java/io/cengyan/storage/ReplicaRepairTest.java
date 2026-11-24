@@ -47,6 +47,8 @@ class ReplicaRepairTest {
             controller.reconcile(1);
             Thread.sleep(5);
             controller.reconcile(1);
+            // reconcile 只登记任务，复制由 tick 逐步推进。
+            controller.runUntilIdle(Duration.ofSeconds(90));
             var after = DataGroupSpec.parseFrom(gateway.get(0, 0, StorageGateway.groupKey(graph.getId(), 0)));
             assertEquals(3, after.getMembersCount());
             assertFalse(after.getMembersList().stream().anyMatch(node -> node.getNodeId().equals(failed.getNodeId())));

@@ -1,9 +1,18 @@
-export type Role = 'read' | 'write' | string;
+export type Role = 'read' | 'write' | 'admin' | string;
 
 export interface SessionInfo {
   session: string;
   user: string;
   role: Role;
+  /** 数据库不可用时 root 在 Studio 本地兜底登录：只能用集群管理和运维监控。 */
+  local?: boolean;
+}
+
+export interface UserRow {
+  user: string;
+  role: Role;
+  /** 只用来标出旧版本 dropUser 留下的停用用户。 */
+  enabled: boolean;
 }
 
 export interface QueryResponse {
@@ -16,6 +25,10 @@ export interface QueryResponse {
   queryId?: string;
   collectedAt?: number;
   elapsedMs?: number;
+  /** root 本地会话（登录、会话检查的响应）。 */
+  local?: boolean;
+  user?: string;
+  role?: string;
 }
 
 export interface StudioConfig {
@@ -94,8 +107,35 @@ export interface OpsOverview {
   clientBytesOutTotal?: number;
   computeNodes?: Array<Record<string, unknown>>;
   storageNodes?: Array<Record<string, unknown>>;
+  /** 只有未托管集群时（Compute 汇总）才在这里给分片；托管集群走 /api/ops/shards。 */
   shards?: Array<Record<string, unknown>>;
+  shardSummary?: { total: number; healthy: number; degraded: number; unavailable: number };
+  metadataLeaderId?: string;
   clusterHealth?: string;
   collectedAt?: number;
   events?: Array<{ ts: number; nodeId: string; level: string; event: string; message: string }>;
+}
+
+/** 服务器级指标。比例是 0..1，速率是字节/秒。 */
+export type HostMetric = 'cpu' | 'memory' | 'diskUsed' | 'diskBusy' | 'diskRead' | 'diskWrite' | 'netIn' | 'netOut';
+export type OpsRange = '1h' | '1d' | '7d';
+
+export interface OpsHostSeries {
+  id: string;
+  name: string;
+  address: string;
+  ts: number[];
+  avg: Record<HostMetric, Array<number | null>>;
+  /** 1d、7d 才有：每段内的最大值。 */
+  max?: Record<HostMetric, Array<number | null>>;
+}
+
+export interface OpsSeries {
+  code: string;
+  message?: string;
+  range: OpsRange;
+  stepMs: number;
+  from: number;
+  to: number;
+  hosts: OpsHostSeries[];
 }

@@ -38,10 +38,17 @@
 
 停止 Studio：./bin/stop-studio.sh 。停止 Studio 不影响已运行的节点。
 
-升级：
+升级节点程序（不需要重启 Studio）：
+  1. 把新的 cengyan-compute.jar / cengyan-storage.jar，或完整发布包 tar.gz，放进 Studio 目录下的 inbox/。
+     建议先用 .part 后缀上传、传完再改名；同目录放 <文件名>.sha256 时会先核对摘要。
+  2. 集群管理 →"程序包"→"扫描导入目录"。单个 jar 会和最新程序包里的其余文件组成新程序包。
+  3. 概览页或程序包页点"升级"，选择目标程序包和范围（全部 / 只计算节点 / 只存储节点），先看预览再开始。
+     只有本角色程序真的变了的节点才会重启：只换了 compute jar 时存储节点不动，也不暂停写入。
+
+升级 Studio 本身：
   1. ./bin/stop-studio.sh 停止旧 Studio。
-  2. 解压新包到新目录，把旧目录的 data/ 和 config/studio.properties 复制过去。
-  3. 启动新 Studio。节点版本低于 Studio 随附版本时，概览页提示"升级集群"，确认后逐台滚动升级。
+  2. 解压新包到新目录，把旧目录的 data/ 和 config/studio.properties 复制过去（程序包保存在 data/packages/）。
+  3. 启动新 Studio。新包随附的节点程序会自动登记为最新程序包，按上面第 3 步升级节点。
 
 安全：data/ssh/id_rsa 是登录所有受管服务器的 root 私钥，data/ 目录只允许运行 Studio 的用户读取。
 Studio 端口只开放给可信内网。bin/ 下文件权限为 777，应部署到受信任目录。

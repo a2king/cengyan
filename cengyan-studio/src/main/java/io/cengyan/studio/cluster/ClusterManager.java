@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class ClusterManager implements AutoCloseable {
     final ClusterStore store;
     final Bundle bundle;
+    final Packages packages;
     final ConfigCatalog catalog;
     final ConfigRenderer renderer;
     final ClusterOps ops;
@@ -21,6 +22,8 @@ public final class ClusterManager implements AutoCloseable {
     final TaskRunner tasks;
     /** 添加服务器时的 root 密码，只在内存中保存到免密登录验证通过为止，不写盘。 */
     final Map<String, String> passwords = new ConcurrentHashMap<>();
+    /** Studio 本地没有、但到服务器上读过摘要的程序包：程序包 ID → 文件名 → SHA-256。 */
+    private final Map<String, Map<String, String>> remoteReleases = new ConcurrentHashMap<>();
     private OpsMonitor opsMonitor;
 
     public static ClusterManager open(Path home) throws IOException {
@@ -39,6 +42,9 @@ public final class ClusterManager implements AutoCloseable {
     ClusterManager(ClusterStore store, Bundle bundle, ClusterOps ops, RemoteShell.Factory shells) throws IOException {
         this.store = store;
         this.bundle = bundle;
+        this.packages = new Packages(store.dataDir().resolve("packages"), bundle.home().resolve("inbox"));
+        try { packages.importBundle(bundle); }
+        catch (ClusterError ex) { /* 随附程序不完整时，概览页提示；已导入的程序包仍可用 */ }
         this.catalog = ConfigCatalog.load();
         this.renderer = new ConfigRenderer(catalog);
         this.ops = ops;
@@ -64,7 +70,7 @@ public final class ClusterManager implements AutoCloseable {
         if (password == null || password.isEmpty()) throw new ClusterError("INVALID_ARGUMENT", "请输入 root 密码");
         String finalHost = host;
         if (state().servers().stream().anyMatch(s -> s.host().equalsIgnoreCase(finalHost))) throw new ClusterError("CONFLICT", "服务器已存在：" + host);
-        bundle.releaseId();
+        packages.latest();
         String id = "server-" + (state().servers().stream().mapToInt(s -> number(s.id())).max().orElse(0) + 1);
         Server server = new Server(id, host, sshPort, note == null ? "" : note.trim(), ServerStatus.PROVISIONING, "正在添加",
                 "", "", "", "", "", "");
@@ -177,16 +183,113 @@ public final class ClusterManager implements AutoCloseable {
         return tasks.submit("restart", Map.of("nodes", order(targets)));
     }
 
-    /** 把所有节点升级到 Studio 随附的程序包版本。 */
-    public TaskRunner.TaskView upgrade() throws IOException {
-        ClusterState state = state();
-        String release = bundle.releaseId();
-        List<NodeSpec> targets = state.nodes().stream().filter(NodeSpec::joined).toList();
-        if (targets.isEmpty()) throw new ClusterError("NOTHING_TO_DO", "还没有节点");
-        if (targets.stream().allMatch(n -> n.releaseId().equals(release))) throw new ClusterError("NOTHING_TO_DO", "所有节点已是当前版本");
+    /**
+     * 把所选范围内的节点升级到指定程序包（为空时用最新导入的）。只有本角色程序真的变了的节点才重启：
+     * 只换了 compute jar 时存储节点不动，也不进维护模式。
+     * @param roles   为空表示所有角色
+     * @param nodeIds 为空表示所选角色的所有节点
+     */
+    public TaskRunner.TaskView upgrade(String release, List<String> roles, List<String> nodeIds) throws IOException {
+        if (state().nodes().stream().noneMatch(NodeSpec::joined)) throw new ClusterError("NOTHING_TO_DO", "还没有节点");
+        UpgradeScope scope = upgradeScope(release, roles, nodeIds);
+        if (scope.targets().isEmpty()) throw new ClusterError("NOTHING_TO_DO", "所选节点的程序和 " + scope.target().id() + " 相同，不需要升级");
         Set<String> previous = new TreeSet<>();
-        targets.forEach(n -> previous.add(n.releaseId()));
-        return tasks.submit("upgrade", Map.of("nodes", order(targets), "release", release, "previous", String.join(",", previous)));
+        scope.targets().forEach(n -> previous.add(n.releaseId()));
+        return tasks.submit("upgrade", Map.of("nodes", order(scope.targets()), "release", scope.target().id(), "previous", String.join(",", previous)));
+    }
+
+    /** 升级前预览：哪些节点会重启、哪些因为程序没变而跳过、是否涉及存储节点（会进维护模式）。 */
+    public ObjectNode upgradePreview(String release, List<String> roles, List<String> nodeIds) throws IOException {
+        UpgradeScope scope = upgradeScope(release, roles, nodeIds);
+        ObjectNode result = ClusterStore.JSON.createObjectNode().put("release", scope.target().id()).put("version", scope.target().version())
+                .put("storage", scope.targets().stream().anyMatch(n -> n.role() == Role.STORAGE));
+        ArrayNode targets = result.putArray("targets");
+        for (NodeSpec n : scope.targets()) targets.addObject().put("id", n.id()).put("role", n.role().name()).put("from", n.releaseId());
+        ArrayNode unchanged = result.putArray("unchanged");
+        for (NodeSpec n : scope.unchanged()) unchanged.addObject().put("id", n.id()).put("role", n.role().name()).put("from", n.releaseId());
+        return result;
+    }
+
+    private record UpgradeScope(Packages.Package target, List<NodeSpec> targets, List<NodeSpec> unchanged) { }
+
+    private UpgradeScope upgradeScope(String release, List<String> roles, List<String> nodeIds) throws IOException {
+        Packages.Package target = release == null || release.isBlank() ? packages.latest() : packages.require(release);
+        Set<Role> roleSet = EnumSet.noneOf(Role.class);
+        if (roles != null) for (String role : roles) {
+            try { roleSet.add(Role.valueOf(role.toUpperCase(Locale.ROOT))); }
+            catch (IllegalArgumentException ex) { throw new ClusterError("INVALID_ARGUMENT", "角色只能是 STORAGE 或 COMPUTE"); }
+        }
+        Set<String> ids = new HashSet<>(nodeIds == null ? List.of() : nodeIds);
+        ClusterState state = state();
+        for (String id : ids) if (state.node(id).isEmpty()) throw new ClusterError("NOT_FOUND", "节点不存在：" + id);
+        List<NodeSpec> targets = new ArrayList<>(), unchanged = new ArrayList<>();
+        for (NodeSpec n : state.nodes()) {
+            if (!n.joined() || (!roleSet.isEmpty() && !roleSet.contains(n.role())) || (!ids.isEmpty() && !ids.contains(n.id()))) continue;
+            (differs(n, target, true) ? targets : unchanged).add(n);
+        }
+        return new UpgradeScope(target, targets, unchanged);
+    }
+
+    /**
+     * 换到 target 时这个节点要不要重启：本角色的 jar 或日志配置变了才要。节点在用的程序包 Studio 不认识时
+     * （例如以前直接替换过 nodes/ 里的文件），probe 为 true 就到节点所在服务器读文件摘要；页面轮询不连服务器。
+     */
+    boolean differs(NodeSpec n, Packages.Package target, boolean probe) throws IOException {
+        if (n.releaseId().equals(target.id())) return false;
+        Map<String, String> files = packages.get(n.releaseId()).map(Packages.Package::files).orElse(remoteReleases.get(n.releaseId()));
+        if (files == null && probe && !n.releaseId().isEmpty()) {
+            try (RemoteShell shell = shell(n.serverId())) { files = Remote.releaseFiles(shell, n.releaseId()); }
+            catch (IOException | RuntimeException ex) { files = Map.of(); }
+            if (!files.isEmpty()) remoteReleases.put(n.releaseId(), files);
+        }
+        if (files == null || files.isEmpty()) return true;
+        String jar = Packages.jar(n.role());
+        return !Objects.equals(files.get(jar), target.files().get(jar)) || !Objects.equals(files.get("logback.xml"), target.files().get("logback.xml"));
+    }
+
+    /** 新节点沿用同角色节点最多在用的程序包，保持一致；还没有同角色节点时用最新导入的。 */
+    String releaseFor(Role role) throws IOException {
+        Map<String, Integer> counts = new HashMap<>();
+        for (NodeSpec n : state().nodes(role)) if (n.joined() && !n.releaseId().isEmpty()) counts.merge(n.releaseId(), 1, Integer::sum);
+        String best = null;
+        for (var entry : counts.entrySet()) {
+            if (packages.get(entry.getKey()).isEmpty()) continue;
+            if (best == null || entry.getValue() > counts.get(best)) best = entry.getKey();
+        }
+        return best != null ? best : packages.latest().id();
+    }
+
+    // ---- packages ----
+    public ObjectNode packagesView() throws IOException {
+        ClusterState state = state();
+        ObjectNode result = ClusterStore.JSON.createObjectNode().put("inbox", packages.inbox().toString()).put("scannedAt", packages.scannedAt());
+        result.set("scan", ClusterStore.JSON.valueToTree(packages.lastScan()));
+        ArrayNode rows = result.putArray("packages");
+        boolean first = true;
+        for (Packages.Package pkg : packages.list()) {
+            ObjectNode row = ClusterStore.JSON.valueToTree(pkg);
+            row.put("latest", first);
+            ArrayNode used = row.putArray("usedBy");
+            state.nodes().stream().filter(n -> n.releaseId().equals(pkg.id())).forEach(n -> used.add(n.id()));
+            rows.add(row);
+            first = false;
+        }
+        return result;
+    }
+
+    /** 处理导入目录。不需要重启 Studio。 */
+    public ObjectNode scanPackages() throws IOException {
+        packages.scan();
+        return packagesView();
+    }
+
+    public void removePackage(String id) throws IOException {
+        packages.require(id);
+        if (tasks.active() != null) throw new ClusterError("BUSY", "有任务进行中，请稍后再删除程序包");
+        List<String> users = state().nodes().stream().filter(n -> n.releaseId().equals(id)).map(NodeSpec::id).toList();
+        if (!users.isEmpty()) throw new ClusterError("INVALID_STATE", "还有节点在用这个程序包：" + String.join("、", users));
+        if (packages.list().size() == 1) throw new ClusterError("INVALID_STATE", "这是唯一的程序包，不能删除");
+        packages.remove(id);
     }
 
     private static String order(List<NodeSpec> nodes) {
@@ -274,6 +377,19 @@ public final class ClusterManager implements AutoCloseable {
         }
     }
 
+    /**
+     * 数据库刚验证过的 root 密码（root 登录或改密码成功）：只更新 Studio 保存的值，不再调用数据库。
+     * 计算节点配置文件里的 root_password 只在集群首次初始化时使用，这里不改写。
+     */
+    public void syncRootPassword(String password) throws IOException {
+        store.update(s -> s.withRootPassword(password));
+    }
+
+    /** 是否已有加入集群的计算节点（数据库里已经有 root 用户）。 */
+    public boolean hasJoinedCompute() {
+        return state().nodes(Role.COMPUTE).stream().anyMatch(NodeSpec::joined);
+    }
+
     public String logs(String nodeId, int lines) throws IOException {
         NodeSpec node = state().node(nodeId).orElseThrow(() -> new ClusterError("NOT_FOUND", "节点不存在：" + nodeId));
         try (RemoteShell shell = shell(node.serverId())) { return Remote.logs(shell, nodeId, lines); }
@@ -286,12 +402,16 @@ public final class ClusterManager implements AutoCloseable {
     /** 页面轮询用：只读本地状态，不访问集群，返回很快。 */
     public ObjectNode overview() throws IOException {
         ClusterState state = state();
-        String release;
+        String release = "", version = "";
         String bundleError = "";
-        try { release = bundle.releaseId(); }
-        catch (ClusterError ex) { release = ""; bundleError = ex.getMessage(); }
+        Packages.Package latest = null;
+        try {
+            latest = packages.latest();
+            release = latest.id();
+            version = latest.version();
+        } catch (ClusterError ex) { bundleError = ex.getMessage(); }
         ObjectNode result = ClusterStore.JSON.createObjectNode().put("code", "OK");
-        result.put("clusterId", state.clusterId()).put("release", release).put("version", bundle.version()).put("bundleError", bundleError)
+        result.put("clusterId", state.clusterId()).put("release", release).put("version", version).put("bundleError", bundleError)
                 .put("rootPasswordSet", !state.rootPassword().isEmpty()).put("configVersion", state.config().version());
         ArrayNode servers = result.putArray("servers");
         for (Server server : state.servers()) {
@@ -304,7 +424,7 @@ public final class ClusterManager implements AutoCloseable {
         for (NodeSpec node : state.nodes()) {
             ObjectNode row = ClusterStore.JSON.valueToTree(node);
             boolean restart = pendingRestart(state, node);
-            boolean upgrade = node.joined() && !release.isEmpty() && !node.releaseId().isEmpty() && !node.releaseId().equals(release);
+            boolean upgrade = node.joined() && latest != null && !node.releaseId().isEmpty() && differs(node, latest, false);
             if (restart) pending++;
             if (upgrade) outdated++;
             row.put("host", state.server(node.serverId()).map(Server::host).orElse(""));
@@ -352,24 +472,38 @@ public final class ClusterManager implements AutoCloseable {
 
     /** 运维总览只读本机监控库，不访问 Storage 或 Compute。 */
     public ObjectNode opsOverview() {
+        if (opsMonitor == null) return emptyOverview(null);
+        try { return opsMonitor.overview(); }
+        catch (RuntimeException ex) { return emptyOverview("监控记录暂不可读：" + (ex.getMessage() == null ? "监控库读取失败" : ex.getMessage())); }
+    }
+
+    /** 服务器趋势曲线，range 为 1h、1d 或 7d。 */
+    public ObjectNode opsSeries(String range) {
         if (opsMonitor == null) {
-            ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK").put("clusterHealth", "UNKNOWN");
-            empty.putArray("computeNodes");
-            empty.putArray("storageNodes");
-            empty.putArray("shards");
-            empty.putArray("events");
+            ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK").put("range", OpsStore.Range.of(range).key());
+            empty.putArray("hosts");
             return empty;
         }
-        try { return opsMonitor.overview(); }
-        catch (RuntimeException ex) {
-            ObjectNode failed = ClusterStore.JSON.createObjectNode().put("code", "OK").put("clusterHealth", "UNKNOWN")
-                    .put("message", "监控记录暂不可读：" + (ex.getMessage() == null ? "监控库读取失败" : ex.getMessage()));
-            failed.putArray("computeNodes");
-            failed.putArray("storageNodes");
-            failed.putArray("shards");
-            failed.putArray("events");
-            return failed;
+        return opsMonitor.series(range);
+    }
+
+    public ObjectNode opsShards() {
+        if (opsMonitor == null) {
+            ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK");
+            empty.putArray("shards");
+            return empty;
         }
+        return opsMonitor.shards();
+    }
+
+    private static ObjectNode emptyOverview(String message) {
+        ObjectNode empty = ClusterStore.JSON.createObjectNode().put("code", "OK").put("clusterHealth", "UNKNOWN");
+        if (message != null) empty.put("message", message);
+        empty.putArray("computeNodes");
+        empty.putArray("storageNodes");
+        empty.putObject("shardSummary").put("total", 0).put("healthy", 0).put("degraded", 0).put("unavailable", 0);
+        empty.putArray("events");
+        return empty;
     }
 
     private static Map<String, String> trim(Map<String, String> values) {

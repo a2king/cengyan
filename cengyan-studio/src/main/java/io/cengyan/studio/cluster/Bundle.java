@@ -36,9 +36,9 @@ public final class Bundle {
     public String releaseId() throws IOException {
         String cached = releaseId;
         if (cached != null) return cached;
-        MessageDigest digest = sha();
-        for (String name : RELEASE_FILES) digest.update(HexFormat.of().parseHex(sha256(releaseFile(name))));
-        cached = version() + "-" + HexFormat.of().formatHex(digest.digest()).substring(0, 10);
+        Map<String, String> shas = new java.util.LinkedHashMap<>();
+        for (String name : RELEASE_FILES) shas.put(name, sha256(releaseFile(name)));
+        cached = Packages.releaseId(version(), shas);
         releaseId = cached;
         return cached;
     }

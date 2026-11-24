@@ -56,7 +56,7 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 
 cd "$APP_HOME"
-nohup "$JAVA_EXE" "-Djava.util.logging.config.file=$LOG_CONFIG" -jar "$APP_HOME/cengyan-studio.jar" \
+nohup "$JAVA_EXE" "-Djava.net.preferIPv4Stack=true" "-Djava.util.logging.config.file=$LOG_CONFIG" -jar "$APP_HOME/cengyan-studio.jar" \
     --home "$APP_HOME" \
     --host "$STUDIO_HOST" \
     --port "$STUDIO_PORT" \

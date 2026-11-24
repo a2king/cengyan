@@ -153,21 +153,43 @@ final class Remote {
     // ---- release ----
     static String releaseDir(String releaseId) { return RELEASES + "/" + releaseId; }
 
-    /** 逐文件比对 SHA-256，一致则跳过上传；全部到位后写完成标记。 */
-    static void syncRelease(RemoteShell shell, Bundle bundle) throws IOException {
-        String release = bundle.releaseId();
+    /**
+     * 逐文件比对 SHA-256，一致则跳过上传；服务器上别的程序包目录里已有同样内容时硬链接过来，
+     * 只换了 compute jar 时 storage jar 不用重新上传。全部到位后写完成标记。
+     */
+    static void syncRelease(RemoteShell shell, Packages packages, Packages.Package pkg) throws IOException {
+        String release = pkg.id();
         String dir = releaseDir(release);
         if (shell.exec("[ \"$(cat " + dir + "/.complete 2>/dev/null)\" = " + quote(release) + " ]", SHORT).ok()) return;
         for (String name : Bundle.RELEASE_FILES) {
-            var local = bundle.releaseFile(name);
-            String sha = Bundle.sha256(local);
+            String sha = pkg.files().get(name);
             String remote = dir + "/" + name;
             var existing = shell.exec("sha256sum " + quote(remote) + " 2>/dev/null | cut -d' ' -f1", SHORT);
-            if (!existing.stdout().strip().equals(sha)) shell.upload(local, remote, "644");
+            if (!existing.stdout().strip().equals(sha) && !reuse(shell, name, sha, remote))
+                shell.upload(packages.file(release, name), remote, "644");
             if (!shell.run("sha256sum " + quote(remote) + " | cut -d' ' -f1", SHORT).strip().equals(sha))
                 throw new ClusterError("REMOTE_FAILED", "上传后校验失败：" + remote);
         }
         shell.write(dir + "/.complete", release + "\n", "644");
+    }
+
+    private static boolean reuse(RemoteShell shell, String name, String sha, String target) throws IOException {
+        String parent = target.substring(0, target.lastIndexOf('/'));
+        return shell.exec("mkdir -p " + quote(parent) + "; for f in " + RELEASES + "/*/" + name + "; do [ -f \"$f\" ] && [ \"$f\" != " + quote(target) + " ] || continue; "
+                + "[ \"$(sha256sum \"$f\" | cut -d' ' -f1)\" = " + sha + " ] || continue; "
+                + "ln -f \"$f\" " + quote(target) + " 2>/dev/null || cp -f \"$f\" " + quote(target) + "; exit 0; done; exit 1", LONG).ok();
+    }
+
+    /** 服务器上某个程序包目录里各文件的摘要；目录不完整时返回空表。 */
+    static Map<String, String> releaseFiles(RemoteShell shell, String releaseId) throws IOException {
+        var result = shell.exec("cd " + quote(releaseDir(releaseId)) + " && sha256sum " + String.join(" ", Bundle.RELEASE_FILES), LONG);
+        if (!result.ok()) return Map.of();
+        Map<String, String> files = new HashMap<>();
+        for (String line : result.stdout().split("\n")) {
+            String[] parts = line.strip().split("\\s+", 2);
+            if (parts.length == 2 && parts[0].matches("[0-9a-f]{64}")) files.put(parts[1].replaceFirst("^\\*", ""), parts[0]);
+        }
+        return files.keySet().containsAll(Bundle.RELEASE_FILES) ? Map.copyOf(files) : Map.of();
     }
 
     /** 删除除 keep 以外的程序包目录。 */

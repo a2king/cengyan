@@ -234,6 +234,104 @@ class ClusterManagerTest {
         assertTrue(file(shells.hosts.get("10.0.3.1"), "/opt/cengyan/nodes/storage-1/storage.properties").contains("write_threads=16"));
     }
 
+    @Test void computeOnlyUpgradeLeavesStorageAloneAndReusesUnchangedFiles() throws Exception {
+        cluster();
+        addNode(Role.COMPUTE, "10.0.3.2", "compute-2");
+        List<String> order = restartHooks();
+        String before = manager.packages.latest().id();
+        Fakes.nodeJar(manager.packages.inbox().resolve("cengyan-compute.jar"), Role.COMPUTE, "query fix");
+        var view = manager.scanPackages();
+        assertTrue(view.path("scan").path(0).path("ok").asBoolean(), view.toString());
+        String release = view.path("packages").path(0).path("id").asText();
+        assertNotEquals(before, release);
+        assertTrue(view.path("packages").path(0).path("latest").asBoolean());
+        assertEquals(4, view.path("packages").path(1).path("usedBy").size(), "旧程序包仍被四个节点使用");
+
+        var overview = manager.overview();
+        assertEquals(release, overview.path("release").asText(), "不重启 Studio 就能看到新程序包");
+        assertEquals(2, overview.path("upgradeAvailable").asInt(), "只有计算节点需要升级");
+
+        var preview = manager.upgradePreview("", List.of(), List.of());
+        assertFalse(preview.path("storage").asBoolean(), "不涉及存储节点，不进维护模式");
+        assertEquals(2, preview.path("targets").size());
+        assertEquals(2, preview.path("unchanged").size());
+
+        for (Fakes.Host host : shells.hosts.values()) host.uploads.clear();
+        TaskRunner.TaskView task = await(manager.upgrade("", List.of(), List.of()));
+        assertEquals(State.DONE, task.state(), task.error());
+        assertEquals(List.of("compute-1", "compute-2"), order, "只重启计算节点");
+        assertFalse(ops.calls.contains("enter"), "没有进维护模式");
+        assertTrue(ops.calls.contains("drainCompute compute-1"), "两个计算节点时先排空再重启");
+        for (String id : List.of("compute-1", "compute-2")) assertEquals(release, manager.state().node(id).orElseThrow().releaseId());
+        for (String id : List.of("storage-1", "storage-2")) assertEquals(before, manager.state().node(id).orElseThrow().releaseId());
+        assertEquals(0, manager.overview().path("upgradeAvailable").asInt());
+
+        for (Fakes.Host host : shells.hosts.values()) {
+            assertEquals(List.of("/opt/cengyan/releases/" + release + "/cengyan-compute.jar"), host.uploads, "只上传变了的 compute jar");
+            assertArrayEquals(host.files.get("/opt/cengyan/releases/" + before + "/cengyan-storage.jar"),
+                    host.files.get("/opt/cengyan/releases/" + release + "/cengyan-storage.jar"), "storage jar 从旧目录链接过来");
+            assertTrue(host.files.containsKey("/opt/cengyan/releases/" + before + "/cengyan-storage.jar"), "存储节点还在用旧目录，不能清理");
+        }
+        assertTrue(file(shells.hosts.get("10.0.3.1"), "/opt/cengyan/nodes/compute-1/node.env").contains("CENGYAN_RELEASE=" + release));
+        assertTrue(file(shells.hosts.get("10.0.3.1"), "/opt/cengyan/nodes/storage-1/node.env").contains("CENGYAN_RELEASE=" + before));
+        assertEquals("NOTHING_TO_DO", assertThrows(ClusterError.class, () -> manager.upgrade("", List.of(), List.of())).code());
+        assertEquals("INVALID_STATE", assertThrows(ClusterError.class, () -> manager.removePackage(before)).code(), "存储节点还在用");
+    }
+
+    @Test void upgradeCanBeLimitedToOneRoleOrNode() throws Exception {
+        cluster();
+        List<String> order = restartHooks();
+        Map<String, byte[]> entries = new LinkedHashMap<>();
+        entries.put("cengyan-1.0.1/BUILD-INFO.json", "{\"version\":\"1.0.1\"}".getBytes(StandardCharsets.UTF_8));
+        entries.put("cengyan-1.0.1/nodes/cengyan-storage.jar", java.nio.file.Files.readAllBytes(Fakes.nodeJar(tmp.resolve("s.jar"), Role.STORAGE, "s")));
+        entries.put("cengyan-1.0.1/nodes/cengyan-compute.jar", java.nio.file.Files.readAllBytes(Fakes.nodeJar(tmp.resolve("c.jar"), Role.COMPUTE, "c")));
+        entries.put("cengyan-1.0.1/nodes/logback.xml", "<configuration/>".getBytes(StandardCharsets.UTF_8));
+        Fakes.tarGz(manager.packages.inbox().resolve("cengyan-1.0.1-linux.tar.gz"), entries);
+        String release = manager.scanPackages().path("packages").path(0).path("id").asText();
+        assertTrue(release.startsWith("1.0.1-"), release);
+        assertEquals(3, manager.overview().path("upgradeAvailable").asInt());
+
+        TaskRunner.TaskView task = await(manager.upgrade(release, List.of("COMPUTE"), List.of()));
+        assertEquals(State.DONE, task.state(), task.error());
+        assertEquals(List.of("compute-1"), order);
+        assertFalse(ops.calls.contains("enter"));
+
+        assertTrue(manager.upgradePreview(release, List.of(), List.of("storage-2")).path("storage").asBoolean());
+        task = await(manager.upgrade(release, List.of(), List.of("storage-2")));
+        assertEquals(State.DONE, task.state(), task.error());
+        assertEquals(List.of("compute-1", "storage-2"), order);
+        assertEquals(release, manager.state().node("storage-2").orElseThrow().releaseId());
+        assertNotEquals(release, manager.state().node("storage-1").orElseThrow().releaseId());
+        assertEquals("NOT_FOUND", assertThrows(ClusterError.class, () -> manager.upgrade("missing", List.of(), List.of())).code());
+        assertEquals("INVALID_ARGUMENT", assertThrows(ClusterError.class, () -> manager.upgrade(release, List.of("studio"), List.of())).code());
+    }
+
+    @Test void releaseStudioNoLongerHasIsComparedByTheFilesOnTheServer() throws Exception {
+        cluster();
+        String before = manager.packages.latest().id();
+        // 以前直接替换过 nodes/ 里的文件：节点用的程序包 Studio 本地没有，但服务器上的 storage jar 和最新的一样。
+        String unknown = "1.0.0-0123456789";
+        for (Fakes.Host host : shells.hosts.values())
+            for (String name : Bundle.RELEASE_FILES) host.files.put("/opt/cengyan/releases/" + unknown + "/" + name, host.files.get("/opt/cengyan/releases/" + before + "/" + name));
+        for (NodeSpec n : manager.state().nodes()) manager.store.update(s -> s.withNode(n.deployed(unknown, n.deployedHash())));
+        Fakes.nodeJar(manager.packages.inbox().resolve("cengyan-compute.jar"), Role.COMPUTE, "fix");
+        manager.scanPackages();
+        var preview = manager.upgradePreview("", List.of(), List.of());
+        assertEquals(1, preview.path("targets").size(), preview.toString());
+        assertEquals("compute-1", preview.path("targets").path(0).path("id").asText());
+        assertEquals(1, manager.overview().path("upgradeAvailable").asInt(), "读过服务器后页面也按文件比较");
+    }
+
+    @Test void newNodeUsesWhatItsRoleAlreadyRuns() throws Exception {
+        cluster();
+        String before = manager.packages.latest().id();
+        Fakes.nodeJar(manager.packages.inbox().resolve("cengyan-storage.jar"), Role.STORAGE, "newer");
+        String release = manager.scanPackages().path("packages").path(0).path("id").asText();
+        assertNotEquals(before, release);
+        addNode(Role.COMPUTE, "10.0.3.2", "compute-2");
+        assertEquals(before, manager.state().node("compute-2").orElseThrow().releaseId(), "同角色节点在用旧程序包，新节点保持一致");
+    }
+
     @Test void singleNodeRestartLeavesOthersAlone() throws Exception {
         cluster();
         List<String> order = restartHooks();

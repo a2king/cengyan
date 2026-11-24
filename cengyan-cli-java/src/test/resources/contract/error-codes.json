@@ -1,0 +1,353 @@
+{
+  "generator": "contract-gen/generate_error_codes.py (pycengyan.exceptions)",
+  "cases": [
+    {
+      "code": "BATCH_TOO_LARGE",
+      "read": "RequestTooLargeException",
+      "write": "RequestTooLargeException",
+      "unknown": "RequestTooLargeException"
+    },
+    {
+      "code": "BUSY",
+      "read": "BusyException",
+      "write": "BusyException",
+      "unknown": "BusyException"
+    },
+    {
+      "code": "CLUSTER_MAINTENANCE",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "CONFIG_MISMATCH",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "CONSTRAINT",
+      "read": "ConstraintException",
+      "write": "ConstraintException",
+      "unknown": "ConstraintException"
+    },
+    {
+      "code": "CORRUPT_DATA",
+      "read": "InternalException",
+      "write": "InternalException",
+      "unknown": "InternalException"
+    },
+    {
+      "code": "CROSS_PART_UNSUPPORTED",
+      "read": "UnsupportedException",
+      "write": "UnsupportedException",
+      "unknown": "UnsupportedException"
+    },
+    {
+      "code": "DIVIDE_BY_ZERO",
+      "read": "QueryException",
+      "write": "QueryException",
+      "unknown": "QueryException"
+    },
+    {
+      "code": "DROP_ALIAS_AS_GRAPH",
+      "read": "GraphContextException",
+      "write": "GraphContextException",
+      "unknown": "GraphContextException"
+    },
+    {
+      "code": "ENDPOINT_NOT_FOUND",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "FAILED",
+      "read": "InternalException",
+      "write": "CommitUncertainException",
+      "unknown": "CommitUncertainException"
+    },
+    {
+      "code": "FORBIDDEN",
+      "read": "AuthorizationException",
+      "write": "AuthorizationException",
+      "unknown": "AuthorizationException"
+    },
+    {
+      "code": "FRONTIER_EXCEEDED",
+      "read": "LimitExceededException",
+      "write": "LimitExceededException",
+      "unknown": "LimitExceededException"
+    },
+    {
+      "code": "GRAPH_NOT_FOUND",
+      "read": "GraphNotFoundException",
+      "write": "GraphNotFoundException",
+      "unknown": "GraphNotFoundException"
+    },
+    {
+      "code": "GRAPH_STATE",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "GROUP_UNAVAILABLE",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "ID_CONFLICT",
+      "read": "ConstraintException",
+      "write": "ConstraintException",
+      "unknown": "ConstraintException"
+    },
+    {
+      "code": "INSUFFICIENT_NODES",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "INTERNAL",
+      "read": "InternalException",
+      "write": "InternalException",
+      "unknown": "InternalException"
+    },
+    {
+      "code": "INVALID_ARGUMENT",
+      "read": "InvalidArgumentException",
+      "write": "InvalidArgumentException",
+      "unknown": "InvalidArgumentException"
+    },
+    {
+      "code": "NAME_CONFLICT",
+      "read": "NameConflictException",
+      "write": "NameConflictException",
+      "unknown": "NameConflictException"
+    },
+    {
+      "code": "NODE_CONFLICT",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "NODE_DELETING",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "NODE_NOT_DRAINED",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "NODE_NOT_FOUND",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "NOT_LEADER",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "PART_NOT_FOUND",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "PART_READONLY",
+      "read": "ReadOnlyException",
+      "write": "ReadOnlyException",
+      "unknown": "ReadOnlyException"
+    },
+    {
+      "code": "PATH_LIMIT",
+      "read": "LimitExceededException",
+      "write": "LimitExceededException",
+      "unknown": "LimitExceededException"
+    },
+    {
+      "code": "PATH_LIMIT_EXCEEDED",
+      "read": "LimitExceededException",
+      "write": "LimitExceededException",
+      "unknown": "LimitExceededException"
+    },
+    {
+      "code": "PROTOCOL_ERROR",
+      "read": "InvalidArgumentException",
+      "write": "InvalidArgumentException",
+      "unknown": "InvalidArgumentException"
+    },
+    {
+      "code": "QUERY_CANCELED",
+      "read": "QueryCanceledException",
+      "write": "QueryCanceledException",
+      "unknown": "QueryCanceledException"
+    },
+    {
+      "code": "QUERY_MEMORY_EXCEEDED",
+      "read": "ResourceExhaustedException",
+      "write": "ResourceExhaustedException",
+      "unknown": "ResourceExhaustedException"
+    },
+    {
+      "code": "QUERY_TIMEOUT",
+      "read": "QueryTimeoutException",
+      "write": "CommitUncertainException",
+      "unknown": "CommitUncertainException"
+    },
+    {
+      "code": "REPLICA_MISMATCH",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "REQUEST_CONFLICT",
+      "read": "RequestConflictException",
+      "write": "RequestConflictException",
+      "unknown": "RequestConflictException"
+    },
+    {
+      "code": "REQUEST_TOO_LARGE",
+      "read": "RequestTooLargeException",
+      "write": "RequestTooLargeException",
+      "unknown": "RequestTooLargeException"
+    },
+    {
+      "code": "RESERVATION_EXPIRED",
+      "read": "BusyException",
+      "write": "BusyException",
+      "unknown": "BusyException"
+    },
+    {
+      "code": "RESULT_TOO_LARGE",
+      "read": "LimitExceededException",
+      "write": "LimitExceededException",
+      "unknown": "LimitExceededException"
+    },
+    {
+      "code": "SCHEMA_MISMATCH",
+      "read": "SchemaMismatchException",
+      "write": "SchemaMismatchException",
+      "unknown": "SchemaMismatchException"
+    },
+    {
+      "code": "SCHEMA_VERSION_MISMATCH",
+      "read": "SchemaMismatchException",
+      "write": "SchemaMismatchException",
+      "unknown": "SchemaMismatchException"
+    },
+    {
+      "code": "SOMETHING_NEW",
+      "read": "CengyanException",
+      "write": "CengyanException",
+      "unknown": "CengyanException"
+    },
+    {
+      "code": "SPACE_READONLY",
+      "read": "ReadOnlyException",
+      "write": "ReadOnlyException",
+      "unknown": "ReadOnlyException"
+    },
+    {
+      "code": "STALE_CONTROLLER",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "STREAM_FAILED",
+      "read": "InternalException",
+      "write": "InternalException",
+      "unknown": "InternalException"
+    },
+    {
+      "code": "SYNTAX",
+      "read": "GqlSyntaxException",
+      "write": "GqlSyntaxException",
+      "unknown": "GqlSyntaxException"
+    },
+    {
+      "code": "TOPOLOGY_CONFLICT",
+      "read": "ClusterStateException",
+      "write": "ClusterStateException",
+      "unknown": "ClusterStateException"
+    },
+    {
+      "code": "TRANSACTION_TIMEOUT",
+      "read": "QueryTimeoutException",
+      "write": "QueryTimeoutException",
+      "unknown": "QueryTimeoutException"
+    },
+    {
+      "code": "TRANSACTION_UNKNOWN",
+      "read": "CommitUncertainException",
+      "write": "CommitUncertainException",
+      "unknown": "CommitUncertainException"
+    },
+    {
+      "code": "TRUNCATED",
+      "read": "LimitExceededException",
+      "write": "LimitExceededException",
+      "unknown": "LimitExceededException"
+    },
+    {
+      "code": "TYPE_MISMATCH",
+      "read": "TypeMismatchException",
+      "write": "TypeMismatchException",
+      "unknown": "TypeMismatchException"
+    },
+    {
+      "code": "TYPE_NOT_EMPTY",
+      "read": "ConstraintException",
+      "write": "ConstraintException",
+      "unknown": "ConstraintException"
+    },
+    {
+      "code": "TYPE_NOT_FOUND",
+      "read": "TypeNotFoundException",
+      "write": "TypeNotFoundException",
+      "unknown": "TypeNotFoundException"
+    },
+    {
+      "code": "UNAUTHENTICATED",
+      "read": "AuthenticationException",
+      "write": "AuthenticationException",
+      "unknown": "AuthenticationException"
+    },
+    {
+      "code": "UNIQUE_VIOLATION",
+      "read": "UniqueViolationException",
+      "write": "UniqueViolationException",
+      "unknown": "UniqueViolationException"
+    },
+    {
+      "code": "UNSUPPORTED",
+      "read": "UnsupportedException",
+      "write": "UnsupportedException",
+      "unknown": "UnsupportedException"
+    },
+    {
+      "code": "VERTEX_DEGREE_EXCEEDED",
+      "read": "LimitExceededException",
+      "write": "LimitExceededException",
+      "unknown": "LimitExceededException"
+    },
+    {
+      "code": "WRITE_CONFLICT",
+      "read": "ConflictException",
+      "write": "ConflictException",
+      "unknown": "ConflictException"
+    }
+  ]
+}

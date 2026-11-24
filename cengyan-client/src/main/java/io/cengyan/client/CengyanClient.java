@@ -2,8 +2,8 @@ package io.cengyan.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.cengyan.protocol.EntityId;
 import io.cengyan.protocol.proto.ClusterProtocol.Entity;
 import io.cengyan.protocol.proto.ClusterProtocol.GraphDefinition;
 import io.cengyan.protocol.proto.ClusterProtocol.IdType;
@@ -21,6 +21,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -28,23 +29,34 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.Comparator;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** 批量导入客户端。一次命令只导入一种点或一种边。 */
+/**
+ * 批量导入客户端。一次命令只导入一种点或一种边，分三步：
+ * <ol>
+ *   <li>上传：读文件、去重、按分片攒成有序的上传段，传给分片的每个副本。上传段只进副本的暂存区，查询看不到；</li>
+ *   <li>归并：所有分片上传完以后，各副本把上传段归并成可摄入的文件。任何一个分片归并失败，整次导入都不生效；</li>
+ *   <li>发布：每个分片一条 Raft 指令，各副本一次性摄入。</li>
+ * </ol>
+ */
 public final class CengyanClient {
     static {
         // ORC 1.9 的 protobuf 代码较旧，运行时会打印拒绝服务警告。默认关掉，仍可用启动参数改回去。
@@ -54,7 +66,8 @@ public final class CengyanClient {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final int CHUNK = 1024 * 1024;
+    /** 4 MiB 原始数据，Base64 后约 5.6 MiB，低于 Compute 8 MiB 的单行上限。 */
+    private static final int CHUNK = 4 * 1024 * 1024;
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0 || !"import".equals(args[0])) {
@@ -71,135 +84,310 @@ public final class CengyanClient {
         System.exit(code);
     }
 
+    /** 导入过程中的计数，进度线程和工作线程共用。 */
+    private static final class Progress {
+        final long startedAt = System.currentTimeMillis();
+        final AtomicLong uploaded = new AtomicLong();
+        final AtomicLong published = new AtomicLong();
+        final AtomicLong skipped = new AtomicLong();
+        final AtomicLong replaced = new AtomicLong();
+        final AtomicLong retries = new AtomicLong();
+        final AtomicInteger partsDone = new AtomicInteger();
+        volatile int partsTotal;
+        volatile String phase = "上传";
+        final long[] sample = { startedAt, 0 };
+    }
+
     int run(String[] args) throws Exception {
         Options options = Options.parse(args);
         List<Path> files = ImportFiles.expand(options.files);
         RocksDB.loadLibrary();
-        long startedAt = System.currentTimeMillis();
         LocalDateTime started = LocalDateTime.now();
-        AtomicLong completed = new AtomicLong();
-        AtomicLong skipped = new AtomicLong();
-        AtomicLong networkRetries = new AtomicLong();
-        long[] progressSample = { startedAt, 0 };
+        Progress progress = new Progress();
+        long uploadMs = 0, publishMs = 0;
         String failure = null;
         AtomicReference<Throwable> broken = new AtomicReference<>();
         String session = UUID.randomUUID().toString();
-        ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "import-heartbeat");
-            thread.setDaemon(true);
-            return thread;
-        });
-        ScheduledExecutorService progress = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "import-progress");
-            thread.setDaemon(true);
-            return thread;
-        });
+        options.session = session;
+        ScheduledExecutorService heartbeat = daemonScheduler("import-heartbeat");
+        ScheduledExecutorService reporter = daemonScheduler("import-progress");
         try (LineClient client = LineClient.connect(options.nodes)) {
             client.login(options.username, options.password);
-            heartbeat.scheduleAtFixedRate(() -> {
-                if (broken.get() != null) return;
-                try { client.call(JSON.createObjectNode().put("op", "importHeartbeat").put("sessionId", session), 30_000); }
-                catch (Exception ignored) { /* 下一次心跳再试。超过 30 分钟没有成功心跳时，副本会删除暂存文件。 */ }
-            }, 0, 20, TimeUnit.SECONDS);
-            progress.scheduleAtFixedRate(() -> printProgress(startedAt, progressSample, completed, skipped, networkRetries), 60, 60, TimeUnit.SECONDS);
             JsonNode plan = client.call(JSON.createObjectNode().put("op", "importPlan").put("graph", options.graph)
                     .put("node", options.node).put("type", options.typeName), 60_000);
+            // 心跳一直发到导入结束：归并可能要几分钟，暂存区 30 分钟收不到心跳就会被删掉。
+            heartbeat.scheduleAtFixedRate(() -> {
+                try { client.call(JSON.createObjectNode().put("op", "importHeartbeat").put("sessionId", session), 30_000); }
+                catch (Exception ignored) { /* 下一次心跳再试。 */ }
+            }, 0, 20, TimeUnit.SECONDS);
+            reporter.scheduleAtFixedRate(() -> printProgress(progress), 60, 60, TimeUnit.SECONDS);
             GraphDefinition graph = graph(plan, options);
             Path work = Files.createTempDirectory(Path.of("").toAbsolutePath(), ".cengyan-import-");
-            ImportIds ids = null;
-            ExecutorService pool = null;
-            List<LineClient> uploads = new ArrayList<>();
-            List<Future<Void>> tasks = new ArrayList<>();
+            List<LineClient> connections = new ArrayList<>();
+            Map<Integer, List<String>> runs = new ConcurrentHashMap<>();
             try {
-                ids = new ImportIds(work.resolve("ids"));
-                pool = Executors.newFixedThreadPool(options.threads);
                 BlockingQueue<LineClient> idle = new ArrayBlockingQueue<>(options.threads);
                 for (int i = 0; i < options.threads; i++) {
                     LineClient extra = LineClient.connect(options.nodes);
-                    uploads.add(extra);
+                    connections.add(extra);
                     extra.login(options.username, options.password);
                     idle.add(extra);
                 }
-                ImportBatches batches = new ImportBatches(options.batchBytes, options.batchBytes * 4);
-                ExecutorService workers = pool;
-                for (Path file : files) {
-                    if (broken.get() != null) break;
-                    ImportIds seen = ids;
-                    ImportFiles.read(options.fileType, file, options.delimiter, record -> {
-                        if (broken.get() != null) throw new IllegalStateException(text(broken.get()));
-                        String id = required(record, options.idColumn, file);
-                        try {
-                            if (!seen.add(id)) {
-                                skipped.incrementAndGet();
-                                return;
-                            }
-                            List<ImportBatches.Ready> ready = new ArrayList<>();
-                            place(graph, options, record, id, batches, ready);
-                            for (ImportBatches.Ready batch : ready) submit(workers, idle, tasks, broken, completed, skipped, networkRetries, options, plan, session, work, batch);
-                        } catch (RuntimeException ex) { throw ex; }
-                        catch (Exception ex) { throw new IllegalStateException(ex.getMessage(), ex); }
-                    });
-                }
+                long phaseStart = System.currentTimeMillis();
+                uploadAll(options, files, plan, graph, session, work, idle, runs, progress, broken);
+                uploadMs = System.currentTimeMillis() - phaseStart;
                 if (broken.get() == null) {
-                    for (ImportBatches.Ready batch : batches.finish()) {
-                        submit(workers, idle, tasks, broken, completed, skipped, networkRetries, options, plan, session, work, batch);
-                    }
+                    phaseStart = System.currentTimeMillis();
+                    publishAll(options, plan, session, idle, runs, progress, broken);
+                    publishMs = System.currentTimeMillis() - phaseStart;
                 }
-                awaitUploads(tasks, broken);
             } catch (Exception ex) {
                 broken.compareAndSet(null, ex);
             } finally {
-                if (broken.get() != null) {
-                    heartbeat.shutdownNow();
-                    abortUploads(pool, tasks, uploads);
-                } else {
-                    for (LineClient extra : uploads) closeQuietly(extra);
-                    if (pool != null) pool.shutdown();
-                }
-                if (ids != null) ids.close();
+                for (LineClient extra : connections) closeQuietly(extra);
                 deleteTree(work);
-                if (plan != null && broken.get() == null) {
-                    try {
-                        client.call(JSON.createObjectNode().put("op", "importFinish").put("graph", options.graph).put("sessionId", session), 1_800_000);
-                    } catch (Exception ex) {
-                        broken.compareAndSet(null, ex);
-                    }
+                // 成功或失败都清掉各副本上的暂存文件。还没进入发布阶段就失败时，归并结果也不会再有人用，一起删掉；
+                // 进入发布阶段以后，落后的副本可能还没应用发布指令，归并结果由副本自己在应用后删除。
+                boolean abort = broken.get() != null && !progress.phase.equals("发布");
+                try { client.call(JSON.createObjectNode().put("op", "importFinish").put("graph", options.graph).put("sessionId", session)
+                        .put("abort", abort), 1_800_000); }
+                catch (Exception ex) {
+                    if (broken.get() == null) System.out.println(LocalDateTime.now().format(CLOCK) + " WARN  CengyanClient - 清理暂存文件失败，"
+                            + "Storage 会在 30 分钟后自动删除：" + text(ex));
                 }
             }
         } catch (Exception ex) {
             broken.compareAndSet(null, ex);
         } finally {
             heartbeat.shutdownNow();
-            progress.shutdownNow();
+            reporter.shutdownNow();
         }
-        if (broken.get() != null && failure == null) failure = text(broken.get());
-        printReport(started, LocalDateTime.now(), System.currentTimeMillis() - startedAt, completed.get(), skipped.get(), session, failure);
+        if (broken.get() != null) failure = text(broken.get());
+        printReport(started, LocalDateTime.now(), System.currentTimeMillis() - progress.startedAt, progress, uploadMs, publishMs, session, failure);
         if (failure != null) throw new IllegalStateException(failure);
         return 0;
     }
 
-    /** 成功时等全部批次结束。失败时不等，避免卡住后仍去结束会话。 */
-    private static void awaitUploads(List<Future<Void>> tasks, AtomicReference<Throwable> broken) throws Exception {
-        for (Future<Void> task : tasks) {
+    /** 读全部文件，按分片攒成上传段并上传。失败时记到 broken 并尽快停下。 */
+    private static void uploadAll(Options options, List<Path> files, JsonNode plan, GraphDefinition graph, String session, Path work,
+                                  BlockingQueue<LineClient> idle, Map<Integer, List<String>> runs, Progress progress,
+                                  AtomicReference<Throwable> broken) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(options.threads);
+        List<Future<?>> tasks = Collections.synchronizedList(new ArrayList<>());
+        ImportIds ids = null;
+        try {
+            ids = new ImportIds(work.resolve("ids"));
+            ImportBatches batches = new ImportBatches(options.batchBytes, options.bufferBytes);
+            ImportIds seen = ids;
+            for (Path file : files) {
+                if (broken.get() != null) break;
+                ImportFiles.read(options.fileType, file, options.delimiter, record -> {
+                    if (broken.get() != null) throw new IllegalStateException(text(broken.get()));
+                    String id = required(record, options.idColumn, file);
+                    try {
+                        if (!seen.add(id)) {
+                            progress.skipped.incrementAndGet();
+                            return;
+                        }
+                        List<ImportBatches.Ready> ready = new ArrayList<>();
+                        place(graph, options, record, id, batches, ready);
+                        for (ImportBatches.Ready batch : ready) submit(pool, idle, tasks, options, plan, session, work, batch, runs, progress, broken);
+                    } catch (RuntimeException ex) { throw ex; }
+                    catch (Exception ex) { throw new IllegalStateException(ex.getMessage(), ex); }
+                });
+            }
+            if (broken.get() == null) {
+                for (ImportBatches.Ready batch : batches.finish()) submit(pool, idle, tasks, options, plan, session, work, batch, runs, progress, broken);
+            }
+            await(tasks, broken);
+        } catch (Exception ex) {
+            broken.compareAndSet(null, ex);
+        } finally {
+            if (broken.get() != null) for (Future<?> task : List.copyOf(tasks)) task.cancel(true);
+            pool.shutdownNow();
+            pool.awaitTermination(30, TimeUnit.SECONDS);
+            if (ids != null) ids.close();
+        }
+    }
+
+    private static void submit(ExecutorService pool, BlockingQueue<LineClient> idle, List<Future<?>> tasks, Options options, JsonNode plan,
+                               String session, Path work, ImportBatches.Ready batch, Map<Integer, List<String>> runs, Progress progress,
+                               AtomicReference<Throwable> broken) throws InterruptedException {
+        if (broken.get() != null || batch.rows.isEmpty()) return;
+        LineClient worker = idle.take();
+        LineClient[] holder = { worker };
+        try {
+            tasks.add(pool.submit(() -> {
+                try {
+                    String hex = upload(holder, options, plan, session, work, batch.part, batch.rows, progress, broken);
+                    runs.computeIfAbsent(batch.part, ignored -> Collections.synchronizedList(new ArrayList<>())).add(hex);
+                    progress.uploaded.addAndGet(batch.primaries);
+                } catch (Exception ex) {
+                    broken.compareAndSet(null, ex);
+                } finally {
+                    idle.offer(holder[0]);
+                }
+                return null;
+            }));
+        } catch (RuntimeException ex) {
+            idle.offer(worker);
+            throw ex;
+        }
+    }
+
+    /** 等全部任务结束。有一个失败就不再等，其余任务由调用方取消。 */
+    private static void await(List<Future<?>> tasks, AtomicReference<Throwable> broken) throws InterruptedException {
+        for (Future<?> task : List.copyOf(tasks)) {
             if (broken.get() != null) return;
             try { task.get(); }
-            catch (Exception ex) {
-                Throwable cause = ex instanceof ExecutionException && ex.getCause() != null ? ex.getCause() : ex;
-                broken.compareAndSet(null, cause);
+            catch (ExecutionException ex) {
+                broken.compareAndSet(null, ex.getCause() == null ? ex : ex.getCause());
                 return;
             }
         }
     }
 
-    /** 关掉正在上传的连接，让卡住的请求马上失败。已经写入的数据保留，未提交的暂存文件等心跳超时后由存储删除。 */
-    private static void abortUploads(ExecutorService pool, List<Future<Void>> tasks, List<LineClient> uploads) {
-        for (Future<Void> task : tasks) task.cancel(true);
-        if (pool != null) pool.shutdownNow();
-        for (LineClient extra : uploads) closeQuietly(extra);
-        if (pool != null) {
-            try { pool.awaitTermination(5, TimeUnit.SECONDS); }
-            catch (InterruptedException ex) { Thread.currentThread().interrupt(); }
+    /** 写成一个有序上传段，按 4 MiB 分块传给分片的每个副本。 @return 上传段的 SHA-256 */
+    private static String upload(LineClient[] client, Options options, JsonNode plan, String session, Path work, int part,
+                                 List<ImportSst.Row> rows, Progress progress, AtomicReference<Throwable> broken) throws Exception {
+        Path file = Files.createTempFile(work, "part-" + part + "-", ".sst");
+        try {
+            ImportSst.write(file, rows);
+            String hex = ImportSst.hex(ImportSst.sha256(file));
+            for (int restart = 0; ; restart++) {
+                try {
+                    sendChunks(client, options, plan, session, part, hex, file, progress, broken);
+                    return hex;
+                } catch (Exception ex) {
+                    // 副本所在机器重启后可能丢了没 fsync 的半个上传段，从头再传一遍。
+                    if (restart < 2 && String.valueOf(ex.getMessage()).contains("导入分块偏移不连续")) continue;
+                    throw ex;
+                }
+            }
+        } finally {
+            Files.deleteIfExists(file);
         }
+    }
+
+    private static void sendChunks(LineClient[] client, Options options, JsonNode plan, String session, int part, String hex, Path file,
+                                   Progress progress, AtomicReference<Throwable> broken) throws Exception {
+        long size = Files.size(file);
+        try (InputStream input = Files.newInputStream(file)) {
+            long offset = 0;
+            do {
+                byte[] data = input.readNBytes((int) Math.min(CHUNK, size - offset));
+                boolean last = offset + data.length >= size;
+                ObjectNode request = JSON.createObjectNode().put("op", "importStage").put("graphId", plan.path("graphId").asLong())
+                        .put("part", part).put("sessionId", session).put("checksum", hex).put("offset", offset)
+                        .put("last", last).put("data", Base64.getEncoder().encodeToString(data));
+                callBatch(client, options, request, 180_000, part, "分块 " + offset, progress, broken);
+                offset += data.length;
+            } while (offset < size);
+        }
+    }
+
+    /**
+     * 先对全部分片归并，全部成功再发布。归并时就会发现键序、类型、代次这类导入内容问题，
+     * 那时一个分片都还没有生效。发布阶段才会发现的只有与已有数据冲突（--unq error）。
+     */
+    private static void publishAll(Options options, JsonNode plan, String session, BlockingQueue<LineClient> idle,
+                                   Map<Integer, List<String>> runs, Progress progress, AtomicReference<Throwable> broken) throws Exception {
+        TreeMap<Integer, List<String>> parts = new TreeMap<>(runs);
+        progress.partsTotal = parts.size();
+        if (parts.isEmpty()) return;
+        progress.phase = "归并";
+        forEachPart(parts, idle, options, broken, (client, part, request) ->
+                callBatch(client, options, request.put("op", "importPrepare"), 1_800_000, part, "归并", progress, broken));
+        if (broken.get() != null) return;
+        progress.phase = "发布";
+        List<String> failed = Collections.synchronizedList(new ArrayList<>());
+        AtomicReference<Throwable> firstFailure = new AtomicReference<>();
+        forEachPart(parts, idle, options, firstFailure, (client, part, request) -> {
+            try {
+                JsonNode result = callBatch(client, options, request.put("op", "importPublish"), 1_800_000, part, "发布", progress, firstFailure);
+                progress.published.addAndGet(result.path("affected").asLong());
+                progress.skipped.addAndGet(result.path("skipped").asLong());
+                progress.replaced.addAndGet(result.path("replaced").asLong());
+                progress.partsDone.incrementAndGet();
+            } catch (Exception ex) {
+                // 一个分片发布失败不拦着其他分片：已经发布的分片收不回来，剩下的也发布完，最后统一报告。
+                failed.add("分片 " + part + "：" + text(ex));
+            }
+        });
+        if (firstFailure.get() != null) broken.compareAndSet(null, firstFailure.get());
+        else if (!failed.isEmpty()) {
+            Collections.sort(failed);
+            broken.compareAndSet(null, new IllegalStateException(progress.partsDone.get() + "/" + parts.size() + " 个分片已发布，"
+                    + failed.size() + " 个分片发布失败。" + String.join("；", failed.subList(0, Math.min(5, failed.size())))
+                    + (failed.size() > 5 ? " 等" : "")));
+        }
+    }
+
+    private interface PartTask { void run(LineClient[] client, int part, ObjectNode request) throws Exception; }
+
+    private static void forEachPart(TreeMap<Integer, List<String>> parts, BlockingQueue<LineClient> idle, Options options,
+                                    AtomicReference<Throwable> broken, PartTask task) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(options.threads);
+        List<Future<?>> tasks = new ArrayList<>();
+        try {
+            for (var entry : parts.entrySet()) {
+                tasks.add(pool.submit(() -> {
+                    if (broken.get() != null) return null;
+                    LineClient[] holder = { idle.take() };
+                    try {
+                        ObjectNode request = JSON.createObjectNode().put("graphId", options.graphId).put("part", entry.getKey())
+                                .put("sessionId", options.session).put("node", options.node).put("typeId", options.typeId)
+                                .put("type", options.typeName).put("generation", options.generation).put("conflict", options.conflict);
+                        ArrayNode list = request.putArray("runs");
+                        synchronized (entry.getValue()) { for (String hex : entry.getValue()) list.add(hex); }
+                        task.run(holder, entry.getKey(), request);
+                    } catch (Exception ex) {
+                        broken.compareAndSet(null, ex);
+                    } finally { idle.offer(holder[0]); }
+                    return null;
+                }));
+            }
+            await(tasks, broken);
+        } finally {
+            if (broken.get() != null) for (Future<?> pending : tasks) pending.cancel(true);
+            pool.shutdownNow();
+            pool.awaitTermination(30, TimeUnit.SECONDS);
+        }
+    }
+
+    /** 只重试这一次请求。分块按偏移覆盖、归并和发布按会话幂等，重发都是安全的。导入已经失败时不再重试。 */
+    private static JsonNode callBatch(LineClient[] client, Options options, ObjectNode request, int timeoutMs, int part, String step,
+                                      Progress progress, AtomicReference<Throwable> broken) throws Exception {
+        for (int attempt = 0; ; attempt++) {
+            if (broken.get() != null) throw new IllegalStateException(text(broken.get()));
+            try {
+                return client[0].call(request, timeoutMs);
+            } catch (Exception ex) {
+                String message = ex.getMessage() == null ? "" : ex.getMessage();
+                if (broken.get() != null || attempt >= options.retries || !retryable(message)) throw ex;
+                progress.retries.incrementAndGet();
+                System.out.println(LocalDateTime.now().format(CLOCK) + " INFO  CengyanClient - 分片 " + part + " " + step
+                        + " 失败，" + options.retryIntervalSeconds + " 秒后重试，剩余 " + (options.retries - attempt) + " 次：" + message);
+                if (options.retryIntervalSeconds > 0) Thread.sleep(options.retryIntervalSeconds * 1000L);
+                if (!client[0].open()) client[0] = reconnect(client[0], options);
+            }
+        }
+    }
+
+    /** 集群暂时忙、超时、换主、连接断开可以重试；导入内容和参数错误不重试。 */
+    static boolean retryable(String message) {
+        if (message == null || message.isBlank()) return true;
+        for (String code : List.of("FAILED", "BUSY", "QUEUE_TIMEOUT", "QUERY_TIMEOUT", "GROUP_UNAVAILABLE", "NOT_LEADER", "REPLICA_UNTRUSTED")) {
+            if (message.startsWith(code + " ") || message.equals(code)) return true;
+        }
+        return message.contains("超时") || message.contains("连接") || message.contains("RPC") || message.contains("中断");
+    }
+
+    private static LineClient reconnect(LineClient dead, Options options) throws Exception {
+        closeQuietly(dead);
+        LineClient client = LineClient.connect(options.nodes);
+        client.login(options.username, options.password);
+        return client;
     }
 
     private static void closeQuietly(LineClient client) {
@@ -207,110 +395,12 @@ public final class CengyanClient {
         catch (Exception ignored) { /* 连接关闭失败不影响已经返回的导入结果。 */ }
     }
 
-    private static void submit(ExecutorService pool, BlockingQueue<LineClient> idle, List<Future<Void>> tasks, AtomicReference<Throwable> broken,
-                               AtomicLong completed, AtomicLong skipped, AtomicLong networkRetries, Options options, JsonNode plan, String session, Path work, ImportBatches.Ready batch) throws InterruptedException {
-        if (broken.get() != null || batch.rows.isEmpty()) return;
-        LineClient worker = idle.take();
-        LineClient[] holder = { worker };
-        try {
-            tasks.add(pool.submit(() -> {
-                try {
-                    long[] counts = upload(holder, options, plan, session, work, batch.part, batch.rows, batch.primaries, networkRetries, broken);
-                    completed.addAndGet(counts[0]);
-                    skipped.addAndGet(counts[1]);
-                } catch (Exception ex) {
-                    broken.compareAndSet(null, ex);
-                } finally {
-                    idle.put(holder[0]);
-                }
-                return null;
-            }));
-        } catch (RuntimeException ex) {
-            idle.put(worker);
-            throw ex;
-        }
-    }
-
-    private static long[] upload(LineClient[] client, Options options, JsonNode plan, String session, Path work, int part, List<ImportSst.Row> rows, int primaries, AtomicLong networkRetries, AtomicReference<Throwable> broken) throws Exception {
-        Path file = Files.createTempFile(work, "part-" + part + "-", ".sst");
-        try {
-            ImportSst.write(file, rows);
-            byte[] checksum = sha256(file);
-            String hex = hex(checksum);
-            try (InputStream input = Files.newInputStream(file)) {
-                byte[] buffer = new byte[CHUNK];
-                byte[] pending = null;
-                long offset = 0;
-                int read;
-                while ((read = input.read(buffer)) >= 0) {
-                    if (pending != null) {
-                        stage(client, options, plan, session, part, hex, offset, pending, false, networkRetries, broken);
-                        offset += pending.length;
-                    }
-                    pending = java.util.Arrays.copyOf(buffer, read);
-                }
-                if (pending != null) stage(client, options, plan, session, part, hex, offset, pending, true, networkRetries, broken);
-            }
-            ObjectNode commit = JSON.createObjectNode().put("op", "importCommit").put("graphId", plan.path("graphId").asLong())
-                    .put("part", part).put("sessionId", session).put("checksum", hex).put("conflict", options.conflict)
-                    .put("generation", plan.path("generation").asLong());
-            JsonNode result = callBatch(client, options, commit, 1_800_000, part, "提交", networkRetries, broken);
-            long affected = result.path("affected").asLong();
-            if ("IMPORT_REPLACE".equals(options.conflict) || "replace".equals(options.conflict)) return new long[] {primaries, 0};
-            return new long[] {affected, Math.max(0, primaries - affected)};
-        } finally {
-            Files.deleteIfExists(file);
-        }
-    }
-
-    private static void stage(LineClient[] client, Options options, JsonNode plan, String session, int part, String checksum, long offset, byte[] data, boolean last, AtomicLong networkRetries, AtomicReference<Throwable> broken) throws Exception {
-        ObjectNode request = JSON.createObjectNode().put("op", "importStage").put("graphId", plan.path("graphId").asLong())
-                .put("part", part).put("sessionId", session).put("checksum", checksum).put("offset", offset)
-                .put("last", last).put("data", Base64.getEncoder().encodeToString(data));
-        callBatch(client, options, request, 180_000, part, "分块 " + offset, networkRetries, broken);
-    }
-
-    /** 只重试这一批的这一次请求。同一校验和的提交由服务端按请求号去重。导入已经失败时不再重试。 */
-    private static JsonNode callBatch(LineClient[] client, Options options, ObjectNode request, int timeoutMs, int part, String step, AtomicLong networkRetries, AtomicReference<Throwable> broken) throws Exception {
-        for (int attempt = 0; ; attempt++) {
-            if (broken.get() != null) throw new IllegalStateException(text(broken.get()));
-            try {
-                return client[0].call(request, timeoutMs);
-            } catch (Exception ex) {
-                String message = ex.getMessage() == null ? "" : ex.getMessage();
-                if (attempt > 0 && message.contains("导入分块偏移不连续")) return JSON.createObjectNode().put("code", "OK");
-                if (broken.get() != null || attempt >= options.retries || !retryable(message)) throw ex;
-                networkRetries.incrementAndGet();
-                System.out.println(LocalDateTime.now().format(CLOCK) + " INFO  CengyanClient - 分片 " + part + " " + step
-                        + " 失败，" + options.retryIntervalSeconds + " 秒后重试，剩余 " + (options.retries - attempt) + " 次：" + message);
-                if (options.retryIntervalSeconds > 0) Thread.sleep(options.retryIntervalSeconds * 1000L);
-                if (message.contains("关闭了连接")) client[0] = reconnect(client[0], options);
-            }
-        }
-    }
-
-    static boolean retryable(String message) {
-        if (message == null || message.isBlank()) return true;
-        if (message.startsWith("FAILED")) return true;
-        return message.contains("超时") || message.contains("连接") || message.contains("RPC") || message.contains("中断");
-    }
-
-    private static LineClient reconnect(LineClient dead, Options options) throws Exception {
-        try { dead.close(); }
-        catch (Exception ignored) { /* 旧连接已经不可用。 */ }
-        LineClient client = LineClient.connect(options.nodes);
-        client.login(options.username, options.password);
-        return client;
-    }
-
-    private static byte[] sha256(Path file) throws Exception {
-        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-        try (InputStream input = Files.newInputStream(file)) {
-            byte[] buffer = new byte[CHUNK];
-            int read;
-            while ((read = input.read(buffer)) >= 0) digest.update(buffer, 0, read);
-        }
-        return digest.digest();
+    private static ScheduledExecutorService daemonScheduler(String name) {
+        return Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, name);
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     private static void place(GraphDefinition graph, Options options, Map<String, String> record, String id,
@@ -328,35 +418,29 @@ public final class CengyanClient {
             entity.putProperties(property, propertyValue(record.getOrDefault(property, ""), field));
         }
         Entity encoded = EntityCodec.validate(entity.build(), graph);
-        byte[] key = EntityCodec.key(node, encoded.getId(), graph).toByteArray();
+        byte[] key = EntityCodec.key(encoded, graph).toByteArray();
         int part = EntityCodec.part(node, encoded.getId(), graph);
         ready.addAll(batches.add(part, new ImportSst.Row(key, encoded.toByteArray()), true));
         if (!node) {
-            byte[] edge = canonical(identity);
-            byte[] source = canonical(encoded.getSource());
-            byte[] target = canonical(encoded.getTarget());
-            long generation = graph.getGeneration();
-            ready.addAll(addAdjacency(graph, batches, true, source, edge, generation, encoded));
-            ready.addAll(addAdjacency(graph, batches, false, target, edge, generation, encoded));
+            byte[] hint = encoded.toBuilder().clearProperties().build().toByteArray();
+            for (boolean outgoing : new boolean[] {true, false}) {
+                Value endpoint = outgoing ? encoded.getSource() : encoded.getTarget();
+                byte[] adjacency = EntityCodec.adjacency(outgoing, options.typeName, endpoint, encoded.getId(), graph).toByteArray();
+                ready.addAll(batches.add(EntityCodec.part(true, endpoint, graph), new ImportSst.Row(adjacency, hint), false));
+            }
         }
     }
 
-    private static List<ImportBatches.Ready> addAdjacency(GraphDefinition graph, ImportBatches batches, boolean outgoing,
-                                                          byte[] vertex, byte[] edge, long generation, Entity encoded) {
-        Value endpoint = outgoing ? encoded.getSource() : encoded.getTarget();
-        int part = EntityCodec.part(true, endpoint, graph);
-        byte[] key = ImportSst.adjacency(outgoing, generation, vertex, edge);
-        Entity hint = encoded.toBuilder().clearProperties().build();
-        return batches.add(part, new ImportSst.Row(key, hint.toByteArray()), false);
-    }
-
     private static GraphDefinition graph(JsonNode plan, Options options) {
-        TypeDefinition.Builder type = TypeDefinition.newBuilder().setName(options.typeName).setNode(options.node)
+        int typeId = plan.path("typeId").asInt();
+        if (typeId <= 0) throw new IllegalStateException("集群没有返回类型编号，请确认 Compute 与客户端版本一致");
+        TypeDefinition.Builder type = TypeDefinition.newBuilder().setName(options.typeName).setNode(options.node).setId(typeId)
                 .setIdType(IdType.valueOf(plan.path(options.node ? "vertexIdType" : "edgeIdType").asText("STRING")));
         for (JsonNode property : plan.path("properties")) {
             type.addProperties(PropertyDefinition.newBuilder().setName(property.path("name").asText())
                     .setType(property.path("type").asText()).setNullable(property.path("nullable").asBoolean()));
         }
+        options.bind(plan);
         return GraphDefinition.newBuilder().setId(plan.path("graphId").asLong()).setName(options.graph)
                 .setPartitions(plan.path("partitions").asInt()).setGeneration(plan.path("generation").asLong())
                 .setVertexIdType(IdType.valueOf(plan.path("vertexIdType").asText()))
@@ -379,25 +463,25 @@ public final class CengyanClient {
         };
     }
 
-    private static byte[] canonical(Value value) {
-        return value.getKindCase() == Value.KindCase.INT_VALUE
-                ? new EntityId.Int64(value.getIntValue()).canonicalBytes()
-                : new EntityId.Text(value.getStringValue()).canonicalBytes();
-    }
-
     private static String required(Map<String, String> record, String column, Path file) {
         String value = record.get(column);
         if (value == null || value.isBlank()) throw new IllegalArgumentException("缺少列 " + column + (file == null ? "" : "：" + file));
         return value;
     }
 
-    private static void printProgress(long startedAt, long[] sample, AtomicLong completed, AtomicLong skipped, AtomicLong networkRetries) {
+    private static void printProgress(Progress progress) {
         long now = System.currentTimeMillis();
-        long done = completed.get();
-        long recent = recentPerSecond(done, sample[1], now - sample[0]);
-        sample[0] = now;
-        sample[1] = done;
-        System.out.println(progressLine(LocalDateTime.now(), Math.max(1, (now - startedAt) / 1000), done, skipped.get(), recent, networkRetries.get()));
+        long elapsed = Math.max(1, (now - progress.startedAt) / 1000);
+        if (progress.phase.equals("上传")) {
+            long done = progress.uploaded.get();
+            long recent = recentPerSecond(done, progress.sample[1], now - progress.sample[0]);
+            progress.sample[0] = now;
+            progress.sample[1] = done;
+            System.out.println(progressLine(LocalDateTime.now(), elapsed, done, progress.skipped.get(), recent, progress.retries.get()));
+        } else {
+            System.out.println(publishLine(LocalDateTime.now(), progress.phase, progress.partsDone.get(), progress.partsTotal,
+                    progress.published.get(), progress.retries.get()));
+        }
     }
 
     /** 最近一个进度窗口内的速度。窗口按进度间隔约 60 秒。 */
@@ -406,19 +490,27 @@ public final class CengyanClient {
         return Math.max(0, completed - previousCompleted) / seconds;
     }
 
-    static String progressLine(LocalDateTime now, long elapsedSeconds, long completed, long skipped, long recentPerSecond, long networkRetries) {
+    static String progressLine(LocalDateTime now, long elapsedSeconds, long uploaded, long skipped, long recentPerSecond, long retries) {
         long seconds = Math.max(1, elapsedSeconds);
-        return now.format(CLOCK) + " INFO  CengyanClient - 完成总条数 " + completed + " 条 | 总跳过 " + skipped
-                + " 条 | 平均导入速度 " + (completed / seconds) + " 条/s | 最新导入速度 " + recentPerSecond
-                + " 条/s | 网络异常重试次数 " + networkRetries + " 次";
+        return now.format(CLOCK) + " INFO  CengyanClient - [上传] 已上传 " + uploaded + " 条 | 总跳过 " + skipped
+                + " 条 | 平均上传速度 " + (uploaded / seconds) + " 条/s | 最新上传速度 " + recentPerSecond
+                + " 条/s | 失败重试次数 " + retries + " 次";
     }
 
-    private static void printReport(LocalDateTime started, LocalDateTime ended, long elapsedMs, long completed, long skipped, String session, String failure) {
+    static String publishLine(LocalDateTime now, String phase, int partsDone, int partsTotal, long published, long retries) {
+        return now.format(CLOCK) + " INFO  CengyanClient - [" + phase + "] 已发布分片 " + partsDone + "/" + partsTotal
+                + " | 已发布 " + published + " 条 | 失败重试次数 " + retries + " 次";
+    }
+
+    private static void printReport(LocalDateTime started, LocalDateTime ended, long elapsedMs, Progress progress, long uploadMs, long publishMs,
+                                     String session, String failure) {
         System.out.println(ended.format(CLOCK) + " INFO  CengyanClient -");
-        for (String line : reportLines(started, ended, elapsedMs, completed, skipped, session, failure)) System.out.println(line);
+        for (String line : reportLines(started, ended, elapsedMs, progress.published.get(), progress.skipped.get(), progress.replaced.get(),
+                uploadMs, publishMs, session, failure)) System.out.println(line);
     }
 
-    static List<String> reportLines(LocalDateTime started, LocalDateTime ended, long elapsedMs, long completed, long skipped, String session, String failure) {
+    static List<String> reportLines(LocalDateTime started, LocalDateTime ended, long elapsedMs, long completed, long skipped, long replaced,
+                                    long uploadMs, long publishMs, String session, String failure) {
         long seconds = Math.max(1, elapsedMs / 1000);
         List<String[]> rows = new ArrayList<>();
         rows.add(new String[] {"起始时间", started.format(CLOCK)});
@@ -426,9 +518,10 @@ public final class CengyanClient {
         rows.add(new String[] {"总耗时", seconds + " s"});
         rows.add(new String[] {"完成条数", completed + " 条"});
         rows.add(new String[] {"跳过条数", skipped + " 条"});
+        rows.add(new String[] {"覆盖条数", replaced + " 条"});
         rows.add(new String[] {"平均速度", (completed / seconds) + " 条/s"});
-        rows.add(new String[] {"唯一索引构建时间", "0 s"});
-        rows.add(new String[] {"快照分发时间", "0 s"});
+        rows.add(new String[] {"上传耗时", uploadMs / 1000 + " s"});
+        rows.add(new String[] {"归并发布耗时", publishMs / 1000 + " s"});
         rows.add(new String[] {"会话号", session});
         int width = 0;
         for (String[] row : rows) width = Math.max(width, displayWidth(row[0]));
@@ -477,13 +570,6 @@ public final class CengyanClient {
         } catch (Exception ignored) { /* 工作目录清不掉时留在当前目录，不掩盖导入结果。 */ }
     }
 
-    private static String hex(byte[] bytes) {
-        StringBuilder text = new StringBuilder(bytes.length * 2);
-        for (byte value : bytes) {
-            text.append(Character.forDigit((value >> 4) & 0xf, 16)).append(Character.forDigit(value & 0xf, 16));
-        }
-        return text.toString();
-    }
 
     static final class Options {
         final List<InetSocketAddress> nodes;
@@ -496,6 +582,7 @@ public final class CengyanClient {
         final String conflict;
         final int threads;
         final long batchBytes;
+        final long bufferBytes;
         final int retries;
         final int retryIntervalSeconds;
         final boolean node;
@@ -504,10 +591,15 @@ public final class CengyanClient {
         final String sourceColumn;
         final String targetColumn;
         final List<String> properties;
+        /** 以下由 importPlan 的结果填入。 */
+        long graphId;
+        long generation;
+        int typeId;
+        String session = "";
 
         private Options(List<InetSocketAddress> nodes, String username, String password, String graph, String fileType, String files,
-                        char delimiter, String conflict, int threads, long batchBytes, int retries, int retryIntervalSeconds, boolean node, String typeName, String idColumn,
-                        String sourceColumn, String targetColumn, List<String> properties) {
+                        char delimiter, String conflict, int threads, long batchBytes, long bufferBytes, int retries, int retryIntervalSeconds,
+                        boolean node, String typeName, String idColumn, String sourceColumn, String targetColumn, List<String> properties) {
             this.nodes = nodes;
             this.username = username;
             this.password = password;
@@ -518,6 +610,7 @@ public final class CengyanClient {
             this.conflict = conflict;
             this.threads = threads;
             this.batchBytes = batchBytes;
+            this.bufferBytes = bufferBytes;
             this.retries = retries;
             this.retryIntervalSeconds = retryIntervalSeconds;
             this.node = node;
@@ -526,6 +619,12 @@ public final class CengyanClient {
             this.sourceColumn = sourceColumn;
             this.targetColumn = targetColumn;
             this.properties = properties;
+        }
+
+        void bind(JsonNode plan) {
+            graphId = plan.path("graphId").asLong();
+            generation = plan.path("generation").asLong();
+            typeId = plan.path("typeId").asInt();
         }
 
         static Options parse(String[] args) {
@@ -554,11 +653,13 @@ public final class CengyanClient {
             if (!conflict.equals("ignore") && !conflict.equals("replace") && !conflict.equals("error")) {
                 throw new IllegalArgumentException("--unq 只能是 ignore、replace 或 error");
             }
-            int threads = Integer.parseInt(values.getOrDefault("--thread", "4"));
+            int threads = Integer.parseInt(values.getOrDefault("--thread", "8"));
             if (threads < 1) throw new IllegalArgumentException("--thread 必须是正整数");
             int batchMb = Integer.parseInt(values.getOrDefault("--batch-mb", "64"));
             if (batchMb < 1) throw new IllegalArgumentException("--batch-mb 必须是正整数");
-            int retries = Integer.parseInt(values.getOrDefault("--retry", "3"));
+            int bufferMb = Integer.parseInt(values.getOrDefault("--buffer-mb", "1024"));
+            if (bufferMb < batchMb) throw new IllegalArgumentException("--buffer-mb 不能小于 --batch-mb");
+            int retries = Integer.parseInt(values.getOrDefault("--retry", "5"));
             if (retries < 0) throw new IllegalArgumentException("--retry 不能是负数");
             int retryInterval = Integer.parseInt(values.getOrDefault("--retry-interval", "5"));
             if (retryInterval < 0) throw new IllegalArgumentException("--retry-interval 不能是负数");
@@ -574,7 +675,8 @@ public final class CengyanClient {
             }
             return new Options(addresses, required(values, "--username"), required(values, "--password"), required(values, "--graph-space"),
                     fileType, required(values, "--files"), delimiterText.charAt(0), conflict.equals("ignore") ? "IMPORT_IGNORE" : conflict.equals("replace") ? "IMPORT_REPLACE" : "IMPORT_ERROR",
-                    threads, batchMb * 1024L * 1024L, retries, retryInterval, node, type, required(values, "--id"), values.get("--src-id"), values.get("--dst-id"), properties);
+                    threads, batchMb * 1024L * 1024L, bufferMb * 1024L * 1024L, retries, retryInterval, node, type, required(values, "--id"),
+                    values.get("--src-id"), values.get("--dst-id"), properties);
         }
 
         private static String required(Map<String, String> values, String name) {
@@ -589,6 +691,8 @@ public final class CengyanClient {
         private final BufferedWriter writer;
         private final BufferedReader reader;
         private String token = "";
+        /** 请求发出后没有读完响应：连接上可能还有一条迟到的响应，不能再用。 */
+        private volatile boolean poisoned;
 
         private LineClient(Socket socket) throws Exception {
             this.socket = socket;
@@ -598,11 +702,15 @@ public final class CengyanClient {
 
         static LineClient connect(List<InetSocketAddress> nodes) throws Exception {
             Exception last = null;
-            for (InetSocketAddress node : nodes) {
+            // 从随机位置开始，多个工作连接分摊到不同的计算节点。
+            int start = java.util.concurrent.ThreadLocalRandom.current().nextInt(nodes.size());
+            for (int i = 0; i < nodes.size(); i++) {
+                InetSocketAddress node = nodes.get((start + i) % nodes.size());
                 try {
                     Socket socket = new Socket();
                     socket.connect(node, 3000);
                     socket.setTcpNoDelay(true);
+                    socket.setKeepAlive(true);
                     return new LineClient(socket);
                 } catch (Exception ex) { last = ex; }
             }
@@ -615,15 +723,32 @@ public final class CengyanClient {
             if (token.isBlank()) throw new IllegalStateException("登录没有返回令牌");
         }
 
+        boolean open() { return !poisoned && !socket.isClosed(); }
+
+        /** 等待时间比服务端超时多 30 秒；还没有响应就放弃这条连接，由调用方重连。 */
         synchronized JsonNode call(ObjectNode request, int timeoutMs) throws Exception {
+            if (!open()) throw new IllegalStateException("计算节点连接已断开");
             if (!token.isBlank()) request.put("token", token);
             request.put("requestId", UUID.randomUUID().toString());
             request.put("timeoutMs", timeoutMs);
-            writer.write(JSON.writeValueAsString(request));
-            writer.write('\n');
-            writer.flush();
-            String line = reader.readLine();
-            if (line == null) throw new IllegalStateException("计算节点关闭了连接");
+            String line;
+            try {
+                socket.setSoTimeout(timeoutMs + 30_000);
+                writer.write(JSON.writeValueAsString(request));
+                writer.write('\n');
+                writer.flush();
+                line = reader.readLine();
+            } catch (SocketTimeoutException ex) {
+                poisoned = true;
+                throw new IllegalStateException("等待计算节点响应超时（" + (timeoutMs + 30_000) / 1000 + " 秒）", ex);
+            } catch (java.io.IOException ex) {
+                poisoned = true;
+                throw new IllegalStateException("计算节点连接中断：" + ex.getMessage(), ex);
+            }
+            if (line == null) {
+                poisoned = true;
+                throw new IllegalStateException("计算节点关闭了连接");
+            }
             JsonNode response = JSON.readTree(line);
             if (!"OK".equals(response.path("code").asText())) {
                 throw new IllegalStateException(response.path("code").asText() + " " + response.path("message").asText());

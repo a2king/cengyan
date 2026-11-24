@@ -153,6 +153,9 @@ final class DroppedGraphCleanup {
         return result;
     }
 
+    /** 有新的隔离目录时立刻开始清空，不等下一轮。 */
+    void wake() { startDeleter(); }
+
     private void startDeleter() {
         if (!cleaning.compareAndSet(false, true)) return;
         try { deleter.execute(this::drain); }
@@ -167,7 +170,7 @@ final class DroppedGraphCleanup {
                 for (Path dir : dirs) {
                     if (closed.get()) return;
                     long started = System.nanoTime();
-                    node.deleteQuarantined(dir, closed::get);
+                    node.deleteQuarantined(dir, closed::get, config.droppedGraphDeleteBytesPerSecond());
                     if (!Files.exists(dir)) {
                         log.info("已清空隔离目录 {}，耗时 {} ms", dir.getFileName(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
                     }

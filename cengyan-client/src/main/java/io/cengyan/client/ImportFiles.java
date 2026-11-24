@@ -82,18 +82,21 @@ final class ImportFiles {
         return fields;
     }
 
+    /** 逐行读，不把整个文件装进内存。 */
     private static void readTsv(java.nio.file.Path file, char delimiter, Consumer<Map<String, String>> consumer) throws IOException {
-        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-        if (lines.isEmpty()) return;
-        List<String> header = split(lines.get(0), delimiter);
-        for (int row = 1; row < lines.size(); row++) {
-            if (lines.get(row).isBlank()) continue;
-            List<String> values = split(lines.get(row), delimiter);
-            Map<String, String> record = new LinkedHashMap<>();
-            for (int column = 0; column < header.size(); column++) {
-                record.put(header.get(column), column < values.size() ? values.get(column) : "");
+        try (java.io.BufferedReader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            String first = reader.readLine();
+            if (first == null) return;
+            List<String> header = split(first, delimiter);
+            for (String line = reader.readLine(); line != null; line = reader.readLine()) {
+                if (line.isBlank()) continue;
+                List<String> values = split(line, delimiter);
+                Map<String, String> record = new LinkedHashMap<>();
+                for (int column = 0; column < header.size(); column++) {
+                    record.put(header.get(column), column < values.size() ? values.get(column) : "");
+                }
+                consumer.accept(record);
             }
-            consumer.accept(record);
         }
     }
 

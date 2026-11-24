@@ -25,6 +25,7 @@ import org.apache.ratis.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.ThreadMXBean;
@@ -37,6 +38,7 @@ import java.util.concurrent.atomic.*;
 
 /** 独立 Compute：外部 JSON 接入、内部代理、单查询单执行节点、本地临时文件。 */
 public final class ComputeServer implements AutoCloseable {
+    private static final String BIND_HOST = "0.0.0.0";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Logger log = LoggerFactory.getLogger(ComputeServer.class);
     private final ComputeConfig config;
@@ -70,12 +72,20 @@ public final class ComputeServer implements AutoCloseable {
     private final HostMetrics hostMetrics = new HostMetrics();
     private record AuthCache(TokenAuthority.User user, long expiresAt) { }
     private final ConcurrentMap<String, AuthCache> authCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Object> authLocks = new ConcurrentHashMap<>();
     private volatile String publicKey;
     private record Work(ObjectNode request, boolean write, long deadline, CompletableFuture<ObjectNode> result) { }
     private volatile String maintenanceId = "";
     /** Admin commands that stay available while data writes are paused for a rolling restart. */
     private static final Set<String> MAINTENANCE_ALLOWED = Set.of("maintenanceEnter", "maintenanceExit", "maintenanceStatus",
-            "transferMetadataLeader", "drainCompute", "resumeCompute", "removeCompute", "createUser", "setPassword", "setRole", "dropUser");
+            "transferMetadataLeader", "drainCompute", "resumeCompute", "removeCompute",
+            "listUsers", "createUser", "setPassword", "setRole", "dropUser", "changePassword");
+    /** 用户管理命令，权限规则见 {@link #userCommand}。 */
+    static final Set<String> USER_COMMANDS = Set.of("listUsers", "createUser", "setPassword", "setRole", "dropUser", "changePassword");
+    /** read 级别可用的管理命令；不在这里的管理命令一律要求 admin（changePassword 在 userCommand 里只允许改自己）。 */
+    static final Set<String> READ_COMMANDS = Set.of("stats", "storage", "showNodes", "showMembers", "replicaStatus", "computeLoad", "maintenanceStatus", "changePassword");
+    /** 已登录即可的非执行操作。 */
+    static final Set<String> READ_OPS = Set.of("ping", "session", "logout", "members", "queries", "cancel", "bulkTopology", "ops.metrics", "ops.overview");
     private static final Map<String, String> MAINTENANCE_METHODS = Map.of("maintenanceEnter", "metadata.maintenance.enter",
             "maintenanceExit", "metadata.maintenance.exit", "maintenanceStatus", "metadata.maintenance.status",
             "transferMetadataLeader", "metadata.transferLeader");
@@ -90,7 +100,10 @@ public final class ComputeServer implements AutoCloseable {
         if (joining) bootstrap.add(RaftPeer.newBuilder().setId(config.nodeId()).setAddress(config.raft()).setClientAddress(config.rpc()).setAdminAddress(config.client())
                 .setStartupRole(org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER).build());
         var group = RaftGroup.valueOf(GroupIds.compute(config.clusterId()), bootstrap);
-        control = new RaftNode(config.clusterId(), config.nodeId(), config.raft().getHostString(), config.raft().getPort(), config.directory().resolve("control"), group, RaftSettings.defaults());
+        control = new RaftNode(config.clusterId(), config.nodeId(), config.raft().getHostString(), config.raft().getPort(), config.directory().resolve("control"), group,
+                new RaftSettings(16L * 1024 * 1024, 2_000, 1_000, 1,
+                        config.raftRpcTimeoutMinMs(), config.raftRpcTimeoutMaxMs(),
+                        config.raftFirstElectionTimeoutMinMs(), config.raftFirstElectionTimeoutMaxMs()), false, BIND_HOST);
         membership = new ComputeMembership(config, control);
         slots = new ExecutionSlots(config.slots(), config.nodeMemory(), config.nodeDisk(), Duration.ofSeconds(5));
         queue = new AdmissionQueue<>(config.queueCapacity(), Duration.ofMillis(config.queueTimeoutMs()));
@@ -99,7 +112,7 @@ public final class ComputeServer implements AutoCloseable {
         ingress = new ThreadPoolExecutor(ingressThreads, ingressThreads, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(config.queueCapacity()), daemon("compute-ingress"), new ThreadPoolExecutor.AbortPolicy());
         Path requests = config.directory().resolve("requests"); Files.createDirectories(requests);
         try (var files = Files.list(requests)) { for (Path old : files.toList()) if (Files.isDirectory(old) && !Files.isSymbolicLink(old)) deleteTemporary(old); }
-        rpc = new RpcServer(config.rpc(), config.clusterId(), Math.max(8 * 1024 * 1024, config.resultMaxBytes() + 1024), 128, this::internal);
+        rpc = new RpcServer(new InetSocketAddress(BIND_HOST, config.rpc().getPort()), config.clusterId(), Math.max(8 * 1024 * 1024, config.resultMaxBytes() + 1024), 128, this::internal);
         try {
             listener = new ServerBootstrap().group(boss, io).channel(NioServerSocketChannel.class)
                     .childOption(ChannelOption.TCP_NODELAY, true).childHandler(new ChannelInitializer<SocketChannel>() {
@@ -138,7 +151,7 @@ public final class ComputeServer implements AutoCloseable {
                                 @Override public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) { ctx.close(); }
                             });
                         }
-                    }).bind(config.client()).sync().channel();
+                    }).bind(new InetSocketAddress(BIND_HOST, config.client().getPort())).sync().channel();
         } catch (Exception ex) {
             rpc.close(); control.close(); storage.close(); ingress.shutdownNow(); execution.shutdownNow(); scheduler.shutdownNow();
             boss.shutdownGracefully(); io.shutdownGracefully(); throw ex;
@@ -188,12 +201,16 @@ public final class ComputeServer implements AutoCloseable {
                         JsonNode claims = verifyExternal(token);
                         ObjectNode result = ok().put("token", token).put("session", token);
                         result.set("columns", JSON.valueToTree(List.of("user", "role")));
-                        result.set("rows", JSON.valueToTree(List.of(List.of(claims.path("user").asText(), claims.path("role").asText()))));
+                        result.set("rows", JSON.valueToTree(List.of(List.of(claims.path("user").asText(),
+                                TokenAuthority.effectiveRole(claims.path("user").asText(), claims.path("role").asText())))));
                         response.complete(result); return;
                     }
                     String token = request.path("token").asText(request.path("session").asText());
                     JsonNode claims = verifyExternal(token);
-                    if (op.equals("session")) { response.complete(ok().put("session", token).put("user", claims.path("user").asText()).put("role", claims.path("role").asText())); return; }
+                    String caller = claims.path("user").asText();
+                    int callerLevel = TokenAuthority.level(caller, claims.path("role").asText());
+                    if (op.equals("session")) { response.complete(ok().put("session", token).put("user", caller)
+                            .put("role", TokenAuthority.effectiveRole(caller, claims.path("role").asText()))); return; }
                     if (op.equals("logout")) { response.complete(ok()); return; }
                     if (op.equals("ops.metrics")) { response.complete(opsMetrics()); return; }
                     if (op.equals("ops.overview")) { response.complete(opsOverview()); return; }
@@ -207,21 +224,34 @@ public final class ComputeServer implements AutoCloseable {
                         response.complete(result); return;
                     }
                     if (op.equals("queries")) {
-                        if (!claims.path("role").asText().equals("write")) throw new ClusterException("FORBIDDEN", "只读用户不能管理正在执行的查询");
+                        // 所有角色可用；非管理员只看到自己的查询。
                         var result = ok(); result.set("columns", JSON.valueToTree(List.of("queryId", "user", "elapsedMs", "query")));
                         var rows = result.putArray("rows");
-                        for (var entry : runningDescriptions.entrySet()) rows.addArray().add(entry.getKey()).add(entry.getValue().user())
-                                .add(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - entry.getValue().startedAt())).add(entry.getValue().query());
+                        for (var entry : runningDescriptions.entrySet()) {
+                            if (callerLevel < TokenAuthority.ADMIN && !entry.getValue().user().equals(caller)) continue;
+                            rows.addArray().add(entry.getKey()).add(entry.getValue().user())
+                                    .add(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - entry.getValue().startedAt())).add(entry.getValue().query());
+                        }
                         response.complete(result); return;
                     }
                     if (op.equals("cancel")) {
-                        if (!claims.path("role").asText().equals("write")) throw new ClusterException("FORBIDDEN", "只读用户不能终止查询");
-                        var pending = runningRpc.get(request.path("queryId").asText());
+                        String queryId = request.path("queryId").asText();
+                        var description = runningDescriptions.get(queryId);
+                        if (callerLevel < TokenAuthority.ADMIN && description != null && !description.user().equals(caller)) {
+                            throw new ClusterException("FORBIDDEN", "只能终止自己的查询");
+                        }
+                        // 非管理员看不到别人的查询，找不到描述时也不能取消（避免猜 queryId 取消他人查询）。
+                        var pending = callerLevel < TokenAuthority.ADMIN && description == null ? null : runningRpc.get(queryId);
                         if (pending != null) pending.cancel(true);
                         response.complete(pending == null ? JSON.createObjectNode().put("code", "QUERY_CANCELED").put("message", "没有找到该查询") : ok()); return;
                     }
+                    // 权限检查（语法错误在这里直接返回）与“是否改数据”分开：后者只用于维护模式禁写和租约。
+                    int required = requiredLevel(request);
+                    if (callerLevel < required) {
+                        throw new ClusterException("FORBIDDEN", required >= TokenAuthority.ADMIN
+                                ? "只有管理员可以执行该操作（DDL、节点维护、用户管理）" : "只读用户不能修改数据");
+                    }
                     boolean write = isWrite(request);
-                    if (write && !claims.path("role").asText().equals("write")) throw new ClusterException("FORBIDDEN", "只读用户不能修改数据");
                     if (write && !maintenanceId.isEmpty() && !MAINTENANCE_ALLOWED.contains(op.equals("admin") ? request.path("command").asText() : "")) {
                         throw ClusterMaintenance.rejected();
                     }
@@ -264,15 +294,7 @@ public final class ComputeServer implements AutoCloseable {
                             }
                             membership.remove(target); response.complete(ok()); return;
                         }
-                        if (Set.of("createUser", "setPassword", "setRole", "dropUser").contains(command)) {
-                            ObjectNode user = JSON.createObjectNode().put("user", request.path("user").asText());
-                            if (command.equals("createUser") || command.equals("setPassword")) user.put("password", request.path("password").asText());
-                            if (command.equals("createUser") || command.equals("setRole")) user.put("role", request.path("role").asText());
-                            if (command.equals("dropUser")) user.put("enabled", false);
-                            auth(command.equals("createUser") ? "auth.create" : "auth.update", user, request.path("requestId").asText(UUID.randomUUID().toString()));
-                            authCache.remove(user.path("user").asText());
-                            response.complete(ok()); return;
-                        }
+                        if (USER_COMMANDS.contains(command)) { response.complete(userCommand(command, request, caller, callerLevel)); return; }
                     }
                     request.put("_user", claims.path("user").asText());
                     request.remove(List.of("token", "session"));
@@ -283,9 +305,12 @@ public final class ComputeServer implements AutoCloseable {
                      log.info("请求开始 requestId={} op={} graph={} write={} timeoutMs={} query={}", id, op,
                              request.path("graph").asText(""), write, Math.max(1, TimeUnit.NANOSECONDS.toMillis(ingressDeadline - System.nanoTime())),
                              queryText.length() > 8192 ? queryText.substring(0, 8192) + "...(truncated)" : queryText);
-                    if (request.path("query").asText().stripLeading().toUpperCase(Locale.ROOT).startsWith("USE ")) {
+                    String leading = request.path("query").asText().stripLeading().toUpperCase(Locale.ROOT);
+                    if (leading.startsWith("USE") || leading.startsWith("SESSION")) {
                         var statements = Gql.parseAll(request.path("query").asText());
+                        // USE g / SESSION SET GRAPH g 切换当前图；USE g 查询 只让这一条请求换图。
                         if (statements.size() == 1 && statements.getFirst() instanceof Stmt.Use use) request.put("graph", use.name());
+                        if (statements.size() == 1 && statements.getFirst() instanceof Stmt.UseQuery use) request.put("graph", use.graph());
                     }
                     long timeout = request.path("remainingTimeoutMs").asLong(request.path("timeoutMs").asLong(config.executionTimeoutMs()));
                     if (timeout <= 0) timeout = config.executionTimeoutMs();
@@ -335,7 +360,7 @@ public final class ComputeServer implements AutoCloseable {
         if ("createGraph".equals(op)) return false;
         if (!"execute".equals(op)) return true;
         String text = query == null ? "" : query.stripLeading().toUpperCase(Locale.ROOT);
-        return !(text.startsWith("CREATE GRAPH") || text.startsWith("SHOW GRAPHS") || text.startsWith("SHOW ALIASES"));
+        return !(text.startsWith("CREATE GRAPH") || text.startsWith("CREATE PROPERTY GRAPH") || text.startsWith("SHOW GRAPHS") || text.startsWith("SHOW ALIASES"));
     }
 
     private final ConcurrentMap<String, SchemaLease> schemaLeases = new ConcurrentHashMap<>();
@@ -539,7 +564,7 @@ public final class ComputeServer implements AutoCloseable {
                     IdType.valueOf(request.path("vertexIdType").asText("INT64")), IdType.valueOf(request.path("edgeIdType").asText("INT64")));
             return ok().put("graphId", definition.getId()).put("rowsAffected", 1);
         }
-        if (op.equals("importPlan") || op.equals("importStage") || op.equals("importCommit") || op.equals("importHeartbeat") || op.equals("importFinish")) {
+        if (op.startsWith("import")) {
             return new BulkImport(storage, catalog, graph).handle(request);
         }
         if (op.equals("bulkTopology")) return bulkTopology(graphName);
@@ -571,8 +596,21 @@ public final class ComputeServer implements AutoCloseable {
             } catch (RuntimeException ex) { WriteTimings.finish(); throw ex; }
         }
         if (op.equals("admin") && request.path("command").asText().equals("addReplica")) {
-            storage.call(0, 0, "metadata.resize", id, ByteString.copyFrom(JSON.writeValueAsBytes(request)), Duration.ofMinutes(5));
-            return ok();
+            // 只登记作业就返回；数据复制由存储节点后台按分片推进，进度用 replicaStatus 查。
+            RpcResponse answer = storage.call(0, 0, "metadata.resize", id, ByteString.copyFrom(JSON.writeValueAsBytes(request)), Duration.ofSeconds(60));
+            ObjectNode response = ok();
+            if (!answer.getBody().isEmpty()) response.set("job", JSON.readTree(answer.getBody().toByteArray()));
+            return response;
+        }
+        if (op.equals("admin") && request.path("command").asText().equals("replicaStatus")) {
+            ObjectNode response = ok();
+            response.set("status", new ReplicaController(storage).status(graphName));
+            return response;
+        }
+        if (op.equals("admin") && request.path("command").asText().equals("cancelReplica")) {
+            ObjectNode response = ok();
+            response.set("job", JSON.valueToTree(new ReplicaController(storage).cancel(graphName)));
+            return response;
         }
         if (op.equals("admin") && Set.of("drainStorage", "removeStorage").contains(request.path("command").asText())) {
             storage.call(0, 0, request.path("command").asText().equals("drainStorage") ? "metadata.drain" : "metadata.remove", id,
@@ -633,14 +671,15 @@ public final class ComputeServer implements AutoCloseable {
             response.put("collectedAt", System.currentTimeMillis()); return response;
         }
         if (op.equals("admin") && request.path("command").asText().equals("storage")) {
-            long bytes = 0;
-            for (Node node : catalog.nodes()) {
-                RpcResponse size = storage.direct(DistributedCatalog.address(node), "node.storageSize", ByteString.EMPTY, Duration.ofSeconds(10));
-                if (!size.getCode().equals("OK")) throw new ClusterException(size.getCode(), size.getMessage());
-                bytes = Math.addExact(bytes, Long.parseLong(size.getBody().toStringUtf8()));
-            }
-            var response = ok(); response.set("columns", JSON.valueToTree(List.of("bytes")));
-            response.set("rows", JSON.valueToTree(List.of(List.of(bytes)))); return response;
+            return graphStorage(catalog.graph(graphName));
+        }
+        if (op.equals("admin") && request.path("command").asText().equals("repairGraphCreate")) {
+            GraphDefinition definition = catalog.recoverCreate(request.path("graph").asText());
+            return ok().put("graphId", definition.getId()).put("state", definition.getState()).put("rowsAffected", 1);
+        }
+        if (op.equals("admin") && request.path("command").asText().equals("forceDropGraph")) {
+            catalog.forceDropGraph(id, request.path("graph").asText());
+            return ok().put("rowsAffected", 1);
         }
         if (op.equals("execute")) {
             Map<String, Object> params = request.has("params") ? JSON.convertValue(request.get("params"), new TypeReference<>() { }) : Map.of();
@@ -653,6 +692,41 @@ public final class ComputeServer implements AutoCloseable {
             response.set("columns", JSON.valueToTree(result.columns())); response.set("rows", JSON.valueToTree(result.rows())); return response;
         }
         throw new ClusterException("UNSUPPORTED", "分布式入口尚不支持该操作：" + op);
+    }
+
+    /**
+     * 单图存储占用：该图每个分片所有副本的 RocksDB 已落盘 SST 之和。bytes 是默认 Column Family（节点、边及其邻接），
+     * indexBytes 是索引 Column Family，另列。不含 Raft 日志、快照、导入暂存、Metadata 和其他图。
+     */
+    private ObjectNode graphStorage(GraphDefinition graph) throws Exception {
+        long dataBytes = 0, indexBytes = 0;
+        int replicas = 0;
+        Map<Integer, Integer> members = new TreeMap<>();
+        for (Node node : catalog.nodes()) {
+            RpcResponse answer = storage.direct(DistributedCatalog.address(node), "ops.shards", ByteString.EMPTY, Duration.ofSeconds(10));
+            if (!answer.getCode().equals("OK")) throw new ClusterException(answer.getCode(), answer.getMessage());
+            for (JsonNode shard : JSON.readTree(answer.getBody().toByteArray()).path("shards")) {
+                if (shard.path("graphId").asLong() != graph.getId()) continue;
+                JsonNode usage = shard.get("physicalUsageBytes");
+                if (usage == null || !usage.isObject()) {
+                    throw new ClusterException("UNSUPPORTED", "Storage " + node.getNodeId() + " 未返回分片占用，请先升级 Storage");
+                }
+                for (var family = usage.fields(); family.hasNext(); ) {
+                    var entry = family.next();
+                    if (entry.getKey().startsWith("idx-")) indexBytes = Math.addExact(indexBytes, entry.getValue().asLong());
+                    else dataBytes = Math.addExact(dataBytes, entry.getValue().asLong());
+                }
+                replicas++;
+                members.merge(shard.path("partId").asInt(), shard.path("members").size(), Math::max);
+            }
+        }
+        int missing = graph.getPartitions() - members.size();
+        if (missing > 0) throw new ClusterException("GROUP_UNAVAILABLE", missing + " 个分片没有副本上报占用，不返回少算的结果");
+        int expected = members.values().stream().mapToInt(Integer::intValue).sum();
+        var response = ok(); response.set("columns", JSON.valueToTree(List.of("bytes", "indexBytes", "replicas", "expectedReplicas")));
+        response.set("rows", JSON.valueToTree(List.of(List.of(dataBytes, indexBytes, replicas, expected))));
+        response.put("storageScope", "GRAPH_REPLICA_SST");
+        response.put("collectedAt", System.currentTimeMillis()); return response;
     }
 
     private ObjectNode bulkTopology(String graphName) throws Exception {
@@ -693,11 +767,17 @@ public final class ComputeServer implements AutoCloseable {
         long now = System.nanoTime();
         AuthCache cache = authCache.get(claims.user());
         if (cache == null || now - cache.expiresAt() >= 0) {
-            JsonNode user = auth("auth.user", JSON.createObjectNode().put("user", claims.user()), "user-state");
-            if (user.isNull()) throw new ClusterException("UNAUTHENTICATED", "用户不存在或被禁用");
-            TokenAuthority.User record = JSON.treeToValue(user, TokenAuthority.User.class);
-            cache = new AuthCache(record, now + TimeUnit.SECONDS.toNanos(2));
-            authCache.put(claims.user(), cache);
+            synchronized (authLocks.computeIfAbsent(claims.user(), ignored -> new Object())) {
+                cache = authCache.get(claims.user());
+                now = System.nanoTime();
+                if (cache == null || now - cache.expiresAt() >= 0) {
+                    JsonNode user = auth("auth.user", JSON.createObjectNode().put("user", claims.user()), "user-state");
+                    if (user.isNull()) throw new ClusterException("UNAUTHENTICATED", "用户不存在或被禁用");
+                    TokenAuthority.User record = JSON.treeToValue(user, TokenAuthority.User.class);
+                    cache = new AuthCache(record, now + TimeUnit.MILLISECONDS.toNanos(config.authCacheTtlMs()));
+                    authCache.put(claims.user(), cache);
+                }
+            }
         }
         if (!cache.user().enabled() || cache.user().version() != claims.version() || !cache.user().role().equals(claims.role())) {
             throw new ClusterException("UNAUTHENTICATED", "认证版本或权限已更新，请重新登录");
@@ -739,6 +819,7 @@ public final class ComputeServer implements AutoCloseable {
             result.put("diskUsableBytes", disk.getUsableSpace());
         } catch (IOException ignored) { }
         hostMetrics.current().putNet(result);
+        HostMetrics.putMemory(result);
         return result;
     }
 
@@ -804,9 +885,105 @@ public final class ComputeServer implements AutoCloseable {
     private static CompletableFuture<RpcResponse> completed(JsonNode body) {
         return CompletableFuture.completedFuture(RpcResponse.newBuilder().setCode("OK").setBody(ByteString.copyFromUtf8(body.toString())).build());
     }
+    /**
+     * 请求需要的权限级别（docs/user-permissions.md 第 3 节）。白名单：read、write 列出允许的内容，其余一律 admin，
+     * 以后新增的语句或命令默认只有管理员能执行。语句解析失败直接抛出语法错误。
+     */
+    static int requiredLevel(JsonNode request) {
+        String op = request.path("op").asText();
+        if (READ_OPS.contains(op)) return TokenAuthority.READ;
+        if (op.equals("execute")) {
+            List<Stmt> statements;
+            try { statements = Gql.parseAll(request.path("query").asText()); }
+            catch (io.cengyan.parser.ParseException ex) { throw new ClusterException("SYNTAX", ex.getMessage() == null ? "语句无法解析" : ex.getMessage()); }
+            int level = TokenAuthority.READ;
+            for (Stmt stmt : statements) level = Math.max(level, statementLevel(stmt));
+            return level;
+        }
+        if (op.equals("admin")) return READ_COMMANDS.contains(request.path("command").asText()) ? TokenAuthority.READ : TokenAuthority.ADMIN;
+        if (op.equals("bulkInsert") || op.startsWith("import")) return TokenAuthority.WRITE;
+        return TokenAuthority.ADMIN;
+    }
+    static int statementLevel(Stmt stmt) {
+        if (stmt instanceof Stmt.UseQuery use) return statementLevel(use.body());
+        if (stmt instanceof Stmt.Composite composite) return Math.max(statementLevel(composite.left()), statementLevel(composite.right()));
+        if (stmt instanceof Stmt.Next next) return Math.max(statementLevel(next.left()), statementLevel(next.right()));
+        if (stmt instanceof Stmt.AggregateFilter filter) return statementLevel(filter.query());
+        if (stmt instanceof Stmt.Match || stmt instanceof Stmt.Select || stmt instanceof Stmt.Show || stmt instanceof Stmt.Describe
+                || stmt instanceof Stmt.Use || stmt instanceof Stmt.Explain || stmt instanceof Stmt.ExplainQuery || stmt instanceof Stmt.Call) {
+            return TokenAuthority.READ;
+        }
+        if (stmt instanceof Stmt.Insert || stmt instanceof Stmt.InsertGraph || stmt instanceof Stmt.InsertUsing
+                || stmt instanceof Stmt.Set || stmt instanceof Stmt.Delete || stmt instanceof Stmt.Mutate) {
+            return TokenAuthority.WRITE;
+        }
+        return TokenAuthority.ADMIN;
+    }
+
+    /**
+     * 用户管理（docs/user-permissions.md 第 4.1 节）。root 可以做一切；其他 admin 只能管理 read/write 用户，
+     * 不能创建、提升或操作任何 admin；changePassword 所有角色可用，只改自己并校验原密码。
+     */
+    private ObjectNode userCommand(String command, ObjectNode request, String caller, int callerLevel) throws IOException {
+        String requestId = request.path("requestId").asText(UUID.randomUUID().toString());
+        boolean root = TokenAuthority.ROOT.equals(caller);
+        if (command.equals("changePassword")) {
+            String password = request.path("password").asText("");
+            TokenAuthority.checkPassword(password);
+            try { auth("auth.login", JSON.createObjectNode().put("user", caller).put("password", request.path("current").asText("")), UUID.randomUUID().toString()); }
+            catch (ClusterException ex) {
+                if (ex.code().equals("UNAUTHENTICATED")) throw new ClusterException("UNAUTHENTICATED", "当前密码不正确");
+                throw ex;
+            }
+            auth("auth.update", JSON.createObjectNode().put("user", caller).put("password", password), requestId);
+            authCache.remove(caller);
+            return ok();
+        }
+        if (callerLevel < TokenAuthority.ADMIN) throw new ClusterException("FORBIDDEN", "只有管理员可以管理用户");
+        if (command.equals("listUsers")) {
+            var result = ok(); result.set("columns", JSON.valueToTree(List.of("user", "role", "enabled")));
+            var rows = result.putArray("rows");
+            for (JsonNode user : auth("auth.list", JSON.createObjectNode(), "user-list")) {
+                rows.addArray().add(user.path("name").asText())
+                        .add(TokenAuthority.effectiveRole(user.path("name").asText(), user.path("role").asText())).add(user.path("enabled").asBoolean(true));
+            }
+            return result;
+        }
+        String target = request.path("user").asText("");
+        if (command.equals("createUser")) {
+            String role = request.path("role").asText("");
+            if (role.equals("admin") && !root) throw new ClusterException("FORBIDDEN", "只有 root 可以创建管理员");
+            auth("auth.create", JSON.createObjectNode().put("user", target).put("password", request.path("password").asText("")).put("role", role), requestId);
+        } else {
+            JsonNode existing = auth("auth.user", JSON.createObjectNode().put("user", target), "user-state");
+            if (existing.isNull() || existing.isMissingNode()) throw new ClusterException("USER_NOT_FOUND", "用户不存在：" + target);
+            if (!root && TokenAuthority.level(target, existing.path("role").asText()) >= TokenAuthority.ADMIN) {
+                throw new ClusterException("FORBIDDEN", "只有 root 可以管理管理员账号");
+            }
+            switch (command) {
+                case "setRole" -> {
+                    String role = request.path("role").asText("");
+                    if (target.equals(TokenAuthority.ROOT)) throw new ClusterException("FORBIDDEN", "不能修改 root 的角色");
+                    if (role.equals("admin") && !root) throw new ClusterException("FORBIDDEN", "只有 root 可以把用户设为管理员");
+                    auth("auth.update", JSON.createObjectNode().put("user", target).put("role", role), requestId);
+                }
+                case "setPassword" -> auth("auth.update", JSON.createObjectNode().put("user", target).put("password", request.path("password").asText("")), requestId);
+                case "dropUser" -> {
+                    if (target.equals(TokenAuthority.ROOT)) throw new ClusterException("FORBIDDEN", "不能删除 root");
+                    if (target.equals(caller)) throw new ClusterException("FORBIDDEN", "不能删除自己");
+                    auth("auth.delete", JSON.createObjectNode().put("user", target), requestId);
+                }
+                default -> throw new ClusterException("UNSUPPORTED", "未知用户管理命令：" + command);
+            }
+        }
+        authCache.remove(target);
+        return ok();
+    }
+
+    /** 是否改数据：只用于维护模式禁写和 Schema 租约，不用于权限检查（见 {@link #requiredLevel}）。 */
     private static boolean isWrite(JsonNode request) {
         String op = request.path("op").asText();
-        if (op.equals("admin")) return !Set.of("showNodes", "showMembers", "stats", "storage", "computeLoad").contains(request.path("command").asText());
+        if (op.equals("admin")) return !Set.of("showNodes", "showMembers", "replicaStatus", "stats", "storage", "computeLoad", "listUsers").contains(request.path("command").asText());
         if (op.equals("execute")) {
             try { return Gql.parseAll(request.path("query").asText()).stream().anyMatch(stmt -> !readOnly(stmt)); }
             catch (Exception ex) { return true; }
@@ -818,6 +995,7 @@ public final class ComputeServer implements AutoCloseable {
         return (host.contains(":") ? "[" + host + "]" : host) + ":" + endpoint.getPort();
     }
     private static boolean readOnly(Stmt stmt) {
+        if (stmt instanceof Stmt.UseQuery use) return readOnly(use.body());
         if (stmt instanceof Stmt.Composite composite) return readOnly(composite.left()) && readOnly(composite.right());
         if (stmt instanceof Stmt.Next next) return readOnly(next.left()) && readOnly(next.right());
         if (stmt instanceof Stmt.AggregateFilter filter) return readOnly(filter.query());

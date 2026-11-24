@@ -2,12 +2,16 @@ package io.cengyan.distributed;
 
 import com.google.protobuf.ByteString;
 import io.cengyan.protocol.EntityId;
+import io.cengyan.protocol.EntityKeys;
 import io.cengyan.protocol.PartitionRouter;
 import io.cengyan.protocol.proto.ClusterProtocol.*;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-/** 实体主键、邻接键与值的唯一规范编码。类型不参与实体身份。 */
+/**
+ * 实体主键、邻接键与值的唯一规范编码，键的字节布局见 {@link EntityKeys}。
+ * 点的 ID 在全图唯一，由点目录登记；边的 ID 在边类型内唯一。
+ */
 public final class EntityCodec {
     private EntityCodec() { }
     public static Value value(Object value) {
@@ -34,21 +38,56 @@ public final class EntityCodec {
         if (type == IdType.STRING && value.getKindCase() == Value.KindCase.STRING_VALUE) return new EntityId.Text(value.getStringValue());
         throw new ClusterException("TYPE_MISMATCH", "实体 ID 必须符合图定义的 " + type + " 类型");
     }
-    public static ByteString key(boolean node, Value id, GraphDefinition graph) {
-        byte[] encoded = id(id, node ? graph.getVertexIdType() : graph.getEdgeIdType()).canonicalBytes();
-        return ByteString.copyFrom(ByteBuffer.allocate(9 + encoded.length).put(node ? (byte) 16 : (byte) 17).putLong(graph.getGeneration()).put(encoded).array());
+    /** @return 图里没有这个名字的点类型或边类型时为 null */
+    public static TypeDefinition type(GraphDefinition graph, boolean node, String name) {
+        if (name == null) return null;
+        for (TypeDefinition type : graph.getTypesList()) if (type.getNode() == node && type.getName().equals(name)) return type;
+        return null;
+    }
+    private static int typeId(GraphDefinition graph, boolean node, String name) {
+        TypeDefinition type = type(graph, node, name);
+        if (type == null) throw new ClusterException("TYPE_NOT_FOUND", "类型不存在：" + name);
+        if (type.getId() <= 0) throw new ClusterException("CORRUPT_DATA", "类型没有编号：" + name);
+        return type.getId();
+    }
+    private static byte[] canonical(boolean node, Value id, GraphDefinition graph) {
+        return id(id, node ? graph.getVertexIdType() : graph.getEdgeIdType()).canonicalBytes();
+    }
+    /** 点数据或边记录的键。 */
+    public static ByteString key(Entity entity, GraphDefinition graph) {
+        return key(entity.getNode(), entity.getType(), entity.getId(), graph);
+    }
+    public static ByteString key(boolean node, String type, Value id, GraphDefinition graph) {
+        return ByteString.copyFrom(EntityKeys.entity(node, graph.getGeneration(), typeId(graph, node, type), canonical(node, id, graph)));
+    }
+    /** 点目录的键：全图一份，键里没有类型，同一个 ID 只能登记给一个点类型。 */
+    public static ByteString directoryKey(Value id, GraphDefinition graph) {
+        return ByteString.copyFrom(EntityKeys.directory(graph.getGeneration(), canonical(true, id, graph)));
+    }
+    /** 点目录里的记录：类型、ID、状态和代次，没有属性。 */
+    public static Entity directoryEntry(Entity node) {
+        return Entity.newBuilder().setNode(true).setType(node.getType()).setId(node.getId())
+                .setState(node.getState()).setIncarnation(node.getIncarnation()).build();
+    }
+    /** 一个类型全部记录的键前缀。 */
+    public static ByteString typePrefix(boolean node, String type, GraphDefinition graph) {
+        return ByteString.copyFrom(EntityKeys.typePrefix(node, graph.getGeneration(), typeId(graph, node, type)));
+    }
+    /** 全部点数据或全部边记录的键前缀，不分类型。 */
+    public static ByteString kindPrefix(boolean node, GraphDefinition graph) {
+        return ByteString.copyFrom(EntityKeys.kindPrefix(node ? EntityKeys.NODE : EntityKeys.EDGE, graph.getGeneration()));
     }
     public static int part(boolean node, Value id, GraphDefinition graph) {
         return PartitionRouter.partOf(id(id, node ? graph.getVertexIdType() : graph.getEdgeIdType()), graph.getPartitions());
     }
-    public static ByteString adjacency(boolean outgoing, Value vertex, Value edge, GraphDefinition graph) {
-        byte[] v = id(vertex, graph.getVertexIdType()).canonicalBytes(), e = id(edge, graph.getEdgeIdType()).canonicalBytes();
-        return ByteString.copyFrom(ByteBuffer.allocate(13 + v.length + e.length).put(outgoing ? (byte) 18 : (byte) 19)
-                .putLong(graph.getGeneration()).putInt(v.length).put(v).put(e).array());
+    public static ByteString adjacency(boolean outgoing, String edgeType, Value vertex, Value edge, GraphDefinition graph) {
+        return ByteString.copyFrom(EntityKeys.adjacency(outgoing, graph.getGeneration(), typeId(graph, false, edgeType),
+                canonical(true, vertex, graph), canonical(false, edge, graph)));
     }
-    public static ByteString adjacencyPrefix(boolean outgoing, Value vertex, GraphDefinition graph) {
-        byte[] v = id(vertex, graph.getVertexIdType()).canonicalBytes();
-        return ByteString.copyFrom(ByteBuffer.allocate(13 + v.length).put(outgoing ? (byte) 18 : (byte) 19).putLong(graph.getGeneration()).putInt(v.length).put(v).array());
+    /** 一个点在一个边类型下的全部出边或入边。 */
+    public static ByteString adjacencyPrefix(boolean outgoing, String edgeType, Value vertex, GraphDefinition graph) {
+        return ByteString.copyFrom(EntityKeys.adjacencyPrefix(outgoing, graph.getGeneration(), typeId(graph, false, edgeType),
+                canonical(true, vertex, graph)));
     }
     public static Entity entity(ByteString bytes) {
         try { return Entity.parseFrom(bytes); }

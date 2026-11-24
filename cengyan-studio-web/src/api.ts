@@ -1,8 +1,9 @@
-import type { OpsOverview, QueryResponse, SessionInfo, StudioConfig } from './types';
+import type { OpsOverview, OpsRange, OpsSeries, QueryResponse, SessionInfo, StudioConfig, UserRow } from './types';
 
 const SESSION_KEY = 'cengyan.studio.session';
 const USER_KEY = 'cengyan.studio.user';
 const ROLE_KEY = 'cengyan.studio.role';
+const LOCAL_KEY = 'cengyan.studio.local';
 const GRAPH_KEY = 'cengyan.studio.graph';
 
 export const storage = {
@@ -10,17 +11,19 @@ export const storage = {
     const session = sessionStorage.getItem(SESSION_KEY);
     const user = sessionStorage.getItem(USER_KEY);
     const role = sessionStorage.getItem(ROLE_KEY);
-    return session && user ? { session, user, role: role || 'read' } : null;
+    return session && user ? { session, user, role: role || 'read', local: sessionStorage.getItem(LOCAL_KEY) === 'true' } : null;
   },
   saveSession(info: SessionInfo) {
     sessionStorage.setItem(SESSION_KEY, info.session);
     sessionStorage.setItem(USER_KEY, info.user);
     sessionStorage.setItem(ROLE_KEY, info.role);
+    if (info.local) sessionStorage.setItem(LOCAL_KEY, 'true'); else sessionStorage.removeItem(LOCAL_KEY);
   },
   clearSession() {
     sessionStorage.removeItem(SESSION_KEY);
     sessionStorage.removeItem(USER_KEY);
     sessionStorage.removeItem(ROLE_KEY);
+    sessionStorage.removeItem(LOCAL_KEY);
     sessionStorage.removeItem(GRAPH_KEY);
   },
   loadGraph() {
@@ -31,6 +34,22 @@ export const storage = {
     else sessionStorage.removeItem(GRAPH_KEY);
   },
 };
+
+/** 副本数调整作业。state：RUNNING、CANCELING、DONE、CANCELED、FAILED。replicas 是每个分片保留的数据份数。 */
+export interface ReplicaJob {
+  id: string; graph: string; replicas: number; previous: number; parts: number; state: string;
+  createdAt: number; updatedAt: number; message: string;
+}
+/** state：DONE、PENDING、CREATED、CATCHING_UP、UPDATING_TOPOLOGY、ROLLING_BACK、CANCELED、NOT_CHANGED。 */
+export interface ReplicaPartition {
+  part: number; members: string[]; state: string; targets?: string[]; error?: string;
+  commitIndex?: number; match?: Record<string, number>; progressError?: string;
+  /** Leader 最新本机快照大小；receivedBytes 是新副本正在接收的快照已写入字节，只在快照传输期间有。 */
+  snapshotBytes?: number; receivedBytes?: Record<string, number>;
+}
+export interface ReplicaStatus {
+  graph: string; parts: number; job?: ReplicaJob; partitions: ReplicaPartition[]; done: number; running: number; pending: number;
+}
 
 export class CengyanApi {
   private session: string;
@@ -51,10 +70,52 @@ export class CengyanApi {
       session: response.session || '',
       user: String(row[0] || user),
       role: String(row[1] || 'read'),
+      local: response.local === true,
     };
     this.session = info.session;
     this.onSession(this.session);
     return info;
+  }
+
+  /** 会话令牌：集群管理接口也用它（请求头 X-Cengyan-Session）。 */
+  token(): string {
+    return this.session;
+  }
+
+  /** 首次部署设置 root 密码后，以 root 本地会话进入。 */
+  adopt(info: SessionInfo) {
+    this.session = info.session;
+    this.onSession(this.session);
+  }
+
+  async logout(): Promise<void> {
+    try { await this.request('/api/logout', {}); } catch { /* 退出只是丢弃令牌 */ }
+    this.session = '';
+  }
+
+  async changePassword(current: string, password: string): Promise<void> {
+    await this.request('/api/password', { current, password });
+  }
+
+  async listUsers(): Promise<UserRow[]> {
+    const response = await this.request('/api/admin', { command: 'listUsers', timeoutMs: 15000 });
+    return rowsAsObjects<UserRow>(response);
+  }
+
+  async createUser(user: string, password: string, role: string): Promise<void> {
+    await this.request('/api/admin', { command: 'createUser', user, password, role, timeoutMs: 15000 });
+  }
+
+  async setRole(user: string, role: string): Promise<void> {
+    await this.request('/api/admin', { command: 'setRole', user, role, timeoutMs: 15000 });
+  }
+
+  async setPassword(user: string, password: string): Promise<void> {
+    await this.request('/api/admin', { command: 'setPassword', user, password, timeoutMs: 15000 });
+  }
+
+  async dropUser(user: string): Promise<void> {
+    await this.request('/api/admin', { command: 'dropUser', user, timeoutMs: 15000 });
   }
 
   setGraph(graph: string) {
@@ -67,7 +128,7 @@ export class CengyanApi {
   }
 
   async query(query: string, timeoutMs = 10000): Promise<QueryResponse> {
-    const use = /^\s*USE\s+([\p{L}][\p{L}\p{N}_]*)\s*;?\s*$/iu.exec(query);
+    const use = /^\s*(?:USE|SESSION\s+SET\s+(?:PROPERTY\s+)?GRAPH)\s+([\p{L}_][\p{L}\p{N}_]*)\s*;?\s*$/iu.exec(query);
     const target = use ? use[1] : usesCurrentGraph(query) ? this.graph : '';
     try {
       const response = await this.request('/api/query', { query, timeoutMs, graph: target });
@@ -104,15 +165,50 @@ export class CengyanApi {
     return this.request('/api/admin', { command: 'showMembers', graph, timeoutMs: 60000 });
   }
 
-  async addReplica(graph: string, replicas: number): Promise<QueryResponse> {
-    return this.request('/api/admin', { command: 'addReplica', graph, replicas, timeoutMs: 120000 });
+  /** 只登记副本作业就返回，数据在后台按分片同步，进度用 replicaStatus 轮询。 */
+  async addReplica(graph: string, replicas: number): Promise<ReplicaJob | undefined> {
+    const response = await this.request('/api/admin', { command: 'addReplica', graph, replicas, timeoutMs: 60000 });
+    return (response as QueryResponse & { job?: ReplicaJob }).job;
+  }
+
+  async replicaStatus(graph: string): Promise<ReplicaStatus> {
+    const response = await this.request('/api/admin', { command: 'replicaStatus', graph, timeoutMs: 30000 });
+    return (response as QueryResponse & { status: ReplicaStatus }).status;
+  }
+
+  async cancelReplica(graph: string): Promise<ReplicaJob | undefined> {
+    const response = await this.request('/api/admin', { command: 'cancelReplica', graph, timeoutMs: 30000 });
+    return (response as QueryResponse & { job?: ReplicaJob }).job;
+  }
+
+  private authHeaders(): Record<string, string> {
+    return this.session ? { 'X-Cengyan-Session': this.session } : {};
   }
 
   async opsOverview(): Promise<OpsOverview> {
-    const response = await fetch('/api/ops/overview');
+    const response = await fetch('/api/ops/overview', { headers: this.authHeaders() });
+    if (response.status === 401) this.onUnauthorized();
     const data = await response.json() as OpsOverview;
     if (!response.ok || data.code !== 'OK') throw new Error(data.message || '集群运维数据读取失败');
     return data;
+  }
+
+  /** 服务器趋势。未托管集群时 Studio 不记录趋势，返回 null。 */
+  async opsSeries(range: OpsRange): Promise<OpsSeries | null> {
+    const response = await fetch(`/api/ops/series?range=${range}`, { headers: this.authHeaders() });
+    if (response.status === 401) this.onUnauthorized();
+    if (response.status === 404) return null;
+    const data = await response.json() as OpsSeries;
+    if (!response.ok || data.code !== 'OK') throw new Error(data.message || '趋势数据读取失败');
+    return data;
+  }
+
+  async opsShards(): Promise<Array<Record<string, unknown>>> {
+    const response = await fetch('/api/ops/shards', { headers: this.authHeaders() });
+    if (response.status === 401) this.onUnauthorized();
+    const data = await response.json() as { code: string; message?: string; shards?: Array<Record<string, unknown>> };
+    if (!response.ok || data.code !== 'OK') throw new Error(data.message || '分片拓扑读取失败');
+    return data.shards || [];
   }
 
   async ping(): Promise<QueryResponse> {
@@ -151,7 +247,9 @@ export class CengyanApi {
       this.session = data.session;
       this.onSession(data.session);
     }
-    if (response.status === 401 || response.status === 403 || data.code === 'FORBIDDEN' || data.code === 'UNAUTHENTICATED') {
+    // 只有会话失效才退出登录。FORBIDDEN 是权限不够（例如 write 执行 DDL），不能把用户踢出去；
+    // 登录本身失败（密码错误）也不触发退出。
+    if (path !== '/api/login' && path !== '/api/password' && (response.status === 401 || data.code === 'UNAUTHENTICATED')) {
       this.onUnauthorized();
     }
     if (!response.ok || data.code !== 'OK') {

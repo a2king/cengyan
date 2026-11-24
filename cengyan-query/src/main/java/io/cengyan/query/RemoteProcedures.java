@@ -19,7 +19,9 @@ final class RemoteProcedures {
         Map<String, Object> args = new LinkedHashMap<>();
         for (Stmt.Arg arg : call.args()) {
             Object value = eval.eval(arg.value());
-            if (arg.name() == null && value instanceof Map<?, ?> map) map.forEach((key, val) -> args.put(String.valueOf(key), val));
+            boolean positional = arg.name() == null || arg.name().isEmpty();
+            if (positional && value instanceof Map<?, ?> map) map.forEach((key, val) -> args.put(String.valueOf(key), val));
+            else if (positional) throw new ClusterException("SYNTAX", "过程参数要写成 {名字: 值} 或传一个参数映射");
             else args.put(arg.name(), value);
         }
         String name = call.name().toLowerCase(Locale.ROOT);
@@ -127,7 +129,8 @@ final class RemoteProcedures {
         check(); List<Entity> result = new ArrayList<>();
         if (!direction.equalsIgnoreCase("in")) result.addAll(data.neighbors(graph, vertex, true, rel, scope));
         if (!direction.equalsIgnoreCase("out")) result.addAll(data.neighbors(graph, vertex, false, rel, scope));
-        LinkedHashMap<Value, Entity> unique = new LinkedHashMap<>(); result.forEach(edge -> unique.put(edge.getId(), edge));
+        // 边的 ID 只在边类型内唯一，去重要带上类型。
+        LinkedHashMap<String, Entity> unique = new LinkedHashMap<>(); result.forEach(edge -> unique.put(edge.getType() + "/" + edge.getId(), edge));
         bounded(unique.size()); return new ArrayList<>(unique.values());
     }
     private void check() { if (canceled.getAsBoolean() || Thread.currentThread().isInterrupted()) throw new ClusterException("QUERY_CANCELED", "过程已取消"); }

@@ -70,7 +70,7 @@ if (Test-Path -LiteralPath $pidFile) {
 }
 
 $process = Start-Process -FilePath $javaExe `
-    -ArgumentList @("`"-Djava.util.logging.config.file=$logConfig`"", '-jar', $jar, '--host', $studioHost, '--port', $studioPort, '--db-host', $dbHost, '--db-port', $dbPort, '--graph-max-nodes', $graphMaxNodes, '--table-max-nodes', $tableMaxNodes, '--compute-host', $computeHost, '--compute-port', $computePort, '--compute-user', $computeUser, '--compute-password', $computePassword) `
+    -ArgumentList @("`"-Djava.net.preferIPv4Stack=true`"", "`"-Djava.util.logging.config.file=$logConfig`"", '-jar', $jar, '--host', $studioHost, '--port', $studioPort, '--db-host', $dbHost, '--db-port', $dbPort, '--graph-max-nodes', $graphMaxNodes, '--table-max-nodes', $tableMaxNodes, '--compute-host', $computeHost, '--compute-port', $computePort, '--compute-user', $computeUser, '--compute-password', $computePassword) `
     -WorkingDirectory $appHome `
     -RedirectStandardOutput $logFile `
     -RedirectStandardError $errorFile `

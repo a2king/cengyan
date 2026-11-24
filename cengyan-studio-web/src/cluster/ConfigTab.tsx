@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Card, Drawer, Input, InputNumber, List, Modal, Segmented, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd';
 import type { TableProps } from 'antd';
-import { CircleHelp, History, KeyRound, Save, Undo2 } from 'lucide-react';
+import { CircleHelp, History, Save, Undo2 } from 'lucide-react';
 import { errorText, timeText } from '../clusterApi';
 import type { Catalog, CatalogEntry, Change, ConfigState, ConfigVersion, Role } from '../clusterApi';
 import type { ConsoleContext } from './ClusterConsole';
 import { configConflicts } from './configConflicts';
 
-const { Text, Paragraph } = Typography;
+const { Text } = Typography;
 type Draft = Pick<ConfigVersion, 'roleDefaults' | 'nodeOverrides'>;
 type Row = CatalogEntry & { value: string; source: 'default' | 'role' | 'node'; inherited: string };
 
@@ -131,7 +131,6 @@ export function ConfigTab({ ctx }: { ctx: ConsoleContext }) {
   if (loadError) return <Alert type="error" showIcon message="配置读取失败" description={loadError} action={<Button size="small" onClick={() => void load()}>重试</Button>} />;
   if (!catalog || !config) return <Card loading bordered={false} />;
   return <div className="cluster-tab">
-    <RootPasswordCard ctx={ctx} />
     <div className="cluster-tab-head">
       <Space wrap>
         <Segmented<Role> value={role} onChange={(v) => { setRole(v); setScope('role'); }} options={[{ value: 'STORAGE', label: '存储节点' }, { value: 'COMPUTE', label: '计算节点' }]} />
@@ -196,30 +195,4 @@ function HistoryDrawer({ ctx, open, current, onClose, onRolledBack }: { ctx: Con
       ]} />}
     </Card>}
   </Drawer>;
-}
-
-function RootPasswordCard({ ctx }: { ctx: ConsoleContext }) {
-  const [password, setPassword] = useState('');
-  const [saving, setSaving] = useState(false);
-  const set = ctx.overview.rootPasswordSet;
-  const joinedCompute = ctx.overview.nodes.some((n) => n.role === 'COMPUTE' && n.joined);
-  const save = async () => {
-    setSaving(true);
-    try { await ctx.api.setRootPassword(password); message.success('数据库 root 密码已更新'); setPassword(''); await ctx.refresh(); }
-    catch (reason) { Modal.error({ title: '修改失败', content: errorText(reason) }); }
-    finally { setSaving(false); }
-  };
-  return <Card className="info-card root-card" bordered={false}>
-    <div className="info-icon"><KeyRound size={18} /></div>
-    <div className="root-card-body">
-      <Space><Text strong>数据库 root 密码</Text>{set ? <Tag color="green">已设置</Tag> : <Tag color="orange">未设置</Tag>}</Space>
-      <Paragraph type="secondary" style={{ margin: 0 }}>{joinedCompute
-        ? '修改后立即在数据库中生效，并更新计算节点配置文件，不需要重启。'
-        : '第一个计算节点启动时用它初始化 root 账号。添加计算节点前必须设置。'}</Paragraph>
-    </div>
-    <Space.Compact>
-      <Input.Password placeholder={set ? '新密码（至少 8 位）' : '设置密码（至少 8 位）'} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" style={{ width: 240 }} />
-      <Button type="primary" disabled={password.length < 8 || Boolean(ctx.overview.activeTask)} loading={saving} onClick={() => void save()}>{set ? '修改' : '设置'}</Button>
-    </Space.Compact>
-  </Card>;
 }

@@ -100,6 +100,10 @@ final class Console {
                         node.put("role", part(parts, 2));
                     }
                     case "dropUser" -> node.put("user", part(parts, 1));
+                    case "changePassword" -> {
+                        node.put("current", part(parts, 1));
+                        node.put("password", part(parts, 2));
+                    }
                     case "addStorage", "addCompute", "setPartCount", "rebuildIndex" ->
                             throw new IllegalArgumentException("旧单机管理命令已移除；新增节点请使用角色配置启动并自动 Join，分片数建图后固定");
                     case "drainStorage", "removeStorage", "drainCompute", "removeCompute" -> node.put("nodeId", part(parts, 1));
@@ -118,8 +122,11 @@ final class Console {
             node.put("op", "execute");
             node.put("session", session);
             node.put("query", trimmed);
-            if (trimmed.matches("(?iu)^USE\\s+[\\p{L}][\\p{L}\\p{N}_]*\\s*;?$")) {
-                graph = trimmed.substring(3).trim().replaceFirst(";\\s*$", "");
+            // USE g 和 SESSION SET [PROPERTY] GRAPH g 切换当前图；USE g MATCH ... 只对这一条生效，不切换。
+            var use = java.util.regex.Pattern.compile("(?iu)^(?:USE|SESSION\\s+SET\\s+(?:PROPERTY\\s+)?GRAPH)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)\\s*;?$")
+                    .matcher(trimmed);
+            if (use.matches()) {
+                graph = use.group(1);
             }
             node.set("params", MAPPER.createObjectNode());
         }

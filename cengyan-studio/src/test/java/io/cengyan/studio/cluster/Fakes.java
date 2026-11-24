@@ -25,6 +25,7 @@ final class Fakes {
         final Map<String, byte[]> files = new ConcurrentHashMap<>();
         final List<String> commands = Collections.synchronizedList(new ArrayList<>());
         final List<String> logins = Collections.synchronizedList(new ArrayList<>());
+        final List<String> uploads = Collections.synchronizedList(new ArrayList<>());
         String rootPassword = "secret";
         boolean keyInstalled;
         /** systemctl show 的输出；默认服务正常运行。 */
@@ -60,6 +61,8 @@ final class Fakes {
 
     private static final Pattern SHA = Pattern.compile("sha256sum '([^']+)'");
     private static final Pattern COMPLETE = Pattern.compile("cat (\\S+/\\.complete) .*= '([^']+)'");
+    private static final Pattern LISTING = Pattern.compile("^cd '([^']+)' && sha256sum (.+)$");
+    private static final Pattern REUSE = Pattern.compile("for f in /opt/cengyan/releases/\\*/(\\S+); do .*!= '([^']+)'.* = ([0-9a-f]{64}) ");
 
     static final class Shell implements RemoteShell {
         private final Host host;
@@ -79,6 +82,25 @@ final class Fakes {
                 if (m.find()) host.files.put("/opt/cengyan/jdk/.cengyan-sha", (m.group(1) + "\n").getBytes(StandardCharsets.UTF_8));
                 return new Result(0, "", "");
             }
+            Matcher reuse = REUSE.matcher(command);
+            if (reuse.find()) {
+                for (var entry : new ArrayList<>(host.files.entrySet())) {
+                    if (entry.getKey().equals(reuse.group(2)) || !entry.getKey().matches("/opt/cengyan/releases/[^/]+/" + Pattern.quote(reuse.group(1)))) continue;
+                    if (!hex(entry.getValue()).equals(reuse.group(3))) continue;
+                    host.files.put(reuse.group(2), entry.getValue());
+                    return new Result(0, "", "");
+                }
+                return new Result(1, "", "");
+            }
+            Matcher listing = LISTING.matcher(command);
+            if (listing.find()) {
+                StringBuilder out = new StringBuilder();
+                for (String name : listing.group(2).split(" ")) {
+                    byte[] value = host.files.get(listing.group(1) + "/" + name);
+                    if (value != null) out.append(hex(value)).append("  ").append(name).append('\n');
+                }
+                return new Result(0, out.toString(), "");
+            }
             Matcher complete = COMPLETE.matcher(command);
             if (complete.find()) {
                 byte[] value = host.files.get(complete.group(1));
@@ -97,7 +119,10 @@ final class Fakes {
             if (command.startsWith("(ss -ltnH")) return new Result(0, "22\n", "");
             return new Result(0, "", "");
         }
-        @Override public void upload(Path local, String remote, String mode) throws IOException { host.files.put(remote, Files.readAllBytes(local)); }
+        @Override public void upload(Path local, String remote, String mode) throws IOException {
+            host.uploads.add(remote);
+            host.files.put(remote, Files.readAllBytes(local));
+        }
         @Override public void write(String remote, byte[] content, String mode) { host.files.put(remote, content); }
         @Override public void close() { }
     }
@@ -170,6 +195,66 @@ final class Fakes {
         @Override JsonNode computeAdmin(ClusterState state, ClusterState.NodeSpec via, ObjectNode request, int timeoutMs) {
             return ClusterStore.JSON.createObjectNode().put("code", "OK").set("rows", ClusterStore.JSON.createArrayNode());
         }
+    }
+
+    /** 能通过导入检查的最小节点 jar：入口类和 Linux 本地库条目齐全，marker 用来区分内容。 */
+    static Path nodeJar(Path file, ClusterState.Role role, String marker) throws IOException {
+        var manifest = new java.util.jar.Manifest();
+        manifest.getMainAttributes().put(java.util.jar.Attributes.Name.MANIFEST_VERSION, "1.0");
+        manifest.getMainAttributes().put(java.util.jar.Attributes.Name.MAIN_CLASS,
+                role == ClusterState.Role.STORAGE ? "io.cengyan.storage.StorageServer" : "io.cengyan.compute.ComputeServer");
+        Files.createDirectories(file.getParent());
+        try (var jar = new java.util.jar.JarOutputStream(Files.newOutputStream(file), manifest)) {
+            for (String name : List.of("librocksdbjni-linux64.so", "librocksdbjni-linux-aarch64.so", "libduckdb_java.so_linux_amd64",
+                    "libduckdb_java.so_linux_arm64", "marker.txt")) {
+                jar.putNextEntry(new java.util.zip.ZipEntry(name));
+                jar.write(name.equals("marker.txt") ? marker.getBytes(StandardCharsets.UTF_8) : new byte[] {1, 2, 3});
+                jar.closeEntry();
+            }
+        }
+        old(file);
+        return file;
+    }
+
+    /** 导入目录只处理已经稳定一段时间的文件，测试里把修改时间往前拨。 */
+    static Path old(Path file) throws IOException {
+        Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() - 60_000));
+        return file;
+    }
+
+    /** 写一个 ustar 格式的 tar.gz。 */
+    static Path tarGz(Path file, Map<String, byte[]> entries) throws IOException {
+        Files.createDirectories(file.getParent());
+        try (var out = new java.util.zip.GZIPOutputStream(Files.newOutputStream(file))) {
+            for (var entry : entries.entrySet()) {
+                byte[] header = new byte[512];
+                byte[] name = entry.getKey().getBytes(StandardCharsets.UTF_8);
+                System.arraycopy(name, 0, header, 0, name.length);
+                put(header, 100, "0000644");
+                put(header, 108, "0000000");
+                put(header, 116, "0000000");
+                put(header, 124, String.format("%011o", entry.getValue().length));
+                put(header, 136, String.format("%011o", 0));
+                Arrays.fill(header, 148, 156, (byte) ' ');
+                header[156] = '0';
+                put(header, 257, "ustar");
+                put(header, 263, "00");
+                int sum = 0;
+                for (byte b : header) sum += b & 0xff;
+                put(header, 148, String.format("%06o", sum));
+                header[154] = 0;
+                out.write(header);
+                out.write(entry.getValue());
+                out.write(new byte[(512 - entry.getValue().length % 512) % 512]);
+            }
+            out.write(new byte[1024]);
+        }
+        return old(file);
+    }
+
+    private static void put(byte[] header, int offset, String text) {
+        byte[] bytes = text.getBytes(StandardCharsets.US_ASCII);
+        System.arraycopy(bytes, 0, header, offset, bytes.length);
     }
 
     /** 带假节点程序和假 JDK 的 Studio 安装目录。 */

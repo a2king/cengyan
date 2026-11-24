@@ -25,7 +25,7 @@ export function TasksTab({ ctx, focus, onFocus }: { ctx: ConsoleContext; focus: 
     <Card size="small" className="task-list" title="最近任务">
       <List dataSource={tasks} locale={{ emptyText: '还没有任务' }} renderItem={(t) => <List.Item className={detail?.id === t.id ? 'history-selected' : ''} onClick={() => onFocus(t.id)}>
         <List.Item.Meta title={<Space size={6}><Text strong>{t.title}</Text><Tag color={STATUS_TEXT[t.state]?.color}>{STATUS_TEXT[t.state]?.text}</Tag></Space>}
-          description={timeText(t.createdAt)} />
+          description={`${timeText(t.createdAt)}${t.params.operator ? ` · ${t.params.operator}` : ''}`} />
       </List.Item>} />
     </Card>
     <div className="task-detail">
@@ -60,7 +60,7 @@ function TaskDetail({ ctx, task, onChanged }: { ctx: ConsoleContext; task: TaskV
     });
   };
   return <Card size="small" title={<Space>{task.title}<Tag color={STATUS_TEXT[task.state]?.color}>{STATUS_TEXT[task.state]?.text}</Tag></Space>}
-    extra={<Text type="secondary">开始于 {timeText(task.createdAt)}</Text>}>
+    extra={<Text type="secondary">{task.params.operator ? `${task.params.operator} · ` : ''}开始于 {timeText(task.createdAt)}</Text>}>
     {paused && <Alert type="warning" showIcon className="task-alert"
       message={task.state === 'INTERRUPTED' ? 'Studio 重启导致任务中断' : `第 ${task.current + 1} 步失败，任务已暂停`}
       description={<Space direction="vertical" style={{ width: '100%' }}>

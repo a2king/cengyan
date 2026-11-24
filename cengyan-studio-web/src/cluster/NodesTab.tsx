@@ -56,7 +56,7 @@ export function NodesTab({ ctx }: { ctx: ConsoleContext }) {
       <Text type="secondary">{busy ? '有任务进行中，完成后才能添加、重启或移除节点。' : '节点添加后自动启动，主节点由集群自动选举。'}</Text>
       <Space>
         <Tooltip title={noServers ? '请先添加服务器' : ''}><Button icon={<Plus size={15} />} disabled={busy || noServers} onClick={() => setAdding('STORAGE')}>添加存储节点</Button></Tooltip>
-        <Tooltip title={noServers ? '请先添加服务器' : noStorage ? '请先添加并启动一个存储节点' : !o.rootPasswordSet ? '请先在配置页设置数据库 root 密码' : ''}>
+        <Tooltip title={noServers ? '请先添加服务器' : noStorage ? '请先添加并启动一个存储节点' : !o.rootPasswordSet ? '请先设置数据库 root 密码' : ''}>
           <Button icon={<Plus size={15} />} disabled={busy || noServers || noStorage || !o.rootPasswordSet} onClick={() => setAdding('COMPUTE')}>添加计算节点</Button>
         </Tooltip>
       </Space>

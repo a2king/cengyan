@@ -63,7 +63,10 @@ class Result:
     def write_csv(self, stream):
         writer = csv.DictWriter(stream, fieldnames=self.columns)
         writer.writeheader()
-        writer.writerows(self.iter_rows())
+        for row in self.iter_rows():
+            # 列表/对象（节点、路径等）写成 JSON，而不是 Python 的 repr。
+            writer.writerow({key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
+                             for key, value in row.items()})
 
     def to_json(self, path, **kwargs):
         with open(path, "w", encoding="utf-8") as stream:

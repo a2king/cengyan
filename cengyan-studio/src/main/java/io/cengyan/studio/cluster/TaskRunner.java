@@ -41,6 +41,8 @@ public final class TaskRunner implements AutoCloseable {
     /** 根据任务类型和参数生成步骤；继续中断的任务时也用它重建步骤。 */
     public interface Planner { Plan plan(String type, Map<String, String> params); }
 
+    /** 当前 HTTP 请求的操作人，由 {@link ClusterApi} 设置；提交任务时写入参数 {@code operator}。 */
+    static final ThreadLocal<String> OPERATOR = new ThreadLocal<>();
     private static final int MAX_LOG_LINES = 400;
     private final Path dir;
     private final Planner planner;
@@ -99,7 +101,9 @@ public final class TaskRunner implements AutoCloseable {
         long now = System.currentTimeMillis();
         String id = String.format("%tY%<tm%<td-%<tH%<tM%<tS-", now) + type.replace('.', '-') + "-" + UUID.randomUUID().toString().substring(0, 4);
         List<StepView> steps = next.steps().stream().map(s -> new StepView(s.title(), StepState.PENDING, 0, 0, List.of())).toList();
-        TaskView task = new TaskView(id, type, next.title(), new LinkedHashMap<>(params), State.RUNNING, 0, "", now, now, steps);
+        Map<String, String> stored = new LinkedHashMap<>(params);
+        if (OPERATOR.get() != null) stored.put("operator", OPERATOR.get());
+        TaskView task = new TaskView(id, type, next.title(), stored, State.RUNNING, 0, "", now, now, steps);
         save(task);
         plan = next;
         cancel = false;

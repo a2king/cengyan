@@ -5,6 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# 被测的是 monorepo 里的 dev-scripts 导入脚本，不是 SDK 本身；单独检出 SDK 时跳过。
+SCRIPT = Path(__file__).parents[2] / "dev-scripts" / "data_init_node_org.py"
+
 
 def load_module():
     common = types.ModuleType("ys_bigdata_tools.common")
@@ -14,13 +17,13 @@ def load_module():
     package.common = common
     sys.modules.setdefault("ys_bigdata_tools", package)
     sys.modules.setdefault("ys_bigdata_tools.common", common)
-    path = Path(__file__).parents[2] / "dev-scripts" / "data_init_node_org.py"
-    spec = importlib.util.spec_from_file_location("org_loader", path)
+    spec = importlib.util.spec_from_file_location("org_loader", SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
+@unittest.skipUnless(SCRIPT.exists(), "需要 monorepo 中的 dev-scripts/data_init_node_org.py")
 class BulkHelperTest(unittest.TestCase):
     def test_partition_checks_target_and_submits_all_batches(self):
         module = load_module()

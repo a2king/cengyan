@@ -115,6 +115,8 @@ class ClusterOps {
         String host = ConfigRenderer.host(state, via);
         JsonNode login = computeCall(host, via.clientPort(), ClusterStore.JSON.createObjectNode().put("op", "login")
                 .put("user", "root").put("password", state.rootPassword()), 10_000);
+        if ("UNAUTHENTICATED".equals(login.path("code").asText()))
+            throw new ClusterError("ROOT_PASSWORD_STALE", "Studio 保存的 root 密码与数据库不一致（可能在命令行改过），请用 root 登录 Studio 同步密码");
         if (!"OK".equals(login.path("code").asText())) throw new ClusterError(login.path("code").asText("FAILED"), "Compute 登录失败：" + login.path("message").asText());
         request.put("token", login.path("token").asText());
         JsonNode result = computeCall(host, via.clientPort(), request, timeoutMs);

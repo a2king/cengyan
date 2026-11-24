@@ -54,13 +54,18 @@ import {
   Server,
   Table2,
   Trash2,
+  UserCog,
   Workflow,
 } from 'lucide-react';
 import { CengyanApi, escapeIdent, graphFromRows, rowsAsObjects, storage } from './api';
 import { ClusterApi } from './clusterApi';
+import type { SetupStatus } from './clusterApi';
+import { ChangePasswordModal, PASSWORD_RULES, ROLE_TEXT, UsersPage } from './UsersPage';
+import { ReplicaPanel } from './ReplicaPanel';
 import { ClusterConsole } from './cluster/ClusterConsole';
 import { QueryGraph } from './QueryGraph';
-import type { GraphSpace, IndexRow, OpsOverview, QueryResponse, SessionInfo, StatsRow, TypeProperty, TypeRow } from './types';
+import { OpsDashboard } from './ops/OpsDashboard';
+import type { GraphSpace, IndexRow, QueryResponse, SessionInfo, StatsRow, TypeProperty, TypeRow } from './types';
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
@@ -101,9 +106,14 @@ const COMPATIBILITY_MARKER = [
   CONFIRM_INPUT_SUFFIX,
 ].join('; ');
 
-function canWrite(role: string) { return role === 'write'; }
+/** 角色线性三级 read < write < admin（docs/user-permissions.md）。 */
+const ROLE_LEVEL: Record<string, number> = { read: 1, write: 2, admin: 3 };
+/** 能改数据（write 及以上）。 */
+function canWrite(role: string) { return (ROLE_LEVEL[role] ?? 0) >= ROLE_LEVEL.write; }
+/** 管理员：DDL、用户管理、集群管理。 */
+function isAdmin(role: string) { return role === 'admin'; }
 
-type NavKey = 'graph' | 'gql' | 'running' | 'ops' | 'cluster';
+type NavKey = 'graph' | 'gql' | 'running' | 'ops' | 'cluster' | 'users';
 
 const NAV_ROUTES: Record<NavKey, string> = {
   graph: '/graph',
@@ -111,7 +121,10 @@ const NAV_ROUTES: Record<NavKey, string> = {
   running: '/running',
   ops: '/ops',
   cluster: '/cluster',
+  users: '/users',
 };
+/** root 本地会话（数据库不可用）只能使用的页面。 */
+const LOCAL_NAVS: NavKey[] = ['cluster', 'ops'];
 
 function normalizePath(pathname: string) {
   const path = pathname.replace(/\/+$/, '');
@@ -164,14 +177,18 @@ export function App() {
     setOpsRefreshing(refreshing);
   }, []);
   const [clusterManaged, setClusterManaged] = useState(false);
-  const [standaloneCluster, setStandaloneCluster] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
   const clusterApiRef = useRef<ClusterApi | undefined>(undefined);
-  if (!clusterApiRef.current) clusterApiRef.current = new ClusterApi();
+  if (!clusterApiRef.current) {
+    clusterApiRef.current = new ClusterApi(() => apiRef.current?.token() || '');
+    clusterApiRef.current.onUnauthorized = () => handleLogout();
+  }
   const clusterApi = clusterApiRef.current;
   const [messageApi, contextHolder] = message.useMessage();
   const [notificationApi, notificationContextHolder] = notification.useNotification();
 
   function handleLogout() {
+    void apiRef.current?.logout();
     apiRef.current?.setGraph('');
     storage.clearSession();
     setSession(null);
@@ -181,6 +198,7 @@ export function App() {
 
   const refreshSpaces = useCallback(async () => {
     if (!session) return;
+    if (session.local) { setInitialized(true); return; }
     setLoadingSpaces(true);
     setBootError('');
     const load = async () => {
@@ -229,7 +247,7 @@ export function App() {
       if (selected && mentionsMissingGraph(error, selected)) releaseMissingGraph();
       if (listed && mentionsMissingGraph(error, selected)) return;
       setBootError(messageText);
-      if (messageText.includes('FORBIDDEN') || messageText.includes('请先登录')) {
+      if (messageText.includes('UNAUTHENTICATED') || messageText.includes('请先登录')) {
         handleLogout();
       }
     } finally {
@@ -295,10 +313,12 @@ export function App() {
     api.setGraph('');
     setCurrentGraph('');
     setGraphView('spaces');
-    const next = navFromPath(window.location.pathname) ?? 'graph';
+    let next = navFromPath(window.location.pathname) ?? 'graph';
+    if (info.local && !LOCAL_NAVS.includes(next)) next = clusterManaged ? 'cluster' : 'ops';
     setActiveNav(next);
     rememberNav(next, true);
-    messageApi.success('已连接到图数据库');
+    if (info.local) messageApi.warning('数据库不可用，已用 root 本地登录：只能使用集群管理和运维监控');
+    else messageApi.success('已连接到图数据库');
   };
 
   const selectGraph = async (name: string, openWorkspace = false) => {
@@ -330,7 +350,9 @@ export function App() {
     });
   };
 
-  const menuItems: MenuProps['items'] = [
+  const admin = Boolean(session && isAdmin(session.role));
+  const local = Boolean(session?.local);
+  const allMenuItems: MenuProps['items'] = [
     {
       key: 'graph',
       icon: <Workflow size={18} />,
@@ -341,49 +363,42 @@ export function App() {
       icon: <Code2 size={18} />,
       label: <span className="menu-label"><span>GQL</span><small>查询工作台</small></span>,
     },
-     ...(session && canWrite(session.role) ? [{
+    {
       key: 'running',
       icon: <Activity size={18} />,
-       label: <span className="menu-label"><span>运行查询</span><small>正在执行的语句</small></span>,
-     }, {
+      label: <span className="menu-label"><span>运行查询</span><small>{admin ? '所有人正在执行的语句' : '我正在执行的语句'}</small></span>,
+    }, {
       key: 'ops',
       icon: <Server size={18} />,
       label: <span className="menu-label"><span>集群运维</span><small>实时资源与拓扑</small></span>,
-    }] : []),
-    ...(clusterManaged ? [{
+    },
+    ...(clusterManaged && admin ? [{
       key: 'cluster',
       icon: <FolderKanban size={18} />,
       label: <span className="menu-label"><span>集群管理</span><small>服务器、节点与配置</small></span>,
     }] : []),
+    ...(admin && !local ? [{
+      key: 'users',
+      icon: <UserCog size={18} />,
+      label: <span className="menu-label"><span>用户管理</span><small>账号与角色</small></span>,
+    }] : []),
   ];
-
-  if (!session && standaloneCluster) {
-    return (
-      <ConfigProvider theme={themeConfig}>
-        <AntApp>
-          <Layout className="studio-layout cluster-standalone">
-            <Header className="studio-header">
-              <div className="brand-block"><div className="brand-mark"><Layers3 size={21} strokeWidth={2.2} /></div><div><div className="brand-name">层岩 <span>Studio</span></div><div className="brand-caption">集群管理</div></div></div>
-              <Button onClick={() => setStandaloneCluster(false)}>返回数据库登录</Button>
-            </Header>
-            <Content className="studio-content"><ClusterConsole api={clusterApi} /></Content>
-          </Layout>
-        </AntApp>
-      </ConfigProvider>
-    );
-  }
+  const menuItems = local ? allMenuItems.filter((item) => LOCAL_NAVS.includes(item?.key as NavKey)) : allMenuItems;
+  const visible = new Set(menuItems.map((item) => item?.key as NavKey));
 
   if (!session) {
     return (
       <ConfigProvider theme={themeConfig}>
         <AntApp>
-          <LoginPage api={api} onLogin={handleLogin} onCluster={clusterManaged ? () => setStandaloneCluster(true) : undefined} />
+          <LoginPage api={api} clusterApi={clusterApi} clusterManaged={clusterManaged} onLogin={handleLogin} />
         </AntApp>
       </ConfigProvider>
     );
   }
 
   const writable = canWrite(session.role);
+  // 没有权限的页面（例如直接打开 /users）回到可用的第一个页面。
+  const shownNav: NavKey = visible.has(activeNav) ? activeNav : (menuItems[0]?.key as NavKey) ?? 'graph';
 
   if (!initialized && loadingSpaces) {
     return (
@@ -411,7 +426,7 @@ export function App() {
             <div className="workspace-label">工作区</div>
             <Menu
               mode="inline"
-              selectedKeys={[activeNav]}
+              selectedKeys={[shownNav]}
               items={menuItems}
               onClick={({ key }) => {
                 const next = key as NavKey;
@@ -424,7 +439,8 @@ export function App() {
             <div className="sider-foot">
               <div className="user-card">
                 <Avatar size={34} icon={<CircleUserRound size={18} />} />
-                <div className="user-card-copy"><Text strong>{session.user}</Text><Text type="secondary">{writable ? '读写角色' : '只读角色'}</Text></div>
+                <div className="user-card-copy"><Text strong>{session.user}</Text><Text type="secondary">{local ? '管理员 · 本地登录' : `${ROLE_TEXT[session.role]?.text || session.role}角色`}</Text></div>
+                <Tooltip title="修改密码"><Button type="text" icon={<KeyRound size={16} />} onClick={() => setPasswordOpen(true)} aria-label="修改密码" /></Tooltip>
                 <Button type="text" icon={<LogOut size={16} />} onClick={handleLogout} aria-label={`${PERMISSION_LABEL} · 退出登录`} />
               </div>
             </div>
@@ -432,43 +448,48 @@ export function App() {
           <Layout>
             <Header className="studio-header">
               <div className="header-title">
-                  <Title level={3}>{activeNav === 'graph' ? (graphView === 'workspace' ? '图空间详情' : '图空间') : activeNav === 'running' ? '正在执行' : activeNav === 'ops' ? '集群运维' : activeNav === 'cluster' ? '集群管理' : '查询工作台'}</Title>
+                  <Title level={3}>{shownNav === 'graph' ? (graphView === 'workspace' ? '图空间详情' : '图空间') : shownNav === 'running' ? '正在执行' : shownNav === 'ops' ? '集群运维' : shownNav === 'cluster' ? '集群管理' : shownNav === 'users' ? '用户管理' : '查询工作台'}</Title>
               </div>
               <div className="header-actions">
-                {activeNav === 'gql' && (
+                {shownNav === 'gql' && (
                   <GraphSelector spaces={spaces} value={currentGraph} onChange={(name) => void selectGraph(name)} />
                 )}
-                {activeNav === 'graph' && graphView === 'workspace' && (
+                {shownNav === 'graph' && graphView === 'workspace' && (
                   <GraphSelector spaces={spaces} value={currentGraph} onChange={(name) => void selectGraph(name, true)} />
                 )}
-                {activeNav === 'graph' && graphView === 'spaces' && writable && (
+                {shownNav === 'graph' && graphView === 'spaces' && admin && (
                   <Button type="primary" icon={<Plus size={16} />} onClick={() => setCreateGraphOpen(true)}>新建空间</Button>
                 )}
-                {activeNav === 'ops' && (
+                {shownNav === 'ops' && (
                   <Button icon={<RefreshCw size={15} />} loading={opsRefreshing} onClick={() => opsRefresh.current()}>刷新</Button>
                 )}
               </div>
             </Header>
             <Content className="studio-content">
+              {local && <Alert className="page-alert" type="warning" showIcon message="数据库不可用，当前为 root 本地登录"
+                description="只能使用集群管理和运维监控。数据库恢复后请退出并重新登录，才能使用图空间、GQL 和用户管理。" />}
               {bootError && <Alert className="page-alert" type="error" showIcon message={bootError} closable onClose={() => setBootError('')} />}
-              {activeNav === 'graph' && (
+              {shownNav === 'graph' && (
                 graphView === 'spaces' ? (
-                   <SpaceOverview api={api} spaces={spaces} currentGraph={currentGraph} canWrite={writable} onRefresh={refreshSpaces} onOpen={(name) => void selectGraph(name, true)} openCreate={createGraphOpen} onCreateChange={setCreateGraphOpen} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
+                   <SpaceOverview api={api} spaces={spaces} currentGraph={currentGraph} canWrite={admin} onRefresh={refreshSpaces} onOpen={(name) => void selectGraph(name, true)} openCreate={createGraphOpen} onCreateChange={setCreateGraphOpen} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
                 ) : (
-                   <GraphWorkspace api={api} graph={currentGraph} aliases={spaces.find((space) => space.name === currentGraph)?.aliases || []} idType={spaces.find((space) => space.name === currentGraph)?.idType} idLength={spaces.find((space) => space.name === currentGraph)?.idLength} tab={graphTab} setTab={setGraphTab} canWrite={writable} onChanged={refreshSpaces} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
+                   <GraphWorkspace api={api} graph={currentGraph} aliases={spaces.find((space) => space.name === currentGraph)?.aliases || []} idType={spaces.find((space) => space.name === currentGraph)?.idType} idLength={spaces.find((space) => space.name === currentGraph)?.idLength} tab={graphTab} setTab={setGraphTab} canWrite={admin} onChanged={refreshSpaces} onCopied={() => notificationApi.success({ message: '已复制', placement: 'topRight' })} />
                 )
               )}
               {gqlMounted && (
-                <div hidden={activeNav !== 'gql'}>
-                    <GqlPage api={api} graph={currentGraph} canWrite={writable} active={activeNav === 'gql'} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} onGraphChanged={switchGraphFromEditor} onInflight={setInflightQuery} />
+                <div hidden={shownNav !== 'gql'}>
+                    <GqlPage api={api} graph={currentGraph} canWrite={writable} active={shownNav === 'gql'} graphMaxNodes={graphMaxNodes} tableMaxNodes={tableMaxNodes} onGraphChanged={switchGraphFromEditor} onInflight={setInflightQuery} />
                 </div>
               )}
-              {activeNav === 'running' && writable && <RunningQueries api={api} inflight={inflightQuery} />}
-              {activeNav === 'ops' && writable && <OpsDashboard api={api} bindRefresh={bindOpsRefresh} />}
-              {activeNav === 'cluster' && clusterManaged && <ClusterConsole api={clusterApi} />}
+              {shownNav === 'running' && <RunningQueries api={api} inflight={inflightQuery} />}
+              {shownNav === 'ops' && <OpsDashboard api={api} bindRefresh={bindOpsRefresh} />}
+              {shownNav === 'cluster' && <ClusterConsole api={clusterApi} />}
+              {shownNav === 'users' && <UsersPage api={api} me={session.user} />}
             </Content>
           </Layout>
         </Layout>
+        <ChangePasswordModal api={api} open={passwordOpen} onClose={() => setPasswordOpen(false)}
+          onChanged={() => { setPasswordOpen(false); messageApi.success('密码已修改，请用新密码重新登录'); handleLogout(); }} />
       </AntApp>
     </ConfigProvider>
   );
@@ -492,11 +513,33 @@ const themeConfig = {
   },
 };
 
-function LoginPage({ api, onLogin, onCluster }: { api: CengyanApi; onLogin: (info: SessionInfo) => Promise<void>; onCluster?: () => void }) {
+function LoginPage({ api, clusterApi, clusterManaged, onLogin }: { api: CengyanApi; clusterApi: ClusterApi; clusterManaged: boolean; onLogin: (info: SessionInfo) => Promise<void> }) {
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [pinging, setPinging] = useState(false);
+  // 托管模式首次部署：还没有 root 密码时先设置（替代原来单独的 Studio 管理员密码）。
+  const [setup, setSetup] = useState<SetupStatus | null>(null);
+  useEffect(() => {
+    if (!clusterManaged) return;
+    void clusterApi.status().then(setSetup).catch(() => setSetup(null));
+  }, [clusterApi, clusterManaged]);
+  const needsSetup = clusterManaged && setup !== null && !setup.initialized;
+
+  const initialize = async (values: { password: string; legacyPassword?: string }) => {
+    setLoading(true);
+    setError('');
+    try {
+      const created = await clusterApi.setup(values.password, values.legacyPassword || '');
+      const info: SessionInfo = { session: created.session, user: created.user, role: created.role, local: true };
+      api.adopt(info);
+      await onLogin(info);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '设置失败');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const login = async (values: { user: string; password: string }) => {
     setLoading(true);
@@ -521,8 +564,22 @@ function LoginPage({ api, onLogin, onCluster }: { api: CengyanApi; onLogin: (inf
           <Paragraph type="secondary">用清晰的空间视图管理 schema，用 GQL 直接探索数据。轻量、明亮，专注于每一次查询。</Paragraph>
           <div className="login-points"><span><Check size={15} /> 点与边类型</span><span><Check size={15} /> 索引与统计</span><span><Check size={15} /> 表格与关系图</span></div>
         </div>
-        <Card className="login-card" bordered={false}>
-          <div className="login-card-head"><div className="soft-icon"><KeyRound size={19} /></div><div><Title level={3}>登录到 Studio</Title><Text type="secondary">使用图数据库账号连接</Text></div></div>
+        {needsSetup ? <Card className="login-card" bordered={false}>
+          <div className="login-card-head"><div className="soft-icon"><KeyRound size={19} /></div><div><Title level={3}>设置 root 密码</Title><Text type="secondary">首次部署。root 是内置管理员，用来添加服务器和节点、管理用户；第一个计算节点启动时用它初始化数据库 root 账号。</Text></div></div>
+          <Form layout="vertical" onFinish={(values) => void initialize(values)}>
+            {setup?.legacy && <Form.Item name="legacyPassword" label="旧 Studio 管理员密码" extra="这台 Studio 由旧版本升级而来，请先输入原来的管理员密码确认身份。" rules={[{ required: true, message: '请输入旧管理员密码' }]}>
+              <Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="current-password" />
+            </Form.Item>}
+            <Form.Item name="password" label="root 密码" rules={PASSWORD_RULES}><Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="new-password" autoFocus /></Form.Item>
+            <Form.Item name="confirm" label="确认密码" dependencies={['password']} rules={[{ required: true, message: '请再次输入' },
+              ({ getFieldValue }) => ({ validator: (_, value) => value === getFieldValue('password') ? Promise.resolve() : Promise.reject(new Error('两次输入不一致')) })]}>
+              <Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="new-password" />
+            </Form.Item>
+            <Alert className={error ? 'login-status' : 'login-status is-empty'} type="error" showIcon icon={<AlertCircle size={16} />} message={error || ' '} />
+            <Button type="primary" htmlType="submit" size="large" block loading={loading}>设置并进入集群管理</Button>
+          </Form>
+        </Card> : <Card className="login-card" bordered={false}>
+          <div className="login-card-head"><div className="soft-icon"><KeyRound size={19} /></div><div><Title level={3}>登录到 Studio</Title><Text type="secondary">使用图数据库账号连接{clusterManaged ? '；数据库不可用时 root 仍可登录进入集群管理' : ''}</Text></div></div>
           <Form form={form} layout="vertical" initialValues={{ user: 'root', password: 'cengyan' }} onFinish={(values) => void login(values)}>
             <Form.Item name="user" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}><Input size="large" prefix={<CircleUserRound size={17} />} autoComplete="username" /></Form.Item>
             <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}><Input.Password size="large" prefix={<KeyRound size={17} />} autoComplete="current-password" /></Form.Item>
@@ -535,9 +592,8 @@ function LoginPage({ api, onLogin, onCluster }: { api: CengyanApi; onLogin: (inf
             />
             <Button type="primary" htmlType="submit" size="large" block loading={loading}>登录</Button>
             <Button className="login-check" type="text" block loading={pinging} onClick={async () => { setPinging(true); setError(''); try { await api.ping(); setError('连接正常，可以登录'); } catch (reason) { setError(reason instanceof Error ? reason.message : '连接失败'); } finally { setPinging(false); } }}>检查连接</Button>
-            {onCluster && <Button className="login-cluster" block icon={<FolderKanban size={16} />} onClick={onCluster}>集群管理：添加服务器和节点</Button>}
           </Form>
-        </Card>
+        </Card>}
       </div>
     </div>
   );
@@ -570,7 +626,7 @@ function quoteComment(comment?: string): string {
 async function typeSchemaStatement(api: CengyanApi, type: TypeRow, node: boolean): Promise<string> {
   const response = await api.query(`DESCRIBE ${node ? 'NODE' : 'REL'} TYPE ${escapeIdent(type.name)}`);
   const properties = rowsAsObjects<TypeProperty>(response)
-    .map((property) => `${escapeIdent(property.property)} ${property.type}${property.nullable ? ' NULL' : ''}${quoteComment(property.comment)}`)
+    .map((property) => `${escapeIdent(property.property)} ${property.type}${property.nullable ? ' NULL' : ' NOT NULL'}${quoteComment(property.comment)}`)
     .join(', ');
   const idClause = node ? ` ${graphKeySpec(type.idType, type.idLength).clause}` : '';
   return `CREATE ${node ? 'NODE' : 'REL'} TYPE ${escapeIdent(type.name)}${quoteComment(type.comment)}${idClause} (${properties})`;
@@ -702,56 +758,6 @@ function AliasPanel({ api, graph, aliases, canWrite, onChanged }: { api: Cengyan
   </div>;
 }
 
-type MemberRow = { nodeId: number; partId: number; vote: string };
-
-function ReplicaPanel({ api, graph, canWrite, active }: { api: CengyanApi; graph: string; canWrite: boolean; active: boolean }) {
-  const [rows, setRows] = useState<MemberRow[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [target, setTarget] = useState<number | null>(null);
-  const load = useCallback(async () => {
-    setLoading(true); setError('');
-    try {
-      const response = await api.showMembers(graph);
-      setRows(rowsAsObjects<MemberRow>(response).map((row) => ({ nodeId: Number(row.nodeId), partId: Number(row.partId), vote: String(row.vote) })));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '读取副本失败');
-    } finally {
-      setLoading(false);
-    }
-  }, [api, graph]);
-  useEffect(() => { if (active) void load(); }, [active, load]);
-  const voterCount = new Set(rows.map((row) => row.nodeId)).size;
-  const partCount = new Set(rows.map((row) => row.partId)).size;
-  const replicaCount = Math.max(0, (voterCount || 1) - 1);
-  useEffect(() => { setTarget(replicaCount); }, [replicaCount]);
-  const add = () => {
-    const replicas = target ?? replicaCount;
-    if (replicas <= replicaCount) {
-      setError('副本数只能增加。0 表示只有一份数据、没有副本。');
-      return;
-    }
-    Modal.confirm({
-      title: `把副本数增加到 ${replicas}？`,
-      content: `将保留 ${replicas + 1} 份数据。同步期间这个图空间暂时只读，查询仍然可以执行。`,
-      okText: '增加副本',
-      cancelText: '取消',
-      onOk: async () => {
-        setBusy(true); setError('');
-        try { await api.addReplica(graph, replicas + 1); message.success('副本已增加'); await load(); }
-        catch (reason) { setError(reason instanceof Error ? reason.message : '增加副本失败'); throw reason; }
-        finally { setBusy(false); }
-      },
-    });
-  };
-  return <div className="panel-stack">
-    <div className="panel-toolbar"><div><Title level={4}>副本管理</Title><Text type="secondary">{rows.length ? `当前副本数 ${replicaCount}，分片 ${partCount}。` : '打开后读取这个图空间的副本。'}0 表示只有一份数据、没有副本，最多 5。增加副本会复制数据，同步期间暂时只读。</Text></div><Space>{canWrite && <><InputNumber min={0} max={5} precision={0} value={target ?? replicaCount} onChange={(value) => { const next = typeof value === 'number' ? value : Number(value); setTarget(Number.isFinite(next) ? Math.min(5, Math.max(0, Math.trunc(next))) : 0); }} /> <Button type="primary" loading={busy} disabled={(target ?? replicaCount) <= replicaCount} onClick={add}>增加副本</Button></>}<Button type="text" icon={<RefreshCw size={15} />} onClick={() => void load()} loading={loading}>刷新</Button></Space></div>
-    {error && <Alert type="error" showIcon message={error} closable onClose={() => setError('')} />}
-    {rows.length ? <Table rowKey={(row) => `${row.nodeId}-${row.partId}`} loading={loading} pagination={false} dataSource={rows} columns={[{ title: '节点', dataIndex: 'nodeId', width: 120 }, { title: '分片', dataIndex: 'partId', width: 120 }, { title: '角色', dataIndex: 'vote', render: () => <Tag color="green">投票成员</Tag> }]} /> : !error && <Empty description={loading ? '正在读取副本' : '还没有投票成员'} />}
-  </div>;
-}
-
 function TypesPanel({ api, graph, node, canWrite, onCopied, idType, idLength }: { api: CengyanApi; graph: string; node: boolean; canWrite: boolean; onCopied: () => void; idType?: string; idLength?: number }) {
   const [rows, setRows] = useState<TypeRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -777,7 +783,7 @@ function TypesPanel({ api, graph, node, canWrite, onCopied, idType, idLength }: 
     comment?: string;
     properties?: Array<{ name?: string; type?: string; nullable?: boolean; comment?: string }>;
   }) => {
-    const props = (values.properties || []).filter((item) => item.name?.trim()).map((item) => `${escapeIdent(item.name!.trim())} ${item.type || 'STRING'}${item.nullable === false ? '' : ' NULL'}${item.comment ? ` COMMENT '${item.comment.replaceAll("'", "''")}'` : ''}`);
+    const props = (values.properties || []).filter((item) => item.name?.trim()).map((item) => `${escapeIdent(item.name!.trim())} ${item.type || 'STRING'}${item.nullable === false ? ' NOT NULL' : ' NULL'}${item.comment ? ` COMMENT '${item.comment.replaceAll("'", "''")}'` : ''}`);
     const idClause = node ? ` ${keySpec.clause}` : '';
     const comment = values.comment ? ` COMMENT '${values.comment.replaceAll("'", "''")}'` : '';
     try { await api.query(`CREATE ${kind} TYPE ${escapeIdent(values.name.trim())}${comment}${idClause} (${props.join(', ')})`); setCreateOpen(false); createForm.resetFields(); await load(); }
@@ -854,6 +860,7 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
   const [rows, setRows] = useState<StatsRow[]>([]);
   const [countedAt, setCountedAt] = useState<number | null>(null);
   const [storageBytes, setStorageBytes] = useState<number | null>(null);
+  const [storageDetail, setStorageDetail] = useState<{ indexBytes: number; replicas: number; expectedReplicas: number } | null>(null);
   const [storageAt, setStorageAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -872,11 +879,13 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
       setStorageLoading(true);
       void api.admin('storage').then((storageResult) => {
         if (sequence !== requestSequence.current) return;
-        const bytes = Number(storageResult?.rows?.[0]?.[0]);
+        const [bytes, indexBytes, replicas, expectedReplicas] = (storageResult?.rows?.[0] ?? []).map(Number);
         setStorageBytes(Number.isFinite(bytes) && bytes >= 0 ? bytes : null);
+        setStorageDetail(Number.isFinite(indexBytes) && Number.isFinite(replicas) && Number.isFinite(expectedReplicas)
+          ? { indexBytes, replicas, expectedReplicas } : null);
         setStorageAt(typeof storageResult?.collectedAt === 'number' ? storageResult.collectedAt : null);
       }).catch(() => {
-        if (sequence === requestSequence.current) setStorageBytes(null);
+        if (sequence === requestSequence.current) { setStorageBytes(null); setStorageDetail(null); }
       }).finally(() => {
         if (sequence === requestSequence.current) setStorageLoading(false);
       });
@@ -891,6 +900,7 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
     setRows([]);
     setCountedAt(null);
     setStorageBytes(null);
+    setStorageDetail(null);
     setStorageLoading(false);
     void load(false);
     return () => { requestSequence.current++; };
@@ -916,7 +926,10 @@ function StatsPanel({ api, graph }: { api: CengyanApi; graph: string }) {
       <div className="storage-icon"><Database size={19} /></div>
       <div>
         <Text strong>存储占用</Text>
-        <Text type="secondary">集群节点目录占用（含副本和日志），不是单图逻辑数据大小。</Text>
+        <Text type="secondary">本图节点和边数据已落盘大小，含全部副本；不含 Raft 日志、快照、索引和其他图。</Text>
+        {!storageLoading && storageDetail && <Text type="secondary">
+          {storageDetail.replicas} 个分片副本{storageDetail.replicas < storageDetail.expectedReplicas ? `（${storageDetail.expectedReplicas - storageDetail.replicas} 个未上报，结果偏小）` : ''}，索引另占 {formatBytes(storageDetail.indexBytes)}
+        </Text>}
         {storageAt != null && <Text type="secondary">读取时间：{formatCollectedAt(storageAt)}</Text>}
       </div>
       <Tag color="blue">{storageLoading ? '读取中' : storageBytes == null ? '未能读取' : formatBytes(storageBytes)}</Tag>
@@ -1109,215 +1122,6 @@ function RunningQueries({ api, inflight }: { api: CengyanApi; inflight: string }
   );
 }
 
-function bytesText(value?: unknown) {
-  const bytes = Number(value);
-  if (!Number.isFinite(bytes) || bytes < 0) return '—';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let index = 0;
-  let amount = bytes;
-  while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index += 1; }
-  return `${amount.toFixed(index ? 1 : 0)} ${units[index]}`;
-}
-
-function percentText(value?: unknown) {
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0 ? `${(number * 100).toFixed(1)}%` : '—';
-}
-
-function rateText(value?: unknown) {
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0 ? `${bytesText(number)}/s` : '—';
-}
-
-function fixedMetric(width: number) {
-  const style = { width, minWidth: width, maxWidth: width };
-  return { width, className: 'ops-num-col ops-fixed-col', onHeaderCell: () => ({ style }), onCell: () => ({ style }) };
-}
-
-function flexColumn(minWidth: number) {
-  const style = { minWidth };
-  return { onHeaderCell: () => ({ style }), onCell: () => ({ style }) };
-}
-
-function identityText(value: unknown) {
-  const text = typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
-  return text || '—';
-}
-
-function timeText(value: unknown) {
-  const time = Number(value);
-  if (!Number.isFinite(time) || time <= 0) return '—';
-  return new Date(time).toLocaleString();
-}
-
-function opsLabel(value: unknown) {
-  switch (String(value || '')) {
-    case 'GOOD': return '良好';
-    case 'HEALTHY': return '正常';
-    case 'REACHABLE': return '可达';
-    case 'CONCERNING': return '关注';
-    case 'DEGRADED': return '缺副本';
-    case 'BAD': return '故障';
-    case 'UNAVAILABLE': return '不可达';
-    case 'INFO': return '信息';
-    case 'WARN': return '警告';
-    case 'ERROR': return '故障';
-    default: return '等待采集';
-  }
-}
-
-function opsTag(value: unknown) {
-  const text = String(value || '');
-  const color = text === 'GOOD' || text === 'HEALTHY' || text === 'REACHABLE' || text === 'INFO' ? 'green'
-    : text === 'CONCERNING' || text === 'DEGRADED' || text === 'WARN' ? 'gold'
-      : text === 'BAD' || text === 'UNAVAILABLE' || text === 'ERROR' ? 'red' : 'default';
-  return <Tag color={color}>{opsLabel(text)}</Tag>;
-}
-
-const hostColumn: NonNullable<TableProps<Record<string, unknown>>['columns']>[number] = {
-  title: '主机名', dataIndex: 'hostname', ellipsis: true, ...flexColumn(160),
-  render: (value: unknown) => <span className="cell-ellipsis" title={identityText(value)}>{identityText(value)}</span>,
-};
-
-const nodeColumn: NonNullable<TableProps<Record<string, unknown>>['columns']>[number] = {
-  title: '节点', dataIndex: 'nodeId', ellipsis: true, ...flexColumn(128),
-  render: (value: unknown) => <span className="code-pill" title={identityText(value)}>{identityText(value)}</span>,
-};
-
-const statusColumns: NonNullable<TableProps<Record<string, unknown>>['columns']> = [
-  { title: '状态', ...fixedMetric(88), render: (_, row) => <span title={identityText(row.message)}>{opsTag(row.state)}</span> },
-  { title: '健康', ...fixedMetric(72), render: (_, row) => opsTag(row.health) },
-  { title: '最近成功', ...flexColumn(168), render: (_, row) => timeText(row.successAt) },
-];
-
-const computeResourceColumns: TableProps<Record<string, unknown>>['columns'] = [
-  hostColumn,
-  nodeColumn,
-  ...statusColumns,
-  { title: 'CPU', ...fixedMetric(72), render: (_, row) => percentText(row.systemCpuLoad) },
-  { title: '堆内存', className: 'ops-num-col', ...flexColumn(168), render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` },
-  { title: '执行中', ...fixedMetric(72), render: (_, row) => String((row.slots as Record<string, unknown> | undefined)?.active ?? '—') },
-  { title: '排队', dataIndex: 'queuePending', ...fixedMetric(64) },
-  { title: '网络流入', ...fixedMetric(128), render: (_, row) => rateText(row.netInBytesPerSec) },
-  { title: '网络流出', ...fixedMetric(128), render: (_, row) => rateText(row.netOutBytesPerSec) },
-];
-
-const storageResourceColumns: TableProps<Record<string, unknown>>['columns'] = [
-  hostColumn,
-  nodeColumn,
-  ...statusColumns,
-  { title: 'CPU', ...fixedMetric(64), render: (_, row) => percentText(row.systemCpuLoad) },
-  { title: '堆内存', className: 'ops-num-col', ...flexColumn(156), render: (_, row) => `${bytesText(row.heapUsedBytes)} / ${bytesText(row.heapMaxBytes)}` },
-  { title: '磁盘可用', ...fixedMetric(96), render: (_, row) => bytesText(row.diskUsableBytes) },
-  { title: '磁盘繁忙', ...fixedMetric(104), render: (_, row) => percentText(row.diskBusy) },
-  { title: '读取速度', ...fixedMetric(128), render: (_, row) => rateText(row.diskReadBytesPerSec) },
-  { title: '写入速度', ...fixedMetric(128), render: (_, row) => rateText(row.diskWriteBytesPerSec) },
-  { title: 'Metadata Leader', dataIndex: 'metadataLeaderId', ellipsis: true, ...flexColumn(140) },
-];
-
-function numberValue(value: unknown): number | undefined {
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0 ? number : undefined;
-}
-
-function recordValue(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' ? value as Record<string, unknown> : undefined;
-}
-
-function OpsDashboard({ api, bindRefresh }: { api: CengyanApi; bindRefresh: (refresh: () => void, refreshing: boolean) => void }) {
-  const [data, setData] = useState<OpsOverview | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const load = useCallback(async () => {
-    setLoading(true);
-    try { setData(await api.opsOverview()); setError(''); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '集群运维数据读取失败'); }
-    finally { setLoading(false); }
-  }, [api]);
-  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 5000); return () => window.clearInterval(timer); }, [load]);
-  useEffect(() => { bindRefresh(() => { void load(); }, loading); }, [bindRefresh, load, loading]);
-  const storageNodes = data?.storageNodes || [];
-  const computeNodes = data?.computeNodes || [];
-  const shards = data?.shards || [];
-  const computeSummary = useMemo(() => {
-    const nodes = computeNodes.length > 0
-      ? computeNodes
-      : data ? [data as unknown as Record<string, unknown>] : [];
-    const cpuValues = nodes.map((node) => numberValue(node.systemCpuLoad)).filter((value): value is number => value !== undefined);
-    let heapUsed = 0;
-    let heapMax = 0;
-    let diskUsable = 0;
-    let diskTotal = 0;
-    let slotsActive = 0;
-    let slotsCapacity = 0;
-    let queuePending = 0;
-    let threadCount = 0;
-    let hasHeapUsed = false;
-    let hasHeapMax = false;
-    let hasDiskUsable = false;
-    let hasDiskTotal = false;
-    let hasThreadCount = false;
-
-    nodes.forEach((node) => {
-      const slots = recordValue(node.slots);
-      const values = [
-        ['heapUsedBytes', (value: number) => { heapUsed += value; hasHeapUsed = true; }],
-        ['heapMaxBytes', (value: number) => { heapMax += value; hasHeapMax = true; }],
-        ['diskUsableBytes', (value: number) => { diskUsable += value; hasDiskUsable = true; }],
-        ['diskTotalBytes', (value: number) => { diskTotal += value; hasDiskTotal = true; }],
-        ['threadCount', (value: number) => { threadCount += value; hasThreadCount = true; }],
-      ] as const;
-      values.forEach(([key, add]) => {
-        const value = numberValue(node[key]);
-        if (value !== undefined) add(value);
-      });
-      const active = numberValue(slots?.active);
-      const capacity = numberValue(slots?.capacity);
-      const queued = numberValue(node.queuePending);
-      if (active !== undefined) slotsActive += active;
-      if (capacity !== undefined) slotsCapacity += capacity;
-      if (queued !== undefined) queuePending += queued;
-    });
-
-    return {
-      averageCpu: cpuValues.length > 0 ? cpuValues.reduce((sum, value) => sum + value, 0) / cpuValues.length : undefined,
-      heapUsed: hasHeapUsed ? heapUsed : undefined,
-      heapMax: hasHeapMax ? heapMax : undefined,
-      diskUsable: hasDiskUsable ? diskUsable : undefined,
-      diskTotal: hasDiskTotal ? diskTotal : undefined,
-      slotsActive,
-      slotsCapacity,
-      queuePending,
-      threadCount: hasThreadCount ? threadCount : undefined,
-    };
-  }, [computeNodes, data]);
-  return <div className="page-stack workspace-page ops-dashboard">
-    {error && <Alert type="warning" showIcon message="集群运维数据暂不可用" description={error} closable onClose={() => setError('')} />}
-    {data?.message && <Alert type="warning" showIcon message={data.message} />}
-    <Card className="workspace-card" bordered={false} title="集群状态">
-      <Row gutter={[16, 16]} align="middle">
-        <Col xs={24} sm={12} lg={8}><Statistic title="整体" value={opsLabel(data?.clusterHealth)} prefix={<Activity size={18} />} /></Col>
-        <Col xs={24} sm={12} lg={8}><Statistic title="最近采集" value={timeText(data?.collectedAt)} /></Col>
-        <Col xs={24} sm={12} lg={8}><Text type="secondary">监控记录保存在控制台本机，只保留 7 天</Text></Col>
-      </Row>
-    </Card>
-    <Card className="workspace-card ops-summary-card" bordered={false} title="计算资源汇总情况">
-      <Row gutter={[16, 16]}>
-        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="平均 CPU 值" value={percentText(computeSummary.averageCpu)} prefix={<Activity size={18} />} /></Card></Col>
-        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="堆内存汇总情况" value={`${bytesText(computeSummary.heapUsed)} / ${bytesText(computeSummary.heapMax)}`} prefix={<Database size={18} />} /></Card></Col>
-        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="磁盘汇总情况" value={`${bytesText(computeSummary.diskUsable)} / ${bytesText(computeSummary.diskTotal)}`} prefix={<Server size={18} />} /></Card></Col>
-        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="执行槽位情况" value={`${computeSummary.slotsActive} / ${computeSummary.slotsCapacity}`} prefix={<Gauge size={18} />} /></Card></Col>
-        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="排队情况" value={computeSummary.queuePending} prefix={<Activity size={18} />} /></Card></Col>
-        <Col xs={24} sm={12} lg={8}><Card className="metric-card"><Statistic title="线程数情况" value={computeSummary.threadCount ?? '—'} prefix={<Workflow size={18} />} /></Card></Col>
-      </Row>
-    </Card>
-    <Card className="workspace-card" bordered={false} title="Compute 节点资源"><Table className="ops-resource-table ops-compute-table" tableLayout="auto" size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={computeNodes} columns={computeResourceColumns} locale={{ emptyText: '没有 Compute 运维数据' }} /></Card>
-    <Card className="workspace-card" bordered={false} title="Storage 节点资源"><Table className="ops-resource-table ops-storage-table" tableLayout="auto" size="small" rowKey={(row) => String(row.nodeId)} pagination={false} dataSource={storageNodes} columns={storageResourceColumns} locale={{ emptyText: '没有 Storage 运维数据' }} /></Card>
-    <Card className="workspace-card" bordered={false} title="分片拓扑"><Table size="small" rowKey={(row) => `${row.graphId}-${row.partId}`} pagination={{ pageSize: 10, hideOnSinglePage: true }} dataSource={shards} columns={[{ title: '图', dataIndex: 'graph' }, { title: '分片', dataIndex: 'partId' }, { title: 'Leader', dataIndex: 'leaderId' }, { title: 'Term', dataIndex: 'term' }, { title: 'Applied Index', dataIndex: 'appliedIndex' }, { title: '副本', render: (_, row) => Array.isArray(row.members) ? (row.members as unknown[]).join(', ') : '—' }, { title: '状态', render: (_, row) => opsTag(row.state) }]} locale={{ emptyText: '没有分片拓扑数据' }} /></Card>
-    <Card className="workspace-card" bordered={false} title="最近记录"><Table size="small" rowKey={(row) => `${row.ts}-${row.event}-${row.nodeId}-${row.message}`} pagination={{ pageSize: 10, hideOnSinglePage: true }} dataSource={data?.events || []} columns={[{ title: '时间', render: (_, row) => timeText(row.ts), width: 180 }, { title: '级别', width: 80, render: (_, row) => opsTag(row.level) }, { title: '节点', dataIndex: 'nodeId', width: 140, render: (value: unknown) => identityText(value) }, { title: '说明', dataIndex: 'message' }]} locale={{ emptyText: '最近 7 天还没有状态变化' }} /></Card>
-  </div>;
-}
-
 type ScriptResult = { statement: string; response: QueryResponse; elapsedMs: number };
 
 function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, onGraphChanged, onInflight }: { api: CengyanApi; graph: string; canWrite: boolean; active: boolean; graphMaxNodes: number; tableMaxNodes: number; onGraphChanged: (name: string) => void; onInflight: (query: string) => void }) {
@@ -1360,7 +1164,8 @@ function GqlPage({ api, graph, canWrite, active, graphMaxNodes, tableMaxNodes, o
        done.push({ statement: text.trim(), response, elapsedMs: Number(response.elapsedMs ?? 0) });
        setResult([...done]);
        setQueryError('');
-      const uses = [...text.matchAll(/\bUSE\s+([A-Za-z][A-Za-z0-9_]*)/gi)];
+      // 只认单独成句的 USE g / SESSION SET GRAPH g；USE g MATCH ... 只对那一条生效，不切换当前图。
+      const uses = [...text.matchAll(/(?:^|;)\s*(?:USE|SESSION\s+SET\s+(?:PROPERTY\s+)?GRAPH)\s+([\p{L}_][\p{L}\p{N}_]*)\s*(?=;|$)/giu)];
       if (uses.length) onGraphChanged(uses[uses.length - 1][1]);
       localStorage.setItem('cengyan.studio.last-query', text);
     } catch (reason) {

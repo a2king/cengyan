@@ -26,6 +26,8 @@ public final class RaftNode implements AutoCloseable {
     private final RaftGroupId metadataGroupId;
     private final RaftServer server;
     private final RaftProperties properties;
+    /** 客户端请求用的配置：节点间请求超时调大了，客户端仍按 Ratis 默认超时换节点重试。 */
+    private final RaftProperties clientProperties;
     private final FileChannel ownerChannel;
     private final java.nio.channels.FileLock ownerLock;
     private final ConcurrentHashMap<RaftGroupId, RocksStateMachine> machines = new ConcurrentHashMap<>();
@@ -36,11 +38,20 @@ public final class RaftNode implements AutoCloseable {
     }
     public RaftNode(String clusterId, String nodeId, String host, int port, Path directory,
                     RaftGroup bootstrapGroup, RaftSettings settings, boolean metadataOnly) throws IOException {
+        this(clusterId, nodeId, host, port, directory, bootstrapGroup, settings, metadataOnly, host);
+    }
+
+    /**
+     * 创建 Raft 节点，host 用于成员通告，bindHost 只用于本地监听。
+     * 两者分开后可以监听所有网卡，同时让其它节点连接固定的可达地址。
+     */
+    public RaftNode(String clusterId, String nodeId, String host, int port, Path directory,
+                    RaftGroup bootstrapGroup, RaftSettings settings, boolean metadataOnly, String bindHost) throws IOException {
         this.clusterId = clusterId;
         this.storageRoot = directory.toAbsolutePath().normalize();
         this.metadataGroupId = bootstrapGroup.getGroupId();
         if (clusterId == null || clusterId.isBlank() || nodeId == null || nodeId.isBlank()
-                || host == null || host.isBlank() || port < 1 || port > 65535) {
+                || host == null || host.isBlank() || bindHost == null || bindHost.isBlank() || port < 1 || port > 65535) {
             throw new IllegalArgumentException("Raft 节点身份或地址无效");
         }
         if (bootstrapGroup.getPeer(RaftPeerId.valueOf(nodeId)) == null) {
@@ -68,7 +79,9 @@ public final class RaftNode implements AutoCloseable {
                 }
             }
         }
-        properties = settings.properties(root.resolve("raft"), host, port);
+        properties = settings.properties(root.resolve("raft"), bindHost, port);
+        clientProperties = new RaftProperties(properties);
+        org.apache.ratis.client.RaftClientConfigKeys.Rpc.setRequestTimeout(clientProperties, RaftSettings.CLIENT_REQUEST_TIMEOUT);
         Properties operations = new Properties();
         if (Files.exists(root.resolve("operations.properties"))) {
             try (var input = Files.newInputStream(root.resolve("operations.properties"))) { operations.load(input); }
@@ -132,9 +145,18 @@ public final class RaftNode implements AutoCloseable {
     }
 
     public RaftClient client(RaftGroup group) {
-        return RaftClient.newBuilder().setRaftGroup(group).setProperties(properties)
+        return RaftClient.newBuilder().setRaftGroup(group).setProperties(clientProperties)
                 .setRetryPolicy(RetryPolicies.retryUpToMaximumCountWithFixedSleep(30,
                         TimeDuration.valueOf(100, TimeUnit.MILLISECONDS))).build();
+    }
+
+    /**
+     * 成员变更用的客户端：Ratis 要先把新成员追平才确认，大分片可能要几十分钟。一直重试（同一请求号，服务端去重），
+     * 由调用方关闭客户端来取消。
+     */
+    public RaftClient patientClient(RaftGroup group) {
+        return RaftClient.newBuilder().setRaftGroup(group).setProperties(clientProperties)
+                .setRetryPolicy(RetryPolicies.retryForeverWithSleep(TimeDuration.valueOf(1, TimeUnit.SECONDS))).build();
     }
 
     /** 先拒绝这个分片上新的导入和查询，再进入卸下。重复调用没有副作用。 */
@@ -166,7 +188,10 @@ public final class RaftNode implements AutoCloseable {
         }
         if (hosts(groupId)) {
             var division = server.getDivision(groupId);
-            var group = RaftGroup.valueOf(groupId, division.getRaftConf().getAllPeers());
+            // 已被移出这个分片的节点，本地配置里没有自己；请求发给本机，所以总要带上本机。
+            var peers = new ArrayList<>(division.getRaftConf().getAllPeers());
+            if (peers.stream().noneMatch(peer -> peer.getId().equals(server.getId()))) peers.add(server.getPeer());
+            var group = RaftGroup.valueOf(groupId, peers);
             try (var client = client(group)) {
                 // 两个 false：关闭状态机并从 Server 摘除，不在这次调用里递归删文件。
                 var reply = client.getGroupManagementApi(server.getId()).remove(groupId, false, false);
@@ -226,6 +251,15 @@ public final class RaftNode implements AutoCloseable {
 
     /** 立刻清空一个已关闭的隔离目录。{@code stop} 为真时保留剩余文件，下次继续。 */
     public void deleteQuarantined(Path directory, BooleanSupplier stop) throws IOException, InterruptedException {
+        deleteQuarantined(directory, stop, Long.MAX_VALUE);
+    }
+
+    /**
+     * 删除已卸载目录。删除文件只改元数据，不读写文件内容，所以默认不限速；
+     * {@code bytesPerSecond > 0} 时按文件大小摊开删除，只用于开启了在线 discard、
+     * 大文件 unlink 会引起 TRIM 尖峰的磁盘。{@code <= 0} 表示不限速。
+     */
+    public void deleteQuarantined(Path directory, BooleanSupplier stop, long bytesPerSecond) throws IOException, InterruptedException {
         Path raftRoot = raftRoot();
         Path target = directory.toAbsolutePath().normalize();
         if (target.getParent() == null || !target.getParent().equals(raftRoot)) throw new IOException("拒绝删除 Raft 根目录之外的路径");
@@ -236,7 +270,8 @@ public final class RaftNode implements AutoCloseable {
             forgetPending(name);
             return;
         }
-        deleteTree(target, stop == null ? () -> false : stop);
+        boolean limited = bytesPerSecond > 0 && bytesPerSecond != Long.MAX_VALUE;
+        deleteTree(target, stop == null ? () -> false : stop, limited ? new DeleteBudget(bytesPerSecond) : null);
         if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) forgetPending(name);
     }
 
@@ -338,7 +373,22 @@ public final class RaftNode implements AutoCloseable {
 
     private Path raftRoot() { return storageRoot.resolve("raft").toAbsolutePath().normalize(); }
 
-    private static void deleteTree(Path path, BooleanSupplier stop) throws IOException, InterruptedException {
+    private static final class DeleteBudget {
+        private final long bytesPerSecond;
+        private final long startedAt = System.nanoTime();
+        private long bytes;
+        DeleteBudget(long bytesPerSecond) { this.bytesPerSecond = bytesPerSecond; }
+        synchronized void add(long count) throws InterruptedException {
+            long next = Math.addExact(bytes, Math.max(0, count));
+            // 用 double 计算目标时刻：按整数 next * 1e9 计算，超过约 9.2 GB 就会溢出。
+            long expectedNanos = (long) ((double) next * 1_000_000_000L / bytesPerSecond);
+            long wait = expectedNanos - (System.nanoTime() - startedAt);
+            if (wait > 0) TimeUnit.NANOSECONDS.sleep(wait);
+            bytes = next;
+        }
+    }
+
+    private static void deleteTree(Path path, BooleanSupplier stop, DeleteBudget budget) throws IOException, InterruptedException {
         if (stop.getAsBoolean() || Thread.currentThread().isInterrupted()) throw new InterruptedException();
         if (Files.isSymbolicLink(path)) {
             Files.deleteIfExists(path);
@@ -347,10 +397,16 @@ public final class RaftNode implements AutoCloseable {
         if (Files.isDirectory(path)) {
             List<Path> children;
             try (var listed = Files.list(path)) { children = listed.toList(); }
-            for (Path child : children) deleteTree(child, stop);
+            for (Path child : children) deleteTree(child, stop, budget);
             if (stop.getAsBoolean()) throw new InterruptedException();
             Files.deleteIfExists(path);
             return;
+        }
+        if (budget != null) {
+            long size = 0;
+            try { if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) size = Files.size(path); }
+            catch (IOException ignored) { }
+            budget.add(size);
         }
         Files.deleteIfExists(path);
     }

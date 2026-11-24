@@ -38,7 +38,14 @@ class ImportFilesTest {
         zero[zero.length - 2] = "--batch-mb";
         zero[zero.length - 1] = "0";
         assertThrows(IllegalArgumentException.class, () -> CengyanClient.Options.parse(zero));
-        assertEquals(3, CengyanClient.Options.parse(base).retries);
+        assertEquals(1024L * 1024 * 1024, CengyanClient.Options.parse(base).bufferBytes);
+        String[] tooSmall = java.util.Arrays.copyOf(base, base.length + 4);
+        tooSmall[tooSmall.length - 4] = "--batch-mb";
+        tooSmall[tooSmall.length - 3] = "128";
+        tooSmall[tooSmall.length - 2] = "--buffer-mb";
+        tooSmall[tooSmall.length - 1] = "64";
+        assertThrows(IllegalArgumentException.class, () -> CengyanClient.Options.parse(tooSmall), "总缓冲不能小于单个分片的批次");
+        assertEquals(5, CengyanClient.Options.parse(base).retries);
         assertEquals(5, CengyanClient.Options.parse(base).retryIntervalSeconds);
         String[] retry = java.util.Arrays.copyOf(base, base.length + 4);
         retry[retry.length - 4] = "--retry";
@@ -48,7 +55,11 @@ class ImportFilesTest {
         assertEquals(2, CengyanClient.Options.parse(retry).retries);
         assertEquals(10, CengyanClient.Options.parse(retry).retryIntervalSeconds);
         assertTrue(CengyanClient.retryable("FAILED Storage 响应中断，写入状态可能未知"));
+        assertTrue(CengyanClient.retryable("BUSY Storage 准入队列已满，尚未提交"));
+        assertTrue(CengyanClient.retryable("GROUP_UNAVAILABLE 副本 storage-2 没有响应"));
+        assertTrue(CengyanClient.retryable("等待计算节点响应超时（210 秒）"));
         assertFalse(CengyanClient.retryable("KEY_EXISTS 导入主键已存在"));
+        assertFalse(CengyanClient.retryable("ID_CONFLICT 点 ID 已经属于点类型 Org，点 ID 在全图唯一"));
         assertFalse(CengyanClient.retryable("INVALID_ARGUMENT 属性未定义"));
     }
 
@@ -82,10 +93,12 @@ class ImportFilesTest {
     }
 
     @Test void progressUsesInfoTimestamp() {
-        assertEquals("2026-11-12 12:39:01 INFO  CengyanClient - 完成总条数 0 条 | 总跳过 0 条 | 平均导入速度 0 条/s | 最新导入速度 0 条/s | 网络异常重试次数 0 次",
+        assertEquals("2026-11-12 12:39:01 INFO  CengyanClient - [上传] 已上传 0 条 | 总跳过 0 条 | 平均上传速度 0 条/s | 最新上传速度 0 条/s | 失败重试次数 0 次",
                 CengyanClient.progressLine(LocalDateTime.of(2026, 11, 12, 12, 39, 1), 60, 0, 0, 0, 0));
-        assertEquals("2026-11-13 14:16:00 INFO  CengyanClient - 完成总条数 160366560 条 | 总跳过 0 条 | 平均导入速度 21908 条/s | 最新导入速度 21908 条/s | 网络异常重试次数 0 次",
+        assertEquals("2026-11-13 14:16:00 INFO  CengyanClient - [上传] 已上传 160366560 条 | 总跳过 0 条 | 平均上传速度 21908 条/s | 最新上传速度 21908 条/s | 失败重试次数 0 次",
                 CengyanClient.progressLine(LocalDateTime.of(2026, 11, 13, 14, 16, 0), 7320, 160_366_560, 0, 21_908, 0));
+        assertEquals("2026-11-13 14:20:00 INFO  CengyanClient - [发布] 已发布分片 12/64 | 已发布 3000 条 | 失败重试次数 2 次",
+                CengyanClient.publishLine(LocalDateTime.of(2026, 11, 13, 14, 20, 0), "发布", 12, 64, 3000, 2));
         assertEquals(21_908, CengyanClient.recentPerSecond(160_366_560, 159_052_080, 60_000));
     }
 
@@ -93,7 +106,7 @@ class ImportFilesTest {
         List<String> lines = CengyanClient.reportLines(
                 LocalDateTime.of(2026, 11, 12, 11, 45, 23),
                 LocalDateTime.of(2026, 11, 12, 11, 45, 24),
-                1_000, 0, 0, "8724fe72-44ca-429d-a204-73739ccb5366",
+                1_000, 0, 0, 0, 400, 500, "8724fe72-44ca-429d-a204-73739ccb5366",
                 "Cannot read the array length because \"bytes\" is null");
         int column = -1;
         for (String line : lines) {
@@ -103,12 +116,13 @@ class ImportFilesTest {
             if (column < 0) column = width;
             assertEquals(column, width);
         }
-        assertEquals("起始时间         : 2026-11-12 11:45:23", lines.get(0));
-        assertEquals("总耗时           : 1 s", lines.get(2));
-        assertEquals("完成条数         : 0 条", lines.get(3));
-        assertEquals("平均速度         : 0 条/s", lines.get(5));
-        assertEquals("唯一索引构建时间 : 0 s", lines.get(6));
-        assertEquals("", lines.get(9));
-        assertEquals("导数发生错误     : Cannot read the array length because \"bytes\" is null", lines.get(10));
+        assertEquals("起始时间     : 2026-11-12 11:45:23", lines.get(0));
+        assertEquals("总耗时       : 1 s", lines.get(2));
+        assertEquals("完成条数     : 0 条", lines.get(3));
+        assertEquals("覆盖条数     : 0 条", lines.get(5));
+        assertEquals("平均速度     : 0 条/s", lines.get(6));
+        assertEquals("归并发布耗时 : 0 s", lines.get(8));
+        assertEquals("", lines.get(10));
+        assertEquals("导数发生错误 : Cannot read the array length because \"bytes\" is null", lines.get(11));
     }
 }

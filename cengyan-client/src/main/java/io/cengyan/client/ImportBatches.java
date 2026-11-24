@@ -7,7 +7,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** 按分片攒一批行。单个分片或总字节数达到上限时交出一批，调用方上传后即可释放。 */
+/**
+ * 按分片攒一批行。单个分片攒到 partBytes，或全部分片合计超过 totalBytes 时交出一批，调用方上传后即可释放。
+ * 批次大小只影响上传次数：副本在发布前会把一个分片的全部上传段归并成大文件，小批次不会进入分片库。
+ */
 final class ImportBatches {
     final long partBytes;
     final long totalBytes;
