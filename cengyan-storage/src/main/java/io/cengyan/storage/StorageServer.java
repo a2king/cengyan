@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 业务 RPC 只提交本节点 Ratis Division，不能悄悄跨节点转发并隐藏 NOT_LEADER。
  */
 public final class StorageServer implements AutoCloseable {
+    private static final String BIND_HOST = "0.0.0.0";
     private final StorageConfig config;
     private final RaftNode node;
     private final RpcServer rpc;
@@ -102,7 +103,7 @@ public final class StorageServer implements AutoCloseable {
         }
         if (config.rebuildData()) throw new IOException("rebuild 数据模式已移除。请改为 data_storage_mode=raft，清空数据目录后重新建图导入");
         node = new RaftNode(config.clusterId(), config.nodeId(), config.raftAddress().getHostString(), config.raftAddress().getPort(),
-                config.directory(), config.metadataGroup(), config.raftSettings(), false);
+                config.directory(), config.metadataGroup(), config.raftSettings(), false, BIND_HOST);
         gateway = new StorageGateway(config.clusterId(), config.metadataMembers().stream()
                 .map(peer -> StorageConfig.endpoint(peer.getClientAddress())).toList());
         gateway.limit(config.rpcMaxPayload(), config.rpcMaxInflight());
@@ -132,7 +133,7 @@ public final class StorageServer implements AutoCloseable {
                 }, new ThreadPoolExecutor.AbortPolicy());
         recoveryWorkers = writePool(config.transactionRecoveryThreads(), "storage-transaction-recovery");
         try {
-            rpc = new RpcServer(config.rpcAddress(), config.clusterId(), config.rpcMaxPayload(), config.rpcMaxInflight(), new RpcServer.StreamingService() {
+            rpc = new RpcServer(new java.net.InetSocketAddress(BIND_HOST, config.rpcAddress().getPort()), config.clusterId(), config.rpcMaxPayload(), config.rpcMaxInflight(), new RpcServer.StreamingService() {
                 @Override public CompletionStage<RpcResponse> handle(RpcRequest request) { return StorageServer.this.handle(request); }
                 @Override public CompletionStage<RpcServer.StreamSource> open(RpcRequest request) {
                     if (!request.getMethod().equals("scan.stream")) return CompletableFuture.failedFuture(new IllegalArgumentException("未知分片流方法"));

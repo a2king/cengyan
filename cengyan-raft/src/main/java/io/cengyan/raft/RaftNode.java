@@ -38,11 +38,20 @@ public final class RaftNode implements AutoCloseable {
     }
     public RaftNode(String clusterId, String nodeId, String host, int port, Path directory,
                     RaftGroup bootstrapGroup, RaftSettings settings, boolean metadataOnly) throws IOException {
+        this(clusterId, nodeId, host, port, directory, bootstrapGroup, settings, metadataOnly, host);
+    }
+
+    /**
+     * 创建 Raft 节点，host 用于成员通告，bindHost 只用于本地监听。
+     * 两者分开后可以监听所有网卡，同时让其它节点连接固定的可达地址。
+     */
+    public RaftNode(String clusterId, String nodeId, String host, int port, Path directory,
+                    RaftGroup bootstrapGroup, RaftSettings settings, boolean metadataOnly, String bindHost) throws IOException {
         this.clusterId = clusterId;
         this.storageRoot = directory.toAbsolutePath().normalize();
         this.metadataGroupId = bootstrapGroup.getGroupId();
         if (clusterId == null || clusterId.isBlank() || nodeId == null || nodeId.isBlank()
-                || host == null || host.isBlank() || port < 1 || port > 65535) {
+                || host == null || host.isBlank() || bindHost == null || bindHost.isBlank() || port < 1 || port > 65535) {
             throw new IllegalArgumentException("Raft 节点身份或地址无效");
         }
         if (bootstrapGroup.getPeer(RaftPeerId.valueOf(nodeId)) == null) {
@@ -70,7 +79,7 @@ public final class RaftNode implements AutoCloseable {
                 }
             }
         }
-        properties = settings.properties(root.resolve("raft"), host, port);
+        properties = settings.properties(root.resolve("raft"), bindHost, port);
         clientProperties = new RaftProperties(properties);
         org.apache.ratis.client.RaftClientConfigKeys.Rpc.setRequestTimeout(clientProperties, RaftSettings.CLIENT_REQUEST_TIMEOUT);
         Properties operations = new Properties();

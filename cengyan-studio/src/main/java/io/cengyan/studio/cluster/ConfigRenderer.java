@@ -93,7 +93,7 @@ public final class ConfigRenderer {
         String release = Remote.RELEASES + "/${CENGYAN_RELEASE}";
         return "# 由层岩 Studio 生成\n[Unit]\nDescription=Cengyan " + role + " " + node.id() + "\nAfter=network-online.target\nWants=network-online.target\n\n"
                 + "[Service]\nType=simple\nUMask=0077\nEnvironmentFile=" + dir + "/node.env\nWorkingDirectory=" + dir + "\n"
-                + "ExecStart=" + Remote.JDK + "/bin/java $JAVA_OPTS -Dlogback.configurationFile=" + release + "/logback.xml -Djava.io.tmpdir=" + dir + "/tmp"
+                + "ExecStart=" + Remote.JDK + "/bin/java $JAVA_OPTS -Djava.net.preferIPv4Stack=true -Dlogback.configurationFile=" + release + "/logback.xml -Djava.io.tmpdir=" + dir + "/tmp"
                 + " -jar " + release + "/cengyan-" + role + ".jar " + Remote.propertiesFile(node) + "\n"
                 + "Restart=on-failure\nRestartSec=10\nTimeoutStopSec=120\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target\n";
     }

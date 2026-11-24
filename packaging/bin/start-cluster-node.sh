@@ -30,9 +30,9 @@ read -r -a extra_options <<< "$extra"
 # expansion emits zero arguments for an empty array, not an empty JVM argument.
 cd "$APP_HOME"
 if [[ "$MODE" == foreground ]]; then
-    exec "$JAVA_EXE" ${options[@]+"${options[@]}"} ${extra_options[@]+"${extra_options[@]}"} "-Dlogback.configurationFile=$LOG_CONFIG" "-Djava.io.tmpdir=$APP_HOME/tmp/$INSTANCE" -jar "$JAR" "$CONFIG"
+    exec "$JAVA_EXE" ${options[@]+"${options[@]}"} ${extra_options[@]+"${extra_options[@]}"} "-Djava.net.preferIPv4Stack=true" "-Dlogback.configurationFile=$LOG_CONFIG" "-Djava.io.tmpdir=$APP_HOME/tmp/$INSTANCE" -jar "$JAR" "$CONFIG"
 fi
-nohup "$JAVA_EXE" ${options[@]+"${options[@]}"} ${extra_options[@]+"${extra_options[@]}"} "-Dlogback.configurationFile=$LOG_CONFIG" "-Djava.io.tmpdir=$APP_HOME/tmp/$INSTANCE" -jar "$JAR" "$CONFIG" >>"$LOG_FILE" 2>&1 < /dev/null &
+nohup "$JAVA_EXE" ${options[@]+"${options[@]}"} ${extra_options[@]+"${extra_options[@]}"} "-Djava.net.preferIPv4Stack=true" "-Dlogback.configurationFile=$LOG_CONFIG" "-Djava.io.tmpdir=$APP_HOME/tmp/$INSTANCE" -jar "$JAR" "$CONFIG" >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$PID_FILE"
 sleep 2

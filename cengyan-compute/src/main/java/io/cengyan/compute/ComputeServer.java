@@ -25,6 +25,7 @@ import org.apache.ratis.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.ThreadMXBean;
@@ -37,6 +38,7 @@ import java.util.concurrent.atomic.*;
 
 /** 独立 Compute：外部 JSON 接入、内部代理、单查询单执行节点、本地临时文件。 */
 public final class ComputeServer implements AutoCloseable {
+    private static final String BIND_HOST = "0.0.0.0";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Logger log = LoggerFactory.getLogger(ComputeServer.class);
     private final ComputeConfig config;
@@ -101,7 +103,7 @@ public final class ComputeServer implements AutoCloseable {
         control = new RaftNode(config.clusterId(), config.nodeId(), config.raft().getHostString(), config.raft().getPort(), config.directory().resolve("control"), group,
                 new RaftSettings(16L * 1024 * 1024, 2_000, 1_000, 1,
                         config.raftRpcTimeoutMinMs(), config.raftRpcTimeoutMaxMs(),
-                        config.raftFirstElectionTimeoutMinMs(), config.raftFirstElectionTimeoutMaxMs()));
+                        config.raftFirstElectionTimeoutMinMs(), config.raftFirstElectionTimeoutMaxMs()), false, BIND_HOST);
         membership = new ComputeMembership(config, control);
         slots = new ExecutionSlots(config.slots(), config.nodeMemory(), config.nodeDisk(), Duration.ofSeconds(5));
         queue = new AdmissionQueue<>(config.queueCapacity(), Duration.ofMillis(config.queueTimeoutMs()));
@@ -110,7 +112,7 @@ public final class ComputeServer implements AutoCloseable {
         ingress = new ThreadPoolExecutor(ingressThreads, ingressThreads, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(config.queueCapacity()), daemon("compute-ingress"), new ThreadPoolExecutor.AbortPolicy());
         Path requests = config.directory().resolve("requests"); Files.createDirectories(requests);
         try (var files = Files.list(requests)) { for (Path old : files.toList()) if (Files.isDirectory(old) && !Files.isSymbolicLink(old)) deleteTemporary(old); }
-        rpc = new RpcServer(config.rpc(), config.clusterId(), Math.max(8 * 1024 * 1024, config.resultMaxBytes() + 1024), 128, this::internal);
+        rpc = new RpcServer(new InetSocketAddress(BIND_HOST, config.rpc().getPort()), config.clusterId(), Math.max(8 * 1024 * 1024, config.resultMaxBytes() + 1024), 128, this::internal);
         try {
             listener = new ServerBootstrap().group(boss, io).channel(NioServerSocketChannel.class)
                     .childOption(ChannelOption.TCP_NODELAY, true).childHandler(new ChannelInitializer<SocketChannel>() {
@@ -149,7 +151,7 @@ public final class ComputeServer implements AutoCloseable {
                                 @Override public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) { ctx.close(); }
                             });
                         }
-                    }).bind(config.client()).sync().channel();
+                    }).bind(new InetSocketAddress(BIND_HOST, config.client().getPort())).sync().channel();
         } catch (Exception ex) {
             rpc.close(); control.close(); storage.close(); ingress.shutdownNow(); execution.shutdownNow(); scheduler.shutdownNow();
             boss.shutdownGracefully(); io.shutdownGracefully(); throw ex;

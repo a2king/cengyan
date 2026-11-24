@@ -50,7 +50,7 @@ if [ ! -x "$DEST/runtime/bin/java" ] || [ ! -f "$DEST/cengyan-client.jar" ]; the
         done
     fi
 fi
-exec "$DEST/runtime/bin/java" -jar "$DEST/cengyan-client.jar" "$@"
+exec "$DEST/runtime/bin/java" "-Djava.net.preferIPv4Stack=true" -jar "$DEST/cengyan-client.jar" "$@"
 """
 
 
