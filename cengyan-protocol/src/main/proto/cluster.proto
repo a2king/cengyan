@@ -157,6 +157,14 @@ message StoredValue { bool found = 1; bytes value = 2; }
 message BatchResult { string code = 1; string message = 2; uint64 affected = 3; uint64 skipped = 4; uint64 replaced = 5; }
 message IdempotencyRecord { bytes digest = 1; BatchResult result = 2; uint64 expires_at_ms = 3; }
 message DataGroupSpec { uint64 graph_id = 1; uint32 part_id = 2; repeated Node members = 3; repeated Node learners = 4; string control_task_id = 5; string data_mode = 6; }
+message ReplicaBootstrapRequest { DataGroupSpec group = 1; Node source = 2; }
+message ReplicaCheckpointRequest { uint64 graph_id = 1; uint32 part_id = 2; string task_id = 3; uint64 index = 4; string file = 5; uint64 offset = 6; }
+message ReplicaCheckpointFile { string name = 1; uint64 size = 2; string digest = 3; }
+message ReplicaCheckpoint {
+  uint64 term = 1;
+  uint64 index = 2;
+  repeated ReplicaCheckpointFile files = 3;
+}
 // Rebuild-only data replicas. Metadata holds decisions/identities, never the data command body.
 message ReplicaReceipt { string node_id = 1; string boot_id = 2; uint64 sequence = 3; bytes digest = 4; }
 message RebuildHead {

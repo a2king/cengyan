@@ -16,6 +16,37 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class SnapshotInstallTest {
     @TempDir Path home;
+    @Test @Timeout(60)
+    void 缺少历史导入上传段会隔离副本并保持到重启后() throws Exception {
+        int port;
+        try (var socket = new ServerSocket(0)) { port = socket.getLocalPort(); }
+        RaftPeer peer = RaftPeer.newBuilder().setId("s1").setAddress("127.0.0.1:" + port).build();
+        var id = GroupIds.data("failed-replay", 1, 0);
+        var group = RaftGroup.valueOf(id, peer);
+        var settings = RaftSettings.defaults();
+        Path root = home.resolve("failed");
+        try (var node = new RaftNode("failed-replay", "s1", "127.0.0.1", port, root, group, settings);
+             var client = node.client(group)) {
+            var publish = ImportPublish.newBuilder().setSessionId("missing").setTypeId(1).setTypeName("N")
+                    .setNode(true).setConflict(ImportConflict.IMPORT_IGNORE).addRuns(ByteString.copyFrom(new byte[32])).build();
+            var command = WriteBatch.newBuilder().setRequestId("history").setExpiresAtMs(2_000_000_000_000L)
+                    .setImportPublish(publish).build();
+            assertThrows(Exception.class, () -> {
+                var reply = client.io().send(RocksStateMachine.message(command.toByteArray()));
+                if (!reply.isSuccess()) throw new java.io.IOException(String.valueOf(reply.getException()));
+            });
+            var machine = (RocksStateMachine) node.server().getDivision(id).getStateMachine();
+            assertTrue(machine.isUntrusted());
+            assertEquals(-1L, machine.takeSnapshot());
+        }
+        try (var node = new RaftNode("failed-replay", "s1", "127.0.0.1", port, root, group, settings)) {
+            var machine = (RocksStateMachine) node.server().getDivision(id).getStateMachine();
+            assertTrue(machine.isUntrusted());
+            assertTrue(machine.query(RocksStateMachine.message(ReadKey.newBuilder().setKey(ByteString.copyFromUtf8("key"))
+                    .build().toByteArray())).isCompletedExceptionally());
+        }
+    }
+
     @Test @Timeout(90)
     void 新副本通过Checkpoint安装追平已压缩日志() throws Exception {
         int a, b;

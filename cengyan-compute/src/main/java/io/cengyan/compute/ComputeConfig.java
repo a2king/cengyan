@@ -9,7 +9,7 @@ import java.util.concurrent.TimeUnit;
 
 public record ComputeConfig(String clusterId, String nodeId, InetSocketAddress client, InetSocketAddress rpc,
                             InetSocketAddress raft, Path directory, List<Peer> members, List<InetSocketAddress> storageSeeds,
-                            int slots, int queueCapacity, long queueTimeoutMs, long executionTimeoutMs,
+                            int slots, int traversalThreads, int duckdbThreads, int queueCapacity, long queueTimeoutMs, long executionTimeoutMs,
                             long queryMemory, long nodeMemory, long queryDisk, long nodeDisk,
                              int resultMaxRows, int resultMaxBytes, String rootPassword, long authCacheTtlMs,
                              long raftRpcTimeoutMinMs, long raftRpcTimeoutMaxMs,
@@ -28,7 +28,7 @@ public record ComputeConfig(String clusterId, String nodeId, InetSocketAddress c
                          int slots, int queueCapacity, long queueTimeoutMs, long executionTimeoutMs,
                          long queryMemory, long nodeMemory, long queryDisk, long nodeDisk,
                          int resultMaxRows, int resultMaxBytes, String rootPassword, long authCacheTtlMs) {
-        this(clusterId, nodeId, client, rpc, raft, directory, members, storageSeeds, slots, queueCapacity,
+        this(clusterId, nodeId, client, rpc, raft, directory, members, storageSeeds, slots, 4, 2, queueCapacity,
                 queueTimeoutMs, executionTimeoutMs, queryMemory, nodeMemory, queryDisk, nodeDisk,
                 resultMaxRows, resultMaxBytes, rootPassword, authCacheTtlMs, 600, 1200, 0, 0);
     }
@@ -43,7 +43,8 @@ public record ComputeConfig(String clusterId, String nodeId, InetSocketAddress c
         if (clusterId == null || clusterId.isBlank() || nodeId == null || !nodeId.matches("[A-Za-z0-9_-]+") || directory == null
                 || members == null || members.isEmpty() || storageSeeds == null || storageSeeds.isEmpty() || client == null || rpc == null || raft == null
                 || rootPassword == null || rootPassword.isEmpty() || client.getPort() < 1 || rpc.getPort() < 1 || raft.getPort() < 1
-                || slots < 1 || queueCapacity < 1 || queueTimeoutMs < 1 || executionTimeoutMs < 1 || queryMemory < 1 || nodeMemory < queryMemory
+                || slots < 1 || traversalThreads < 1 || traversalThreads > 64 || duckdbThreads < 1 || duckdbThreads > 64
+                || queueCapacity < 1 || queueTimeoutMs < 1 || executionTimeoutMs < 1 || queryMemory < 1 || nodeMemory < queryMemory
                 || queryDisk < 1 || nodeDisk < queryDisk || resultMaxRows < 1 || resultMaxBytes < 1024 || resultMaxBytes > 64 * 1024 * 1024
                  || executionTimeoutMs > 1800000
                  || authCacheTtlMs < 1000 || authCacheTtlMs > TimeUnit.HOURS.toMillis(24)
@@ -79,7 +80,8 @@ public record ComputeConfig(String clusterId, String nodeId, InetSocketAddress c
                 io.cengyan.distributed.TransactionEngine.DEFAULT_PLAN_MAX_BYTES)));
         return new ComputeConfig(required(p, "cluster_id"), required(p, "node_id"), address(required(p, "client_address")),
                 address(required(p, "rpc_address")), address(required(p, "raft_address")), directory, members, seeds,
-                (int) number(p, "query_slots", 16), (int) number(p, "queue_capacity", 128), number(p, "queue_timeout_ms", 30000),
+                (int) number(p, "query_slots", 16), (int) number(p, "query_traversal_threads", 4),
+                (int) number(p, "query_duckdb_threads", 2), (int) number(p, "queue_capacity", 128), number(p, "queue_timeout_ms", 30000),
                 number(p, "max_execution_time_ms", 1800000), number(p, "query_memory_bytes", 67108864), number(p, "node_memory_bytes", 536870912),
                 number(p, "query_temp_bytes", 1073741824), number(p, "node_temp_bytes", 8589934592L),
                  (int) number(p, "result_max_rows", 100000), (int) number(p, "result_max_bytes", 16777216), required(p, "root_password"),

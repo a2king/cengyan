@@ -35,6 +35,7 @@ final class CheckpointStorage implements StateMachineStorage {
     private File stateMachineDir;
     private volatile SnapshotInfo latest;
     private volatile Path live;
+    private final java.util.Map<Path, Integer> pins = new java.util.HashMap<>();
 
     @Override public void init(RaftStorage storage) {
         stateMachineDir = storage.getStorageDir().getStateMachineDir();
@@ -51,17 +52,31 @@ final class CheckpointStorage implements StateMachineStorage {
         }
     }
 
-    @Override public void cleanupOldSnapshots(SnapshotRetentionPolicy policy) throws IOException {
+    @Override public synchronized void cleanupOldSnapshots(SnapshotRetentionPolicy policy) throws IOException {
         int keep = policy == null ? 1 : Math.max(1, policy.getNumSnapshotsRetained());
         List<Path> snaps = snapshots();
         snaps.sort(Comparator.comparingLong((Path path) -> termIndex(path).getIndex()).reversed());
         for (int i = keep; i < snaps.size(); i++) {
-            if (snaps.get(i).equals(live)) continue;
+            if (snaps.get(i).equals(live) || pins.containsKey(snaps.get(i))) continue;
             deleteTree(snaps.get(i));
         }
     }
 
     void retain(Path directory) { live = directory; }
+
+    synchronized SnapshotInfo pinLatest() throws IOException {
+        var snapshot = latest;
+        if (snapshot == null || snapshot.getFiles().isEmpty()) throw new IOException("没有已封存的分片快照");
+        var path = snapshot.getFiles().getFirst().getPath().getParent();
+        if (!Files.isRegularFile(path.resolve("CURRENT"))) throw new IOException("分片快照已失效");
+        pins.merge(path, 1, Integer::sum);
+        return snapshot;
+    }
+
+    synchronized void unpin(SnapshotInfo snapshot) {
+        var path = snapshot.getFiles().getFirst().getPath().getParent();
+        pins.computeIfPresent(path, (ignored, count) -> count > 1 ? count - 1 : null);
+    }
 
     /** 重新登记已经存在的硬链接快照，供重启后继续发给落后副本。 */
     void reload() throws IOException {
@@ -152,7 +167,8 @@ final class CheckpointStorage implements StateMachineStorage {
         long read = 0;
         try (var children = Files.list(directory)) {
             for (Path file : children.filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)).sorted().toList()) {
-                if (file.getFileName().toString().endsWith(MD5FileUtil.MD5_SUFFIX)) continue;
+                String filename = file.getFileName().toString();
+                if (filename.endsWith(MD5FileUtil.MD5_SUFFIX) || filename.endsWith(MD5FileUtil.MD5_SUFFIX + ".tmp")) continue;
                 MD5Hash digest = storedDigest(file);
                 if (digest == null) {
                     digest = MD5FileUtil.computeMd5ForFile(file.toFile());

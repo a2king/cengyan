@@ -6,6 +6,11 @@ import com.google.protobuf.ByteString;
 import io.cengyan.distributed.*;
 import io.cengyan.protocol.proto.ClusterProtocol.*;
 import io.cengyan.raft.RaftSettings;
+import io.cengyan.raft.GroupIds;
+import io.cengyan.raft.ImportSst;
+import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.protocol.RaftGroup;
+import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -104,6 +109,80 @@ class ReplicaJobTest {
                 assertEquals(2, DataGroupSpec.parseFrom(gateway.get(0, 0, StorageGateway.groupKey(graph.getId(), part))).getMembersCount());
             assertEquals(60, countAll(data, graph));
         } finally { for (var server : servers) if (server != null) server.close(); }
+    }
+
+    @Test @Timeout(180)
+    void 扩容从快照恢复已清理上传段的历史导入并可重启切主() throws Exception {
+        int[] ports = new int[4];
+        try (var a = new ServerSocket(0); var b = new ServerSocket(0);
+             var c = new ServerSocket(0); var d = new ServerSocket(0)) {
+            ports[0] = a.getLocalPort(); ports[1] = b.getLocalPort();
+            ports[2] = c.getLocalPort(); ports[3] = d.getLocalPort();
+        }
+        List<RaftPeer> peers = new ArrayList<>();
+        for (int i = 0; i < 2; i++) peers.add(RaftPeer.newBuilder().setId("s" + i)
+                .setAddress(addr(ports[2 * i])).setClientAddress(addr(ports[2 * i + 1])).build());
+        var configs = new ArrayList<StorageConfig>();
+        var servers = new ArrayList<StorageServer>();
+        var settings = RaftSettings.defaults();
+        try (var gateway = new StorageGateway("historical-import", List.of(addr(ports[1]), addr(ports[3])))) {
+            for (int i = 0; i < 2; i++) {
+                Path dir = Files.createDirectory(home.resolve("import-" + i));
+                Files.writeString(dir.resolve("operations.properties"), "background_interval_ms=86400000\n");
+                var config = new StorageConfig("historical-import", "s" + i, addr(ports[2 * i + 1]),
+                        addr(ports[2 * i]), dir, peers, settings, 8 * 1024 * 1024, 128, 4, 128);
+                configs.add(config);
+                servers.add(new StorageServer(config));
+            }
+            var catalog = new DistributedCatalog(gateway);
+            catalog.create("create", "I", 1, 1, IdType.STRING, IdType.STRING);
+            var graph = catalog.addType("type", "I", TypeDefinition.newBuilder().setNode(true).setName("N").build());
+            var type = graph.getTypesList().getFirst();
+            var route = DataGroupSpec.parseFrom(gateway.get(0, 0, StorageGateway.groupKey(graph.getId(), 0)));
+            var member = route.getMembers(0);
+            var vertex = Entity.newBuilder().setNode(true).setType("N").setId(EntityCodec.value("imported")).build();
+            var key = EntityCodec.key(vertex, graph);
+            Path run = Files.createTempFile(home, "seed-", ".sst");
+            ImportSst.write(run, List.of(new ImportSst.Row(key.toByteArray(), vertex.toByteArray())));
+            ByteString digest = ByteString.copyFrom(ImportSst.sha256(run));
+            var chunk = ImportChunk.newBuilder().setGraphId(graph.getId()).setPartId(0)
+                    .setSessionId("history").setChecksum(digest).setLast(true).setData(ByteString.copyFrom(Files.readAllBytes(run))).build();
+            var source = DistributedCatalog.address(member);
+            assertEquals("OK", gateway.direct(source, "import.stage", chunk.toByteString(), Duration.ofSeconds(10)).getCode());
+            var publish = ImportPublish.newBuilder().setSessionId("history").setNode(true).setTypeId(type.getId())
+                    .setTypeName("N").setGeneration(graph.getGeneration()).setConflict(ImportConflict.IMPORT_IGNORE).addRuns(digest).build();
+            assertEquals("OK", gateway.write(graph.getId(), 0, StorageGateway.batch("history.publish")
+                    .setImportPublish(publish).build(), Duration.ofSeconds(20)).getCode());
+            assertEquals("OK", gateway.direct(source, "import.finish", ImportHeartbeat.newBuilder().setSessionId("history")
+                    .build().toByteString(), Duration.ofSeconds(10)).getCode());
+
+            var controller = new ReplicaController(gateway);
+            controller.resize("history.resize", "I", 2);
+            controller.runUntilIdle(Duration.ofSeconds(90));
+            assertEquals("DONE", controller.status("I").path("job").path("state").asText(), controller.status("I").toString());
+            var restored = DataGroupSpec.parseFrom(gateway.get(0, 0, StorageGateway.groupKey(graph.getId(), 0)));
+            Node target = restored.getMembersList().stream().filter(n -> !n.getNodeId().equals(member.getNodeId())).findFirst().orElseThrow();
+            int index = target.getNodeId().equals("s0") ? 0 : 1;
+            servers.get(index).close();
+            servers.set(index, null);
+            servers.set(index, new StorageServer(configs.get(index)));
+            // 双副本提交需要重启后的节点响应，等旧连接完成重建再切主。
+            assertEquals("OK", gateway.write(graph.getId(), 0, StorageGateway.batch("history.after-restart")
+                    .addMutations(TransactionEngine.put(TransactionEngine.text("history/after-restart"), ByteString.copyFromUtf8("ready")))
+                    .build(), Duration.ofSeconds(30)).getCode());
+            var group = RaftGroup.valueOf(GroupIds.data("historical-import", graph.getId(), 0), peers);
+            try (var raft = RaftClient.newBuilder().setRaftGroup(group)
+                    .setProperties(settings.properties(home.resolve("test-client"), "127.0.0.1", ports[0])).build()) {
+                assertTrue(raft.admin().transferLeadership(RaftPeerId.valueOf(target.getNodeId()), 10_000).isSuccess());
+            }
+            var reply = gateway.call(graph.getId(), 0, "data.status", "", ByteString.EMPTY, Duration.ofSeconds(10));
+            assertEquals(target.getNodeId(), GroupStatus.parseFrom(reply.getBody()).getLeaderId());
+            var value = gateway.get(graph.getId(), 0, key);
+            assertNotNull(value);
+            assertEquals(vertex.getId(), Entity.parseFrom(VersionedCell.parseFrom(value).getVersions(0).getValue()).getId());
+        } finally {
+            for (var server : servers) if (server != null) server.close();
+        }
     }
 
     @Test @Timeout(180)

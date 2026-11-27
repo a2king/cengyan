@@ -31,6 +31,8 @@ public final class RaftNode implements AutoCloseable {
     private final FileChannel ownerChannel;
     private final java.nio.channels.FileLock ownerLock;
     private final ConcurrentHashMap<RaftGroupId, RocksStateMachine> machines = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<RaftGroupId, Path> bootstrapCheckpoints = new ConcurrentHashMap<>();
+    private final java.util.Set<RaftGroupId> electionsPaused = ConcurrentHashMap.newKeySet();
 
     public RaftNode(String clusterId, String nodeId, String host, int port, Path directory,
                     RaftGroup bootstrapGroup, RaftSettings settings) throws IOException {
@@ -92,7 +94,7 @@ public final class RaftNode implements AutoCloseable {
                 .setGroup(bootstrapGroup).setProperties(properties).setOption(RaftStorage.StartupOption.RECOVER)
                 .setStateMachineRegistry(id -> {
                     if (metadataOnly && !id.equals(bootstrapGroup.getGroupId())) throw new IllegalStateException("重建模式禁止打开 Data Raft Group");
-                    return machines.computeIfAbsent(id, ignored -> new RocksStateMachine(snapshotRate));
+                    return machines.computeIfAbsent(id, ignored -> new RocksStateMachine(snapshotRate, bootstrapCheckpoints.get(id)));
                 }).build();
         try { server.start(); }
         catch (IOException | RuntimeException ex) {
@@ -142,6 +144,34 @@ public final class RaftNode implements AutoCloseable {
             var reply = client.getGroupManagementApi(server.getId()).add(group, true);
             if (!reply.isSuccess()) throw new IOException("创建 Data Raft Group 失败：" + reply.getException());
         }
+    }
+
+    public synchronized void addGroupFromCheckpoint(RaftGroup group, Path checkpoint) throws IOException {
+        RaftGroupId id = group.getGroupId();
+        if (hosts(id) || dataDirectoryPresent(id)) throw new IOException("checkpoint 引导要求目标分片尚未创建");
+        bootstrapCheckpoints.put(id, checkpoint);
+        try { addGroup(group); }
+        finally { bootstrapCheckpoints.remove(id); }
+    }
+
+    public long untrustedReplicaCount() {
+        return machines.entrySet().stream().filter(entry -> !entry.getKey().equals(metadataGroupId)
+                && entry.getValue().isUntrusted()).count();
+    }
+
+    public void pauseUntrustedElections() {
+        machines.forEach((id, machine) -> {
+            if (id.equals(metadataGroupId) || !machine.isUntrusted() || !electionsPaused.add(id)) return;
+            try {
+                var division = server.getDivision(id);
+                try (var client = client(division.getGroup())) {
+                    if (client.getLeaderElectionManagementApi(server.getId()).pause().isSuccess()) return;
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // 本地 RPC 未就绪时下一轮再试。状态机已拒绝读写。
+            }
+            electionsPaused.remove(id);
+        });
     }
 
     public RaftClient client(RaftGroup group) {
@@ -201,6 +231,7 @@ public final class RaftNode implements AutoCloseable {
             }
         }
         if (!hosts(groupId)) {
+            electionsPaused.remove(groupId);
             machines.remove(groupId);
             if (machine != null) {
                 try { machine.close(); }

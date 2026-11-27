@@ -62,9 +62,9 @@ public final class ConfigCatalog {
         Map<String, String> errors = new LinkedHashMap<>();
         if (role == Role.COMPUTE) {
             if (number(effective.get("query_memory_bytes")) > number(effective.get("node_memory_bytes")))
-                errors.put("query_memory_bytes", "单查询内存上限不能超过节点查询内存上限");
+                errors.put("query_memory_bytes", "单查询执行内存上限不能超过节点查询内存上限");
             if (number(effective.get("query_temp_bytes")) > number(effective.get("node_temp_bytes")))
-                errors.put("query_temp_bytes", "单查询临时文件上限不能超过节点临时文件上限");
+                errors.put("query_temp_bytes", "单查询落盘空间上限不能超过节点查询落盘空间上限");
         }
         if (role == Role.STORAGE) {
             long plan = number(effective.get("transaction_plan_max_bytes"));

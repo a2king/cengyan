@@ -36,6 +36,7 @@ public final class StorageGateway implements AutoCloseable {
     private volatile boolean closed;
     private static final ThreadLocal<RequestBudget> CURRENT = new ThreadLocal<>();
     private static final ThreadLocal<ControllerGuard> CONTROL = new ThreadLocal<>();
+    private static final ThreadLocal<Integer> PARALLEL_DEPTH = ThreadLocal.withInitial(() -> 0);
     private static final ExecutorService READERS = new ThreadPoolExecutor(16, 16, 0, TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue<>(256), task -> {
                 Thread thread = new Thread(task, "distributed-partition-reader"); thread.setDaemon(true); return thread;
@@ -109,11 +110,29 @@ public final class StorageGateway implements AutoCloseable {
 
     /** 每个请求最多四个并行分片，所有工作共享一个预算对象；首个失败取消其余任务。 */
     public static <T> List<T> parallel(List<java.util.function.Supplier<T>> tasks) {
+        return parallel(tasks, 4);
+    }
+
+    /**
+     * 按调用方指定的并发上限读取分片。结果按任务提交顺序返回，便于保持路径和聚合输入的稳定顺序。
+     */
+    public static <T> List<T> parallel(List<java.util.function.Supplier<T>> tasks, int maxParallel) {
+        if (maxParallel < 1) throw new IllegalArgumentException("并行读取上限必须为正");
+        int depth = PARALLEL_DEPTH.get();
+        if (depth > 0) {
+            List<T> results = new ArrayList<>(tasks.size());
+            for (var task : tasks) {
+                charge(0);
+                results.add(task.get());
+            }
+            return results;
+        }
         RequestBudget budget = CURRENT.get(); ControllerGuard controller = CONTROL.get();
         List<Future<T>> submitted = new ArrayList<>(); List<T> results = new ArrayList<>();
         try {
             int next = 0;
-            for (; next < Math.min(4, tasks.size()); next++) submitted.add(submit(tasks.get(next), budget, controller));
+            int width = Math.min(maxParallel, tasks.size());
+            for (; next < width; next++) submitted.add(submit(tasks.get(next), budget, controller, depth + 1));
             for (int completed = 0; completed < tasks.size(); completed++) {
                 Future<T> task = submitted.get(completed);
                 for (;;) {
@@ -121,7 +140,7 @@ public final class StorageGateway implements AutoCloseable {
                     try { results.add(task.get(200, TimeUnit.MILLISECONDS)); break; }
                     catch (TimeoutException waiting) { }
                 }
-                if (next < tasks.size()) submitted.add(submit(tasks.get(next++), budget, controller));
+                if (next < tasks.size()) submitted.add(submit(tasks.get(next++), budget, controller, depth + 1));
             }
             return results;
         } catch (InterruptedException ex) {
@@ -132,12 +151,18 @@ public final class StorageGateway implements AutoCloseable {
         } catch (RejectedExecutionException ex) { throw new ClusterException("BUSY", "节点并行分片扫描队列已满", ex); }
         finally { submitted.forEach(task -> { if (!task.isDone()) task.cancel(true); }); }
     }
-    private static <T> Future<T> submit(java.util.function.Supplier<T> task, RequestBudget budget, ControllerGuard controller) {
+    private static <T> Future<T> submit(java.util.function.Supplier<T> task, RequestBudget budget,
+                                         ControllerGuard controller, int depth) {
         return READERS.submit(() -> {
+            int previousDepth = PARALLEL_DEPTH.get();
             if (budget != null) CURRENT.set(budget);
             if (controller != null) CONTROL.set(controller);
+            PARALLEL_DEPTH.set(depth);
             try { return task.get(); }
-            finally { CURRENT.remove(); CONTROL.remove(); }
+            finally {
+                CURRENT.remove(); CONTROL.remove();
+                PARALLEL_DEPTH.set(previousDepth);
+            }
         });
     }
 
@@ -294,6 +319,9 @@ public final class StorageGateway implements AutoCloseable {
                 submitted = true;
                 pendingCall = client.call(request, Duration.ofNanos(remaining));
                 RpcResponse response = pendingCall.get(remaining, TimeUnit.NANOSECONDS);
+                if (response.getCode().equals("REPLICA_UNTRUSTED") && !response.hasLeaderHint()) {
+                    throw new ClusterException(response.getCode(), response.getMessage());
+                }
                 if (Set.of("NOT_LEADER", "GROUP_UNAVAILABLE", "REPLICA_UNTRUSTED").contains(response.getCode())) {
                     if (pinned) throw new ClusterException("QUERY_CANCELED", "扫描已返回数据后分片位置变化，当前查询失败，不重新扫描");
                     last = new IllegalStateException(response.toString());

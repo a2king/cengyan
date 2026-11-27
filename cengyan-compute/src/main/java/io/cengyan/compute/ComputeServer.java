@@ -683,7 +683,8 @@ public final class ComputeServer implements AutoCloseable {
         }
         if (op.equals("execute")) {
             Map<String, Object> params = request.has("params") ? JSON.convertValue(request.get("params"), new TypeReference<>() { }) : Map.of();
-            var engine = new RemoteQueryEngine(storage, work.resolve("duck"), config.queryMemory() + "B", config.queryDisk() + "B", 1);
+            var engine = new RemoteQueryEngine(storage, work.resolve("duck"), config.queryMemory() + "B", config.queryDisk() + "B",
+                    config.traversalThreads(), config.duckdbThreads());
             long started = System.nanoTime();
             long schemaVersion = request.hasNonNull("_schemaLease")
                     ? SchemaLease.parseFrom(Base64.getDecoder().decode(request.path("_schemaLease").asText())).getSchemaVersion() : 0;
