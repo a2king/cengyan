@@ -343,6 +343,10 @@ final class DuckResult {
                         set(statement, i + 1, row.get(i), columns[i], false);
                     }
                     statement.addBatch();
+                    if (rowIndex % 32 == 0) {
+                        statement.executeBatch();
+                        statement.clearBatch();
+                    }
                 }
                 statement.executeBatch();
             } finally {

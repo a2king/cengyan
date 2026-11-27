@@ -93,6 +93,9 @@ public final class RocksStateMachine extends BaseStateMachine {
     private final Set<String> busyScans = new HashSet<>();
     private volatile Map<String, Long> lastUsage = Map.of();
     private final long snapshotBytesPerSecond;
+    private final Path bootstrapCheckpoint;
+    private volatile boolean untrusted;
+    private Path untrustedMarker;
     /** 图空间已经删除。新的导入和查询直接拒绝；正在进行的调用结束于关闭数据库之前。 */
     private volatile boolean dropping;
     private static final byte PHYSICAL_NAMESPACE = 2;
@@ -104,9 +107,15 @@ public final class RocksStateMachine extends BaseStateMachine {
     private static final Map<String, String> FAMILY_NAMES = new java.util.concurrent.ConcurrentHashMap<>();
     public RocksStateMachine() { this(64L * 1024 * 1024); }
     public RocksStateMachine(long snapshotBytesPerSecond) {
+        this(snapshotBytesPerSecond, null);
+    }
+    RocksStateMachine(long snapshotBytesPerSecond, Path bootstrapCheckpoint) {
         if (snapshotBytesPerSecond < 1) throw new IllegalArgumentException("快照带宽必须为正数");
         this.snapshotBytesPerSecond = snapshotBytesPerSecond;
+        this.bootstrapCheckpoint = bootstrapCheckpoint;
     }
+
+    public boolean isUntrusted() { return untrusted; }
 
     /** New process-owned database: never reopen this directory after a restart. */
     public static RocksStateMachine freshReplica(Path directory) throws IOException {
@@ -305,7 +314,12 @@ public final class RocksStateMachine extends BaseStateMachine {
         if (leftover.directories() > 0)
             LOG.warning("删除 " + groupId + " 上次未装完的快照残留 " + leftover.directories() + " 个，释放 " + leftover.bytes() + " 字节");
         Files.createDirectories(stateDirectory);
-        imports = new ImportStaging(Files.createDirectories(stateDirectory.resolve("import-staging")));
+        untrustedMarker = stateDirectory.getParent().resolve("untrusted-import");
+        untrusted = Files.exists(untrustedMarker);
+        if (bootstrapCheckpoint != null && Files.exists(bootstrapCheckpoint)) {
+            Files.move(bootstrapCheckpoint, stateDirectory.resolve(bootstrapCheckpoint.getFileName()),
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        }
         restore();
         getLifeCycle().transition(org.apache.ratis.util.LifeCycle.State.STARTING);
         getLifeCycle().transition(org.apache.ratis.util.LifeCycle.State.RUNNING);
@@ -376,10 +390,14 @@ public final class RocksStateMachine extends BaseStateMachine {
     }
 
     @Override public CompletableFuture<Message> applyTransaction(TransactionContext trx) {
+        if (untrusted) return CompletableFuture.failedFuture(new IOException("副本需要重新安装快照"));
         var entry = trx.getLogEntry();
         io.cengyan.protocol.proto.ClusterProtocol.WriteBatch command;
         try { command = io.cengyan.protocol.proto.ClusterProtocol.WriteBatch.parseFrom(entry.getStateMachineLogEntry().getLogData().toByteArray()); }
-        catch (Exception ex) { return CompletableFuture.failedFuture(ex); }
+        catch (Exception ex) {
+            markUntrusted(entry.getTerm(), entry.getIndex(), "decode", ex);
+            return CompletableFuture.failedFuture(ex);
+        }
         // 导入发布自己管锁：比对和重写在读锁下做，查询不用等它。
         if (command.hasImportPublish()) return applyPublish(command, entry.getIndex(), entry.getTerm());
         dbLock.writeLock().lock();
@@ -473,6 +491,7 @@ public final class RocksStateMachine extends BaseStateMachine {
             updateLastAppliedTermIndex(term, index);
             return CompletableFuture.completedFuture(message(result.toByteArray()));
         } catch (Exception ex) {
+            markUntrusted(term, index, command.getRequestId(), ex);
             LOG.log(java.util.logging.Level.SEVERE, "分片状态机应用失败，requestId=" + command.getRequestId(), ex);
             return CompletableFuture.failedFuture(new IOException("分片状态机应用失败", ex));
         }
@@ -481,15 +500,19 @@ public final class RocksStateMachine extends BaseStateMachine {
     @Override public void notifyTermIndexUpdated(long term, long index) {
         dbLock.writeLock().lock();
         try {
-            if (index <= getLastAppliedTermIndex().getIndex()) return;
+            if (untrusted || index <= getLastAppliedTermIndex().getIndex()) return;
             try {
                 db.put(writes, APPLIED, position(term, index));
                 updateLastAppliedTermIndex(term, index);
-            } catch (RocksDBException ex) { throw new IllegalStateException("无法持久化 Raft 控制日志进度", ex); }
+            } catch (RocksDBException ex) {
+                markUntrusted(term, index, "control", ex);
+                throw new IllegalStateException("无法持久化 Raft 控制日志进度", ex);
+            }
         } finally { dbLock.writeLock().unlock(); }
     }
 
     @Override public CompletableFuture<Message> query(Message request) {
+        if (untrusted) return CompletableFuture.failedFuture(new IOException("副本需要重新安装快照"));
         dbLock.readLock().lock();
         try { return queryLocked(request); }
         finally { dbLock.readLock().unlock(); }
@@ -619,7 +642,7 @@ public final class RocksStateMachine extends BaseStateMachine {
             try {
                 // Data Group 被删除/隔离后，Ratis 可能仍触发一次已排队的快照回调。
                 // 此时数据库句柄已关闭，不能再调用 RocksDB Checkpoint。
-                if (db == null || dropping) return -1;
+                if (db == null || dropping || untrusted) return -1;
                 flushHeld();
                 position = getLastAppliedTermIndex();
                 if (position.getIndex() < 0) return -1;
@@ -633,6 +656,15 @@ public final class RocksStateMachine extends BaseStateMachine {
             return position.getIndex();
         }
     }
+
+    public org.apache.ratis.statemachine.SnapshotInfo pinCheckpoint(long minimumIndex) throws IOException {
+        synchronized (snapshotLock) {
+            if (takeSnapshot() < minimumIndex) throw new IOException("分片应用尚未追到创建 checkpoint 所需的位置");
+            return storage.pinLatest();
+        }
+    }
+
+    public void releaseCheckpoint(org.apache.ratis.statemachine.SnapshotInfo snapshot) { storage.unpin(snapshot); }
 
     private void flushHeld() throws IOException {
         if (db == null || dropping) return;
@@ -712,7 +744,8 @@ public final class RocksStateMachine extends BaseStateMachine {
                 updateLastAppliedTermIndex(term, index);
             } finally { dbLock.writeLock().unlock(); }
         } catch (Exception ex) {
-            LOG.log(java.util.logging.Level.SEVERE, "导入发布应用失败；如果其他副本已经成功，本副本缺少这批数据，需要删除分片目录后从 Leader 重新同步。requestId="
+            markUntrusted(term, index, command.getRequestId(), ex);
+            LOG.log(java.util.logging.Level.SEVERE, "导入发布应用失败；分片副本已隔离，请从可信快照重建。requestId="
                     + command.getRequestId(), ex);
             return CompletableFuture.failedFuture(new IOException("导入发布应用失败", ex));
         }
@@ -721,6 +754,16 @@ public final class RocksStateMachine extends BaseStateMachine {
             catch (IOException ex) { LOG.warning("导入发布后清理暂存文件失败，会话结束时再删：" + ex.getMessage()); }
         }
         return CompletableFuture.completedFuture(message(result.toByteArray()));
+    }
+
+    private void markUntrusted(long term, long index, String reason, Exception failure) {
+        if (untrustedMarker == null) return;
+        untrusted = true;
+        try {
+            Files.writeString(untrustedMarker, term + "/" + index + " " + reason,
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE,
+                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING, java.nio.file.StandardOpenOption.SYNC);
+        } catch (IOException ex) { failure.addSuppressed(ex); }
     }
 
     /**

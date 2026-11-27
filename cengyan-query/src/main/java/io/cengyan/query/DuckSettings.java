@@ -65,7 +65,7 @@ final class DuckSettings {
         }
         long configuredBytes = memoryBytes(memoryLimit);
         long effective = Math.min(queryBytes, configuredBytes);
-        return new DuckSettings(formatBytes(effective), tempDirectory, maxTempDirectorySize, threads, beforeClose);
+        return new DuckSettings(effective + "B", tempDirectory, memoryBytes(maxTempDirectorySize) + "B", threads, beforeClose);
     }
 
     Consumer<Path> beforeClose() {
@@ -105,16 +105,4 @@ final class DuckSettings {
         }
     }
 
-    private static String formatBytes(long bytes) {
-        if (bytes % (1024L * 1024L * 1024L) == 0) {
-            return (bytes / (1024L * 1024L * 1024L)) + "GB";
-        }
-        if (bytes % (1024L * 1024L) == 0) {
-            return (bytes / (1024L * 1024L)) + "MB";
-        }
-        if (bytes % 1024L == 0) {
-            return (bytes / 1024L) + "KB";
-        }
-        return bytes + "B";
-    }
 }

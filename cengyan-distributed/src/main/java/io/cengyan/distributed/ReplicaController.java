@@ -298,10 +298,11 @@ public final class ReplicaController {
             boolean joined = added.stream().allMatch(n -> m.listeners().contains(n.getNodeId()) || m.voters().contains(n.getNodeId()));
             if (joined && m.stable()) return stage(task, "CATCHING_UP");
             if (!m.configuring() && due(task)) {
-                // 新节点先建一个空的分片，再作为 listener 加入，由 Leader 在后台发快照。
                 var staging = before.toBuilder().clearLearners().addAllLearners(added).setControlTaskId(task.getTaskId()).build();
+                var bootstrap = ReplicaBootstrapRequest.newBuilder().setGroup(staging).setSource(m.leader()).build();
                 for (Node target : added) {
-                    var response = storage.direct(DistributedCatalog.address(target), "data.addGroup", staging.toByteString(), Duration.ofSeconds(30));
+                    var response = storage.direct(DistributedCatalog.address(target), "data.bootstrapGroup", bootstrap.toByteString(), Duration.ofSeconds(30));
+                    if (response.getCode().equals("BUSY")) return task;
                     if (!response.getCode().equals("OK")) throw new ClusterException(response.getCode(), response.getMessage());
                 }
                 configure(task, m, staging);
@@ -311,6 +312,11 @@ public final class ReplicaController {
         if (stage.equals("CATCHING_UP")) {
             claim(task);
             Membership m = membership(task);
+            for (Node target : added(task)) {
+                var ready = storage.direct(DistributedCatalog.address(target), "data.bootstrapReady",
+                        before.toBuilder().setControlTaskId(task.getTaskId()).build().toByteString(), Duration.ofSeconds(5));
+                if (!ready.getCode().equals("OK")) return error(task, "目标副本未确认可信 checkpoint：" + ready.getMessage());
+            }
             if (m.voters().equals(ids(after.getMembersList())) && m.stable()) return stage(task, "UPDATING_TOPOLOGY");
             task = configureError(task, m);
             if (!m.configuring() && due(task)) configure(task, m, after.toBuilder().setControlTaskId(task.getTaskId()).build());

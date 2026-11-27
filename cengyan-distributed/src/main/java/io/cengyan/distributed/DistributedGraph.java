@@ -79,23 +79,49 @@ public final class DistributedGraph {
         }
         return result;
     }
+
+    /** 按已知节点类型批量读取节点，结果保持请求顺序并跳过不可见或不存在的 ID。 */
+    public Map<Value, Entity> getMany(GraphDefinition graph, String nodeType, Collection<Value> ids,
+                                      TransactionEngine.QueryScope scope) {
+        if (nodeType == null || nodeType.isBlank()) {
+            return getMany(graph, true, new ArrayList<>(ids), scope);
+        }
+        if (EntityCodec.type(graph, true, nodeType) == null) return Map.of();
+        Map<Value, Entity> found = read(graph, true, ids,
+                id -> EntityCodec.key(true, nodeType, id, graph), scope);
+        Map<Value, Entity> ordered = new LinkedHashMap<>();
+        for (Value id : ids) {
+            Entity entity = found.get(id);
+            if (entity != null) ordered.put(id, entity);
+        }
+        return ordered;
+    }
+
     /** 按分片批量点读。不可见的 ID 不出现在结果里。 */
     private Map<Value, Entity> read(GraphDefinition graph, boolean node, Collection<Value> ids,
                                     java.util.function.Function<Value, ByteString> keyOf, TransactionEngine.QueryScope scope) {
         Map<Integer, List<Value>> grouped = new LinkedHashMap<>();
         for (Value id : ids) grouped.computeIfAbsent(EntityCodec.part(node, id, graph), ignored -> new ArrayList<>()).add(id);
-        Map<Value, Entity> result = new LinkedHashMap<>();
+        List<java.util.function.Supplier<Map<Value, Entity>>> reads = new ArrayList<>();
         for (var partition : grouped.entrySet()) {
-            List<ByteString> keys = partition.getValue().stream().map(keyOf).toList();
-            List<ByteString> values = storage.getMany(graph.getId(), partition.getKey(), keys);
-            for (int i = 0; i < values.size(); i++) {
-                ByteString visible = scope.value(values.get(i));
-                if (visible == null) continue;
-                Entity entity = EntityCodec.entity(visible);
-                StorageGateway.charge(entity.getSerializedSize() * 3L + 128);
-                result.put(partition.getValue().get(i), entity);
-            }
+            int part = partition.getKey();
+            List<Value> partitionIds = partition.getValue();
+            reads.add(() -> {
+                List<ByteString> keys = partitionIds.stream().map(keyOf).toList();
+                List<ByteString> values = storage.getMany(graph.getId(), part, keys);
+                Map<Value, Entity> result = new LinkedHashMap<>();
+                for (int i = 0; i < values.size(); i++) {
+                    ByteString visible = scope.value(values.get(i));
+                    if (visible == null) continue;
+                    Entity entity = EntityCodec.entity(visible);
+                    StorageGateway.charge(entity.getSerializedSize() * 3L + 128);
+                    result.put(partitionIds.get(i), entity);
+                }
+                return result;
+            });
         }
+        Map<Value, Entity> result = new LinkedHashMap<>();
+        for (Map<Value, Entity> partition : StorageGateway.parallel(reads)) result.putAll(partition);
         return result;
     }
     /** 给了类型就只扫这个类型的键区间；没给类型扫全部点或全部边。图里没有这个类型时返回 null。 */
@@ -243,6 +269,21 @@ public final class DistributedGraph {
         }
         return result;
     }
+
+    /** 按顶点批量读取邻接边，结果按输入顶点顺序返回。 */
+    public Map<Value, List<Entity>> neighborsMany(GraphDefinition graph, Collection<Value> vertices, boolean out,
+                                                  String edgeType, TransactionEngine.QueryScope scope, int maxParallel) {
+        LinkedHashSet<Value> unique = new LinkedHashSet<>(vertices);
+        List<java.util.function.Supplier<List<Entity>>> tasks = unique.stream()
+                .map(vertex -> (java.util.function.Supplier<List<Entity>>) () -> neighbors(graph, vertex, out, edgeType, scope))
+                .toList();
+        List<List<Entity>> loaded = StorageGateway.parallel(tasks, maxParallel);
+        Map<Value, List<Entity>> result = new LinkedHashMap<>();
+        int index = 0;
+        for (Value vertex : unique) result.put(vertex, List.copyOf(loaded.get(index++)));
+        return result;
+    }
+
     private List<Entity> deletionPage(GraphDefinition graph, Value vertex, boolean out, int limit) {
         var scope = readScope(graph.getId());
         List<Entity> result = new ArrayList<>();

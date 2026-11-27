@@ -62,6 +62,7 @@ public final class StorageServer implements AutoCloseable {
     private final Object topologyController = new Object();
     private final java.util.concurrent.ConcurrentMap<RaftGroupId, Object> configurationLocks = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.concurrent.ConcurrentMap<RaftGroupId, Reconfiguration> reconfigurations = new java.util.concurrent.ConcurrentHashMap<>();
+    private final ReplicaBootstrap replicaBootstrap;
     /** 成员变更在后台等待 Ratis 追平新成员；控制器限制了同时进行的分片数。 */
     private final ExecutorService reconfigurers = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "storage-reconfigure"); t.setDaemon(true); return t;
@@ -109,6 +110,7 @@ public final class StorageServer implements AutoCloseable {
         gateway.limit(config.rpcMaxPayload(), config.rpcMaxInflight());
         dropCleanup = new DroppedGraphCleanup(config, node, gateway, closed);
         maintenanceGate = new RaftMaintenance(config, gateway, node);
+        replicaBootstrap = new ReplicaBootstrap(config, gateway, node, reconfigurers);
         versions = new io.cengyan.distributed.VersionMaintenance(gateway, config.versionRetentionMs(), config.readProtectionMs());
         writers = writePool(config.writeThreads(), "storage-writer");
         writeParticipants = writePool(config.writeThreads(), "storage-write-participant");
@@ -307,6 +309,8 @@ public final class StorageServer implements AutoCloseable {
     private CompletionStage<RpcResponse> handle(RpcRequest request) {
         if (request.getMethod().equals("ping")) return CompletableFuture.completedFuture(response("OK", "", ByteString.EMPTY));
         if (request.getMethod().equals("maintenance.boot")) return CompletableFuture.completedFuture(response("OK", "", ByteString.copyFromUtf8(maintenanceGate.bootId())));
+        if (request.getMethod().equals("maintenance.untrusted")) return CompletableFuture.completedFuture(
+                response("OK", "", ByteString.copyFromUtf8(Long.toString(node.untrustedReplicaCount()))));
         if (request.getMethod().equals("maintenance.flush") || request.getMethod().equals("import.finish")) {
             CompletableFuture<RpcResponse> pending = new CompletableFuture<>();
             String method = request.getMethod();
@@ -688,6 +692,28 @@ public final class StorageServer implements AutoCloseable {
                                 record.getErrorMessage(), record.toByteString()));
                         return;
                     }
+                    if (inbound.getMethod().equals("data.bootstrapGroup")) {
+                        var requestBody = ReplicaBootstrapRequest.parseFrom(inbound.getBody());
+                        replicaBootstrap.begin(requestBody, raftGroup(requestBody.getGroup()));
+                        result.complete(response("OK", "", ByteString.EMPTY));
+                        return;
+                    }
+                    if (inbound.getMethod().equals("data.bootstrapManifest")) {
+                        result.complete(response("OK", "", replicaBootstrap.manifest(ReplicaCheckpointRequest.parseFrom(inbound.getBody())).toByteString()));
+                        return;
+                    }
+                    if (inbound.getMethod().equals("data.bootstrapChunk")) {
+                        result.complete(response("OK", "", replicaBootstrap.chunk(ReplicaCheckpointRequest.parseFrom(inbound.getBody()))));
+                        return;
+                    }
+                    if (inbound.getMethod().equals("data.bootstrapReady")) {
+                        var spec = DataGroupSpec.parseFrom(inbound.getBody());
+                        if (!replicaBootstrap.ready(spec)) throw new ClusterException("REPLICA_UNTRUSTED", "目标未确认安装可信 checkpoint");
+                        var target = node.server().getDivision(GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId()));
+                        var machine = (RocksStateMachine) target.getStateMachine();
+                        result.complete(response("OK", "", ByteString.copyFromUtf8(Long.toString(machine.getLastAppliedTermIndex().getIndex()))));
+                        return;
+                    }
                     if (inbound.getMethod().equals("data.addGroup")) {
                         addGroup(inbound);
                         result.complete(response("OK", "", ByteString.EMPTY));
@@ -711,9 +737,13 @@ public final class StorageServer implements AutoCloseable {
                         result.complete(notLeader(division.getInfo(), division.getRaftConf().getAllPeers()));
                         return;
                     }
+                    if (division.getStateMachine() instanceof RocksStateMachine machine && machine.isUntrusted()) {
+                        result.complete(response("REPLICA_UNTRUSTED", "本机分片应用失败，需要从可信 checkpoint 重建", ByteString.EMPTY));
+                        return;
+                    }
+                    var command = read ? null : WriteBatch.parseFrom(inbound.getBody());
                     if (read) ReadKey.parseFrom(inbound.getBody());
                     else {
-                        var command = WriteBatch.parseFrom(inbound.getBody());
                         if (inbound.getContext().getControllerEpoch() != command.getControllerEpoch()) {
                             result.complete(response("INVALID_ARGUMENT", "控制命令任期与请求上下文不一致", ByteString.EMPTY)); return;
                         }
@@ -731,7 +761,16 @@ public final class StorageServer implements AutoCloseable {
                             .setType(read ? RaftClientRequest.readRequestType() : RaftClientRequest.writeRequestType())
                             .setTimeoutMs(Math.max(1, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())))
                             .setMessage(RocksStateMachine.message(inbound.getBody().toByteArray())).build();
-                    node.server().submitClientRequestAsync(raftRequest).whenComplete((reply, failure) -> {
+                    boolean publish = command != null && command.hasImportPublish() && context.getGraphId() > 0;
+                    if (publish) replicaBootstrap.beginPublish(groupId, context.getGraphId(), context.getPartId());
+                    CompletableFuture<RaftClientReply> submitted;
+                    try { submitted = node.server().submitClientRequestAsync(raftRequest); }
+                    catch (IOException | RuntimeException ex) {
+                        if (publish) replicaBootstrap.endPublish(groupId);
+                        throw ex;
+                    }
+                    submitted.whenComplete((reply, failure) -> {
+                        if (publish) replicaBootstrap.endPublish(groupId);
                         if (failure != null) result.complete(response("FAILED", "Raft 未返回确认，写入状态可能未知", ByteString.EMPTY));
                         else if (reply.isSuccess()) {
                             ByteString body = ByteString.copyFrom(reply.getMessage().getContent().toByteArray());
@@ -781,7 +820,7 @@ public final class StorageServer implements AutoCloseable {
         if (method.startsWith("import.")) return importRequests;
         if (method.equals("ops.metrics")) return metricsRequests;
         if (method.equals("ops.shards") || method.equals("node.storageSize")) return opsRequests;
-        if (method.equals("data.membership") || method.equals("data.receiving")) return dataRequests;
+        if (method.equals("data.membership") || method.equals("data.receiving") || method.startsWith("data.bootstrap")) return dataRequests;
         if (method.startsWith("kv.") || method.equals("data.status")) return request.getContext().getGraphId() > 0 ? dataRequests : metadataRequests;
         if (method.startsWith("auth.") || method.equals("data.configure") || method.equals("data.abandonReplica") || method.startsWith("metadata.") || method.startsWith("schema.")) return coordinators;
         return admission;
@@ -959,6 +998,9 @@ public final class StorageServer implements AutoCloseable {
             if (job.cancelled) return;
             var division = node.server().getDivision(id);
             if (!division.getInfo().isLeaderReady()) throw new ClusterException("NOT_LEADER", "本节点已不是分片 Leader");
+            if (division.getStateMachine() instanceof RocksStateMachine machine && machine.isUntrusted()) {
+                throw new ClusterException("REPLICA_UNTRUSTED", "分片 Leader 未通过状态机检查");
+            }
             verifyConfigurationTask(spec);
             var group = RaftGroup.valueOf(id, division.getRaftConf().getAllPeers());
             try (var client = node.patientClient(group)) {
@@ -969,6 +1011,12 @@ public final class StorageServer implements AutoCloseable {
                 for (Node desired : spec.getMembersList()) {
                     if (voters.stream().anyMatch(peer -> peer.getId().toString().equals(desired.getNodeId()))) continue;
                     verifyConfigurationTask(spec);
+                    long committed = division.getRaftLog().getLastCommittedIndex();
+                    var ready = gateway.direct(io.cengyan.distributed.DistributedCatalog.address(desired),
+                            "data.bootstrapReady", spec.toByteString(), java.time.Duration.ofSeconds(5));
+                    if (!ready.getCode().equals("OK") || Long.parseLong(ready.getBody().toStringUtf8()) < committed) {
+                        throw new ClusterException("REPLICA_UNTRUSTED", "目标尚未从经过校验的 checkpoint 追到 Leader 提交位置");
+                    }
                     var previousVoters = java.util.List.copyOf(voters);
                     var previousListeners = java.util.List.copyOf(listeners);
                     listeners.removeIf(peer -> peer.getId().toString().equals(desired.getNodeId()));
@@ -1037,8 +1085,17 @@ public final class StorageServer implements AutoCloseable {
         boolean added = task.getAfter().getMembersList().stream().anyMatch(member -> member.getNodeId().equals(config.nodeId()));
         if (original || !added) throw new ClusterException("INVALID_ARGUMENT", "本节点不是这次新增的副本，拒绝卸下");
         var id = GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId());
-        if (!node.hosts(id) && !node.dataDirectoryPresent(id)) return;
-        node.detachDataGroup(id);
+        synchronized (node) {
+            if (!node.hosts(id) && !node.dataDirectoryPresent(id)) return;
+            var active = gateway.get(0, 0, ReplicaBootstrap.activeKey(spec.getGraphId(), spec.getPartId()));
+            var route = gateway.get(0, 0, StorageGateway.groupKey(spec.getGraphId(), spec.getPartId()));
+            if (active != null && !active.toStringUtf8().equals(spec.getControlTaskId())
+                    || route != null && DataGroupSpec.parseFrom(route).getMembersList().stream()
+                            .anyMatch(member -> member.getNodeId().equals(config.nodeId()))) {
+                throw new ClusterException("STALE_CONTROLLER", "后续副本任务或当前拓扑已接管该分片");
+            }
+            node.detachDataGroup(id);
+        }
         dropCleanup.wake();
     }
 
@@ -1076,6 +1133,7 @@ public final class StorageServer implements AutoCloseable {
 
     /** 快照安装失败后 Ratis 不清理接收目录，Leader 每次重发都会多一份；每分钟只留正在写的那一份。 */
     private void purgeSnapshotTemps() {
+        replicaBootstrap.expireManifests();
         if (closed.get()) return;
         for (RocksStateMachine machine : node.importMachines()) {
             try { machine.purgeSnapshotTemps(SNAPSHOT_TEMP_IDLE_MS); }
@@ -1207,6 +1265,17 @@ public final class StorageServer implements AutoCloseable {
 
     private void addGroup(RpcRequest request) throws IOException {
         var spec = DataGroupSpec.parseFrom(request.getBody());
+        var group = raftGroup(spec);
+        try { node.addGroup(group); }
+        catch (IllegalArgumentException ex) {
+            if (!staleReplica(spec)) throw ex;
+            node.detachDataGroup(group.getGroupId());
+            dropCleanup.wake();
+            node.addGroup(group);
+        }
+    }
+
+    private RaftGroup raftGroup(DataGroupSpec spec) {
         if (spec.getMembersCount() < 1) throw new IllegalArgumentException("Data Group 成员不能为空");
         var peers = new ArrayList<RaftPeer>();
         var ids = new java.util.HashSet<String>();
@@ -1229,18 +1298,7 @@ public final class StorageServer implements AutoCloseable {
             peers.add(raftPeer(member, spec.getLearnersList().contains(member)));
         }
         if (!ids.contains(config.nodeId())) throw new IllegalArgumentException("Data Group 不包含本节点");
-        var id = GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId());
-        try {
-            node.addGroup(RaftGroup.valueOf(id, peers));
-        } catch (IllegalArgumentException ex) {
-            // 以前加副本中途取消或失败、没卸干净时，本地会留着同名分片。本节点不在这次任务开始前的成员里，
-            // 说明路由上它本来就没有这份数据，残留的一定是过期的：先隔离掉，再按新任务建。
-            if (!staleReplica(spec)) throw ex;
-            org.slf4j.LoggerFactory.getLogger(StorageServer.class).warn("分片 {} 在本节点有过期的残留副本，隔离后重新加入", id);
-            node.detachDataGroup(id);
-            dropCleanup.wake();
-            node.addGroup(RaftGroup.valueOf(id, peers));
-        }
+        return RaftGroup.valueOf(GroupIds.data(config.clusterId(), spec.getGraphId(), spec.getPartId()), peers);
     }
 
     /** 新增副本任务（还在加入阶段）要把本节点加进来，而本节点不在任务开始前的成员里。 */

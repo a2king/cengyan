@@ -390,6 +390,9 @@ final class ClusterPlans {
         for (JsonNode n : status.path("nodes")) {
             if (nodeId != null && !n.path("nodeId").asText().equals(nodeId)) continue;
             if (!n.path("reachable").asBoolean()) continue;
+            int untrusted = n.path("untrustedReplicas").asInt();
+            if (untrusted != 0) throw new ClusterError("PROGRESS", n.path("nodeId").asText()
+                    + (untrusted < 0 ? " 尚未返回副本健康状态" : " 有 " + untrusted + " 个不可信副本"));
             if (!n.path("sealed").asBoolean()) throw new ClusterError("PROGRESS", n.path("nodeId").asText() + " 尚未完成封存");
         }
         return true;
@@ -410,7 +413,9 @@ final class ClusterPlans {
         if (n == null || !n.path("reachable").asBoolean()) throw new ClusterError("PROGRESS", "节点尚未启动");
         if (n.path("bootId").asText().equals(c.param("boot." + id))) throw new ClusterError("PROGRESS", "节点尚未重启");
         if (!n.path("resumed").asBoolean()) throw new ClusterError("PROGRESS", "正在打开本地数据库并重放日志");
-        if (n.path("untrustedReplicas").asInt() > 0) throw new ClusterError("PROGRESS", n.path("untrustedReplicas").asInt() + " 个副本比对不一致，正在全量同步");
+        int untrusted = n.path("untrustedReplicas").asInt();
+        if (untrusted != 0) throw new ClusterError("PROGRESS", untrusted < 0 ? "尚未返回副本健康状态"
+                : untrusted + " 个副本状态机应用失败，需从可信快照重建");
         JsonNode parts = status.path("partitions");
         if (parts.path("writing").asInt() > 0 || parts.path("frozen").asInt() > 0) throw new ClusterError("PROGRESS", "分片同步中");
         if (status.path("metadataLeader").asText().isEmpty()) throw new ClusterError("PROGRESS", "Metadata 尚未选出 Leader");

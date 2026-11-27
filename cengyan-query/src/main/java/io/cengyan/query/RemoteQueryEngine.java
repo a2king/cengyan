@@ -16,6 +16,7 @@ public final class RemoteQueryEngine {
     private final DistributedCatalog catalog;
     private final DistributedGraph data;
     private final DuckSettings duck;
+    private final int traversalThreads;
     private final StorageGateway storage;
     private TransactionEngine.QueryScope queryScope;
     private Stmt supplied;
@@ -32,15 +33,43 @@ public final class RemoteQueryEngine {
     interface Reads {
         /** type 为空字符串时按点目录查，不限类型。 */
         Entity node(GraphDefinition graph, String type, Value id, TransactionEngine.QueryScope scope);
+        /** 批量按 ID 读取节点。测试替身可以保留逐个读取，生产实现使用分片批量读取。 */
+        default Map<Value, Entity> nodes(GraphDefinition graph, Collection<Value> ids, TransactionEngine.QueryScope scope) {
+            Map<Value, Entity> result = new LinkedHashMap<>();
+            for (Value id : ids) {
+                Entity entity = node(graph, "", id, scope);
+                if (entity != null) result.put(id, entity);
+            }
+            return result;
+        }
         List<Entity> neighbors(GraphDefinition graph, Value vertex, boolean out, String edgeType, TransactionEngine.QueryScope scope);
+        default Map<Value, List<Entity>> neighborsMany(GraphDefinition graph, Collection<Value> vertices, boolean out,
+                                                        String edgeType, TransactionEngine.QueryScope scope, int maxParallel) {
+            LinkedHashSet<Value> unique = new LinkedHashSet<>(vertices);
+            List<java.util.function.Supplier<List<Entity>>> tasks = unique.stream()
+                    .map(vertex -> (java.util.function.Supplier<List<Entity>>) () -> neighbors(graph, vertex, out, edgeType, scope))
+                    .toList();
+            List<List<Entity>> loaded = StorageGateway.parallel(tasks, maxParallel);
+            Map<Value, List<Entity>> result = new LinkedHashMap<>();
+            int index = 0;
+            for (Value vertex : unique) result.put(vertex, List.copyOf(loaded.get(index++)));
+            return result;
+        }
         List<Entity> scan(GraphDefinition graph, String type, Map<String, Value> filters, TransactionEngine.QueryScope scope);
     }
     Reads reads = new Reads() {
         @Override public Entity node(GraphDefinition graph, String type, Value id, TransactionEngine.QueryScope scope) {
             return type.isEmpty() ? data.get(graph, true, id, scope) : data.get(graph, true, type, id, scope);
         }
+        @Override public Map<Value, Entity> nodes(GraphDefinition graph, Collection<Value> ids, TransactionEngine.QueryScope scope) {
+            return data.getMany(graph, true, new ArrayList<>(ids), scope);
+        }
         @Override public List<Entity> neighbors(GraphDefinition graph, Value vertex, boolean out, String edgeType, TransactionEngine.QueryScope scope) {
             return data.neighbors(graph, vertex, out, edgeType, scope);
+        }
+        @Override public Map<Value, List<Entity>> neighborsMany(GraphDefinition graph, Collection<Value> vertices, boolean out,
+                                                                String edgeType, TransactionEngine.QueryScope scope, int maxParallel) {
+            return data.neighborsMany(graph, vertices, out, edgeType, scope, maxParallel);
         }
         @Override public List<Entity> scan(GraphDefinition graph, String type, Map<String, Value> filters, TransactionEngine.QueryScope scope) {
             return filters.isEmpty() ? data.scan(graph, true, type, scope) : data.lookup(graph, true, type, filters, scope);
@@ -52,10 +81,21 @@ public final class RemoteQueryEngine {
     private BooleanSupplier currentCanceled = () -> false;
     private final Map<NodeKey, Optional<Entity>> nodeCache = new HashMap<>();
     private final Map<AdjacencyKey, List<Entity>> adjacencyCache = new HashMap<>();
-    public RemoteQueryEngine(StorageGateway storage, Path temporaryDirectory, String memory, String disk, int threads) {
+    public RemoteQueryEngine(StorageGateway storage, Path temporaryDirectory, String memory, String disk, int duckdbThreads) {
+        this(storage, temporaryDirectory, memory, disk, 4, duckdbThreads);
+    }
+
+    public RemoteQueryEngine(StorageGateway storage, Path temporaryDirectory, String memory, String disk,
+                             int traversalThreads, int duckdbThreads) {
+        if (traversalThreads <= 0) throw new IllegalArgumentException("路径展开线程数必须为正");
         this.storage = storage;
         catalog = new DistributedCatalog(storage); data = new DistributedGraph(storage);
-        duck = new DuckSettings(memory, temporaryDirectory, disk, threads);
+        this.traversalThreads = traversalThreads;
+        duck = new DuckSettings(memory, temporaryDirectory, disk, duckdbThreads);
+    }
+
+    int traversalThreads() {
+        return traversalThreads;
     }
 
     public QueryResult execute(String requestId, String graphName, String gql, Map<String, Object> params, BooleanSupplier canceled) {
@@ -174,7 +214,8 @@ public final class RemoteQueryEngine {
         if (statement instanceof Stmt.Next next) {
             QueryResult previous = child(next.left(), requestId, graphName, params, canceled, schemaVersion);
             if (!next.yield().isEmpty()) previous = yieldColumns(previous, next.yield());
-            RemoteQueryEngine engine = new RemoteQueryEngine(storage, duck.tempDirectory(), duck.memoryLimit(), duck.maxTempDirectorySize(), duck.threads());
+            RemoteQueryEngine engine = new RemoteQueryEngine(storage, duck.tempDirectory(), duck.memoryLimit(), duck.maxTempDirectorySize(),
+                    traversalThreads, duck.threads());
             engine.queryScope = queryScope; engine.supplied = next.right();
             engine.incoming = new ArrayList<>();
             for (List<Object> row : previous.rows()) {
@@ -329,7 +370,7 @@ public final class RemoteQueryEngine {
             return project(bindings, match.items(), match.orderBy(), match.distinct(), null, match.skip(), match.limit(), eval, canceled);
         }
         if (statement instanceof Stmt.Select select) {
-            return select(clauses(graph, select.clauses(), params, canceled), select.tail(), eval, canceled);
+            return select(graph, select, params, eval, canceled);
         }
         if (statement instanceof Stmt.Mutate mutate) {
             List<Map<String, Entity>> rows = clauses(graph, mutate.clauses(), params, canceled);
@@ -895,7 +936,8 @@ public final class RemoteQueryEngine {
     /** 在给定的外层绑定上执行一个嵌套查询（内联 CALL、EXISTS、VALUE），返回它的结果表。 */
     private QueryResult nested(GraphDefinition graph, Stmt body, Map<String, Entity> outer, Map<String, Object> params,
                                BooleanSupplier canceled) {
-        RemoteQueryEngine engine = new RemoteQueryEngine(storage, duck.tempDirectory(), duck.memoryLimit(), duck.maxTempDirectorySize(), duck.threads());
+        RemoteQueryEngine engine = new RemoteQueryEngine(storage, duck.tempDirectory(), duck.memoryLimit(), duck.maxTempDirectorySize(),
+                traversalThreads, duck.threads());
         engine.queryScope = queryScope; engine.reads = reads; engine.cancellation = cancellation;
         engine.nodeCache.putAll(nodeCache); engine.adjacencyCache.putAll(adjacencyCache);
         engine.incoming = List.of(transfer(outer, engine));
@@ -924,9 +966,9 @@ public final class RemoteQueryEngine {
         currentGraph = graph; currentParams = params; currentCanceled = canceled;
         ExprEval eval = new ExprEval(params, false);
         if (statement instanceof Stmt.Select select) {
+            if (select.tail() != null) return select(graph, select, params, eval, canceled);
             List<Map<String, Entity>> rows = clauses(graph, select.clauses(), params, canceled);
-            if (select.tail() == null) return new QueryResult(List.of(), rows.stream().map(row -> List.<Object>of()).toList(), 0);
-            return select(rows, select.tail(), eval, canceled);
+            return new QueryResult(List.of(), rows.stream().map(row -> List.<Object>of()).toList(), 0);
         }
         if (statement instanceof Stmt.Match match) {
             return run(graph, new Stmt.Select(List.of(new Stmt.Clause.Match(false, null, null, null, null,
@@ -958,6 +1000,19 @@ public final class RemoteQueryEngine {
     }
 
     /** RETURN 的投影：{@code RETURN *}、GROUP BY 校验、FINISH。 */
+    private QueryResult select(GraphDefinition graph, Stmt.Select select, Map<String, Object> params,
+                               ExprEval eval, BooleanSupplier canceled) {
+        var tail = select.tail();
+        long memory = QueryMemory.current().limit();
+        var spillPlan = incoming == null && memory > 0 ? SpillPathQuery.plan(select) : null;
+        if (spillPlan != null && (tail.groupBy().isEmpty() || groupsMatch(tail.items(), tail.groupBy()))) {
+            var operator = new SpillPathQuery(graph, reads, queryScope, traversalThreads, memory,
+                    () -> check(canceled), this::entityBody);
+            return operator.execute(spillPlan, eval, duck.tempDirectory(), parseBudget(duck.maxTempDirectorySize()));
+        }
+        return select(clauses(graph, select.clauses(), params, canceled), tail, eval, canceled);
+    }
+
     private QueryResult select(List<Map<String, Entity>> rows, Stmt.Tail tail, ExprEval eval, BooleanSupplier canceled) {
         if (tail.finish()) return new QueryResult(List.of(), List.of(), 0);
         List<Stmt.Item> items = tail.items();
@@ -1005,7 +1060,8 @@ public final class RemoteQueryEngine {
     private final IdentityHashMap<Stmt.EdgePat, GroupInfo> groups = new IdentityHashMap<>();
 
     private QueryResult child(Stmt statement, String requestId, String graph, Map<String, Object> params, BooleanSupplier canceled, long version) {
-        RemoteQueryEngine engine = new RemoteQueryEngine(storage, duck.tempDirectory(), duck.memoryLimit(), duck.maxTempDirectorySize(), duck.threads());
+        RemoteQueryEngine engine = new RemoteQueryEngine(storage, duck.tempDirectory(), duck.memoryLimit(), duck.maxTempDirectorySize(),
+                traversalThreads, duck.threads());
         engine.queryScope = queryScope; engine.supplied = statement;
         return engine.execute(requestId, graph, "", params, canceled, version);
     }
@@ -1080,9 +1136,8 @@ public final class RemoteQueryEngine {
                 paths = shortestPaths(graph, rel.edge(), target, bound, eval, canceled, start, max, ends, filter, pathVariable);
             } else {
                 paths = new ArrayList<>();
-                List<Entity> vertices = new ArrayList<>(); vertices.add(start);
-                walkPaths(graph, rel.edge(), target, bound, eval, canceled, pattern.mode() == null ? "WALK" : pattern.mode(),
-                        min, max, vertices, new ArrayList<>(), paths, filter, pathVariable);
+                walkPathsParallel(graph, rel.edge(), target, bound, eval, canceled,
+                        pattern.mode() == null ? "WALK" : pattern.mode(), min, max, start, paths, filter, pathVariable);
             }
             paths.sort(Comparator.comparingInt(path -> path.edges().size()));
             Map<Value, List<PathFound>> byEnd = new LinkedHashMap<>();
@@ -1153,16 +1208,30 @@ public final class RemoteQueryEngine {
         vertices.put(start.getId(), start);
         List<Value> frontier = List.of(start.getId());
         for (int hop = 1; hop <= max && !frontier.isEmpty(); hop++) {
+            List<PathFound> frontierStates = frontier.stream()
+                    .map(id -> new PathFound(List.of(vertices.get(id)), List.of())).toList();
+            prefetchAdjacent(graph, frontierStates, pattern, queryScope, canceled);
             List<Value> next = new ArrayList<>();
+            LinkedHashSet<Value> targetIds = new LinkedHashSet<>();
+            Map<Value, List<Entity>> edgesByVertex = new LinkedHashMap<>();
+            for (Value current : frontier) {
+                List<Entity> edges = adjacent(graph, current, pattern, queryScope);
+                edgesByVertex.put(current, edges);
+                for (Entity edge : edges) {
+                    Value other = edge.getSource().equals(current) ? edge.getTarget() : edge.getSource();
+                    targetIds.add(other);
+                }
+            }
+            Map<Value, Entity> prefetchedNodes = reads.nodes(graph, targetIds, queryScope);
             for (Value current : frontier) {
                 check(canceled);
-                for (Entity edge : adjacent(graph, current, pattern, queryScope)) {
+                for (Entity edge : edgesByVertex.getOrDefault(current, List.of())) {
                     if (!edgeAccept(pattern, edge, eval, initial, null, null)) continue;
                     Value other = edge.getSource().equals(current) ? edge.getTarget() : edge.getSource();
                     Integer seen = depth.get(other);
                     if (seen != null && seen < hop) continue;
                     if (seen == null) {
-                        Entity vertex = node(graph, null, other, queryScope);
+                        Entity vertex = prefetchedNodes.get(other);
                         if (vertex == null) continue;
                         depth.put(other, hop);
                         vertices.put(other, vertex);
@@ -1297,6 +1366,107 @@ public final class RemoteQueryEngine {
         if (!entity.getNode()) { body.put("src", EntityCodec.object(entity.getSource())); body.put("dst", EntityCodec.object(entity.getTarget())); }
         return body;
     }
+
+    /**
+     * 按层展开路径。Storage 读取在同一层内并行预取，路径过滤和路径对象构造仍由当前查询线程按父路径顺序完成。
+     * 这样不会让 ExprEval、scalarValues 或结果列表跨线程共享，同时保持同一跳路径的稳定顺序。
+     */
+    private void walkPathsParallel(GraphDefinition graph, Stmt.EdgePat pattern, Stmt.NodePat target,
+                                   Map<String, Entity> initial, ExprEval eval, BooleanSupplier canceled, String mode,
+                                   int min, int max, Entity start, List<PathFound> found, Expr where, String pathVariable) {
+        List<PathFound> frontier = List.of(new PathFound(List.of(start), List.of()));
+        for (int depth = 0; depth <= max && !frontier.isEmpty(); depth++) {
+            check(canceled);
+            for (PathFound state : frontier) {
+                if (state.edges().size() >= min) {
+                    if (acceptPath(target, pattern, initial, eval, where, pathVariable, state.vertices(), state.edges())) {
+                        if (found.size() >= 100000) {
+                            throw new ClusterException("PATH_LIMIT_EXCEEDED", "路径数量超过安全上限");
+                        }
+                        found.add(state);
+                    }
+                }
+            }
+            if (depth == max) break;
+            prefetchAdjacent(graph, frontier, pattern, queryScope, canceled);
+            List<List<Entity>> edgesByState = new ArrayList<>(frontier.size());
+            LinkedHashSet<Value> targetIds = new LinkedHashSet<>();
+            for (PathFound state : frontier) {
+                Entity current = state.vertices().getLast();
+                if (mode.equalsIgnoreCase("SIMPLE") && state.vertices().size() > 1
+                        && current.getId().equals(state.vertices().getFirst().getId())) {
+                    edgesByState.add(List.of());
+                    continue;
+                }
+                List<Entity> edges = adjacent(graph, current.getId(), pattern, queryScope);
+                edgesByState.add(edges);
+                for (Entity edge : edges) {
+                    Value id = edge.getSource().equals(current.getId()) ? edge.getTarget() : edge.getSource();
+                    targetIds.add(id);
+                }
+            }
+            Map<Value, Entity> prefetchedNodes = reads.nodes(graph, targetIds, queryScope);
+            List<PathFound> next = new ArrayList<>();
+            for (int stateIndex = 0; stateIndex < frontier.size(); stateIndex++) {
+                PathFound state = frontier.get(stateIndex);
+                check(canceled);
+                Entity current = state.vertices().getLast();
+                if (mode.equalsIgnoreCase("SIMPLE") && state.vertices().size() > 1
+                        && current.getId().equals(state.vertices().getFirst().getId())) {
+                    continue;
+                }
+                for (Entity edge : edgesByState.get(stateIndex)) {
+                    if (mode.equalsIgnoreCase("TRAIL") && state.edges().stream()
+                            .anyMatch(existing -> identity(existing).equals(identity(edge)))) continue;
+                    Value id = edge.getSource().equals(current.getId()) ? edge.getTarget() : edge.getSource();
+                    boolean repeated = state.vertices().stream().anyMatch(vertex -> vertex.getId().equals(id));
+                    if (repeated && mode.equalsIgnoreCase("ACYCLIC")) continue;
+                    if (repeated && mode.equalsIgnoreCase("SIMPLE") && !id.equals(state.vertices().getFirst().getId())) continue;
+                    Entity other = prefetchedNodes.get(id);
+                    if (other == null || !edgeAccept(pattern, edge, eval, initial, current, other)) continue;
+                    List<Entity> vertices = new ArrayList<>(state.vertices());
+                    List<Entity> edges = new ArrayList<>(state.edges());
+                    vertices.add(other); edges.add(edge);
+                    next.add(new PathFound(List.copyOf(vertices), List.copyOf(edges)));
+                }
+            }
+            if (next.size() > 1000000) {
+                throw new ClusterException("PATH_LIMIT_EXCEEDED", "路径展开中间状态超过安全上限");
+            }
+            QueryMemory.current().observeRows(next.size(), Math.max(2, (depth + 2) * 2));
+            frontier = next;
+        }
+    }
+
+    /** 只在协调线程写 adjacencyCache，Storage 读取任务不接触查询表达式和路径结果状态。 */
+    private void prefetchAdjacent(GraphDefinition graph, List<PathFound> frontier, Stmt.EdgePat pattern,
+                                  TransactionEngine.QueryScope scope, BooleanSupplier canceled) {
+        record BatchKey(boolean out, String type) { }
+        Map<BatchKey, LinkedHashSet<Value>> batches = new LinkedHashMap<>();
+        List<String> types = pattern.typeNames();
+        List<String> edgeTypes = types.size() <= 1
+                ? List.of(types.isEmpty() ? "" : types.getFirst()) : types;
+        List<Boolean> directions = pattern.direction() == Stmt.EdgePat.Direction.OUT ? List.of(true)
+                : pattern.direction() == Stmt.EdgePat.Direction.IN ? List.of(false) : List.of(true, false);
+        for (PathFound state : frontier) {
+            Value vertex = state.vertices().getLast().getId();
+            for (boolean out : directions) for (String type : edgeTypes) {
+                AdjacencyKey key = new AdjacencyKey(vertex, out, type);
+                if (!adjacencyCache.containsKey(key)) batches.computeIfAbsent(new BatchKey(out, type), ignored -> new LinkedHashSet<>()).add(vertex);
+            }
+        }
+        if (batches.isEmpty()) return;
+        check(canceled);
+        for (var batch : batches.entrySet()) {
+            Map<Value, List<Entity>> loaded = reads.neighborsMany(graph, batch.getValue(), batch.getKey().out(),
+                    batch.getKey().type().isEmpty() ? null : batch.getKey().type(), scope, traversalThreads);
+            for (var entry : loaded.entrySet()) {
+                adjacencyCache.put(new AdjacencyKey(entry.getKey(), batch.getKey().out(), batch.getKey().type()), entry.getValue());
+            }
+            check(canceled);
+        }
+    }
+
     private void walkPaths(GraphDefinition graph, Stmt.EdgePat pattern, Stmt.NodePat target, Map<String, Entity> initial, ExprEval eval,
                            BooleanSupplier canceled, String mode, int min, int max, List<Entity> vertices, List<Entity> edges,
                            List<PathFound> found, Expr where, String pathVariable) {
@@ -1365,8 +1535,17 @@ public final class RemoteQueryEngine {
             int min = edge.minHop() == null ? 1 : edge.minHop(), max = edge.maxHop() == null ? 1 : edge.maxHop();
             if (min != 1 || max != 1) {
                 if (max < 0 || max > 32 || min < 0 || min > max) throw new ClusterException("PATH_LIMIT", "路径跳数必须有界且不超过 32");
-                Set<Value> visited = new HashSet<>(); visited.add(node.getId());
-                expand(graph, node, node, row, edge, target, where, eval, scope, canceled, 0, min, max, new HashSet<>(), visited, mode == null ? "WALK" : mode, result);
+                List<PathFound> paths = new ArrayList<>();
+                walkPathsParallel(graph, edge, target, row, eval, canceled, mode == null ? "WALK" : mode,
+                        min, max, node, paths, where, null);
+                for (PathFound path : paths) {
+                    var bound = new LinkedHashMap<>(row);
+                    if (target.variable() != null) bound.put(target.variable(), path.vertices().getLast());
+                    if (edge.variable() != null) {
+                        bound.put(edge.variable(), scalar(path.edges().stream().map(this::entityBody).toList()));
+                    }
+                    result.add(bound);
+                }
                 continue;
             }
             for (Entity relation : adjacent(graph, node.getId(), edge, scope)) {

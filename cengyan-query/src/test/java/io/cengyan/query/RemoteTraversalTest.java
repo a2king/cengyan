@@ -57,8 +57,12 @@ class RemoteTraversalTest {
     }
 
     private RemoteQueryEngine engine(Graph graph) {
+        return engine(graph, "1GB");
+    }
+
+    private RemoteQueryEngine engine(Graph graph, String disk) {
         RemoteQueryEngine engine = new RemoteQueryEngine(
-                new StorageGateway("test", List.of(new InetSocketAddress("127.0.0.1", 1))), work, "64MB", "1GB", 1);
+                new StorageGateway("test", List.of(new InetSocketAddress("127.0.0.1", 1))), work, "64MB", disk, 1);
         engine.reads = graph;
         return engine;
     }
@@ -146,6 +150,31 @@ class RemoteTraversalTest {
         assertEquals("q", String.valueOf(((Map<?, ?>) row.get(0)).get("id")));
         assertEquals(0.5, ((Number) row.get(4)).doubleValue(), 1e-9, "0.8*0.5 + 0.1");
         assertEquals(2, ((List<?>) row.get(3)).size());
+    }
+
+    @Test
+    void 按层计数与落盘路径聚合保持结果并遵守临时盘预算() throws Exception {
+        var graph = new Graph().node("s", "org").node("a", "org").node("b", "org").node("t", "org")
+                .inv("a", "s", 0.6).inv("b", "s", 0.4).inv("t", "a", 1).inv("t", "b", 1);
+        String match = "MATCH p = (s:org)<-[e:inv]-{1,7}(t:org) WHERE id(s) = 's' ";
+        var count = (Stmt.Select) Gql.parse(match + "RETURN count(*) AS n");
+        String gql = match + "LET w = REDUCE(acc = 1.0, rel IN relationships(p) | acc * coalesce(rel.conprop, 0.0)) "
+                + "RETURN s AS start_node, t AS end_node, collect_list(nodes(p)) AS node_list, "
+                + "collect_list(relationships(p)) AS path_list, sum(w) AS total GROUP BY start_node, end_node "
+                + "FILTER total >= 0.5 ORDER BY total DESC SKIP 0 LIMIT 1000";
+        var grouped = (Stmt.Select) Gql.parse(gql);
+        assertNotNull(SpillPathQuery.plan(count));
+        assertNotNull(SpillPathQuery.plan(grouped));
+        var reference = run(engine(graph), gql);
+        try (var memory = QueryMemory.open(16L << 20)) {
+            assertEquals(List.of(List.of(4L)), engine(graph).run(GRAPH, count, Map.of(), () -> false).rows());
+            var result = engine(graph).run(GRAPH, grouped, Map.of(), () -> false);
+            assertEquals(reference, result);
+            var limit = engine(graph, "128B");
+            assertEquals("QUERY_TEMP_LIMIT_EXCEEDED", assertThrows(io.cengyan.distributed.ClusterException.class,
+                    () -> limit.run(GRAPH, grouped, Map.of(), () -> false)).code());
+        }
+        try (var files = java.nio.file.Files.list(work)) { assertEquals(0, files.count()); }
     }
 
     @Test

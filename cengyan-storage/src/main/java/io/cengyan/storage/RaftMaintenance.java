@@ -37,6 +37,7 @@ final class RaftMaintenance {
     String bootId() { return boot; }
 
     void tick() {
+        node.pauseUntrustedElections();
         ByteString raw = storage.get(0, 0, ClusterMaintenance.KEY);
         ClusterMaintenance.State state = ClusterMaintenance.state(raw);
         if (state == null) return;
@@ -94,7 +95,7 @@ final class RaftMaintenance {
             nodes.addObject().put("nodeId", member.getNodeId()).put("reachable", !live.isEmpty()).put("bootId", live)
                     .put("sealed", current && marker.sealedBoot().equals(live))
                     .put("resumed", current && marker.resumed())
-                    .put("untrustedReplicas", 0);
+                    .put("untrustedReplicas", live.isEmpty() ? 0 : untrusted(member));
         }
         result.put("metadataLeader", leader);
         return result;
@@ -106,5 +107,14 @@ final class RaftMaintenance {
             var response = storage.direct(new java.net.InetSocketAddress(rpc.getHost(), rpc.getPort()), "maintenance.boot", ByteString.EMPTY, Duration.ofSeconds(2));
             return response.getCode().equals("OK") ? response.getBody().toStringUtf8() : "";
         } catch (Exception ex) { return ""; }
+    }
+
+    private long untrusted(Node member) {
+        if (member.getNodeId().equals(config.nodeId())) return node.untrustedReplicaCount();
+        try {
+            var response = storage.direct(DistributedCatalog.address(member), "maintenance.untrusted", ByteString.EMPTY, Duration.ofSeconds(2));
+            if (response.getCode().equals("UNSUPPORTED")) return 0;
+            return response.getCode().equals("OK") ? Long.parseLong(response.getBody().toStringUtf8()) : -1;
+        } catch (RuntimeException ex) { return -1; }
     }
 }
